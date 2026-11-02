@@ -1,0 +1,74 @@
+name: Build Orbit Play (Windows x64)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Disable autocrlf
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: mingw64
+          update: true
+          install: git zip
+          pacboy: >-
+            cc:p
+            cmake:p
+            ninja:p
+            pkgconf:p
+            python:p
+            python-protobuf:p
+            openssl:p
+            opus:p
+            json-c:p
+            miniupnpc:p
+            libevent:p
+            sdl3:p
+            ffmpeg:p
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --target OrbitPlay
+
+      - name: Package
+        run: |
+          mkdir -p dist/OrbitPlay
+          cp build/OrbitPlay.exe dist/OrbitPlay/
+          cp README.md LICENSE dist/OrbitPlay/ 2>/dev/null || true
+          # Copy every MSYS2 DLL the exe needs (recursively)
+          todo=(dist/OrbitPlay/OrbitPlay.exe)
+          while [ ${#todo[@]} -gt 0 ]; do
+            f="${todo[0]}"; todo=("${todo[@]:1}")
+            for dll in $(ldd "$f" | awk '/=> \/mingw64\// { print $3 }'); do
+              base=$(basename "$dll")
+              if [ ! -f "dist/OrbitPlay/$base" ]; then
+                cp "$dll" dist/OrbitPlay/
+                todo+=("dist/OrbitPlay/$base")
+              fi
+            done
+          done
+          ls dist/OrbitPlay
+          cd dist && zip -r ../OrbitPlay-win64.zip OrbitPlay
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OrbitPlay-win64
+          path: OrbitPlay-win64.zip
+          if-no-files-found: error

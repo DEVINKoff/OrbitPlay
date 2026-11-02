@@ -1,0 +1,1268 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+#include "app.h"
+#include "log.h"
+
+#include <chiaki/common.h>
+#include <chiaki/time.h>
+
+#include <imgui.h>
+#include <imgui_impl_dx11.h>
+#include <imgui_impl_sdl3.h>
+
+extern "C" {
+#include <libavutil/frame.h>
+}
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+
+static const char *kAppName = "Orbit Play";
+static const uint64_t kWakeTimeoutMs = 60000;
+
+static uint64_t NowMs() { return chiaki_time_now_monotonic_ms(); }
+
+// ---------------------------------------------------------------------------
+// Init / shutdown
+
+bool App::Init()
+{
+	const char *appdata = getenv("APPDATA");
+	data_dir = std::string(appdata ? appdata : ".") + "\\OrbitPlay";
+	CreateDirectoryA(data_dir.c_str(), nullptr);
+	settings_path = data_dir + "\\settings.ini";
+	Log::Get().Open(data_dir + "\\orbitplay.log");
+	LOGI("%s starting", kAppName);
+
+	ChiakiErrorCode err = chiaki_lib_init();
+	if(err != CHIAKI_ERR_SUCCESS)
+	{
+		LOGE("chiaki_lib_init failed: %s", chiaki_error_string(err));
+		return false;
+	}
+
+	settings.Load(settings_path);
+	strncpy(account_buf, settings.psn_account_id.c_str(), sizeof(account_buf) - 1);
+
+	// DualSense: enhanced reports are needed for gyro/touchpad/effects over Bluetooth.
+	SDL_SetHint("SDL_JOYSTICK_ENHANCED_REPORTS", "1");
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_PLAYER_LED, "1");
+	SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+	if(!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO))
+	{
+		LOGE("SDL_Init failed: %s", SDL_GetError());
+		return false;
+	}
+
+	window = SDL_CreateWindow(kAppName, 1600, 900, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+	if(!window)
+	{
+		LOGE("SDL_CreateWindow failed: %s", SDL_GetError());
+		return false;
+	}
+	hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+	if(!hwnd || !renderer.Init(hwnd))
+	{
+		LOGE("Renderer initialization failed");
+		return false;
+	}
+
+	IMGUI_CHECKVERSION();
+	ImGui::CreateContext();
+	ImGuiIO &io = ImGui::GetIO();
+	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+	io.IniFilename = nullptr;
+	ui_scale = SDL_GetWindowDisplayScale(window);
+	if(ui_scale <= 0.0f)
+		ui_scale = 1.0f;
+	SetupStyle(ui_scale);
+	ImGui_ImplSDL3_InitForD3D(window);
+	ImGui_ImplDX11_Init(renderer.Device(), renderer.Context());
+
+	audio.SetVolume(settings.volume);
+	discovery.Start();
+	if(settings.fullscreen)
+		SetFullscreen(true);
+	present_window_start = NowMs();
+	return true;
+}
+
+void App::Shutdown()
+{
+	if(session)
+	{
+		session->Stop();
+		session.reset();
+	}
+	gamepads.StopAllFeedback();
+	registration.Cancel();
+	discovery.Stop();
+	settings.Save(settings_path);
+	ImGui_ImplDX11_Shutdown();
+	ImGui_ImplSDL3_Shutdown();
+	ImGui::DestroyContext();
+	renderer.Shutdown();
+	if(window)
+		SDL_DestroyWindow(window);
+	SDL_Quit();
+	LOGI("Bye");
+}
+
+void App::SetupStyle(float scale)
+{
+	ImGuiIO &io = ImGui::GetIO();
+	io.Fonts->Clear();
+	ImFontConfig cfg;
+	cfg.OversampleH = 2;
+	const char *font = "C:\\Windows\\Fonts\\segoeui.ttf";
+	if(GetFileAttributesA(font) != INVALID_FILE_ATTRIBUTES)
+		io.Fonts->AddFontFromFileTTF(font, 19.0f * scale, &cfg);
+	else
+	{
+		cfg.SizePixels = 15.0f * scale;
+		io.Fonts->AddFontDefault(&cfg);
+	}
+
+	ImGuiStyle &s = ImGui::GetStyle();
+	s = ImGuiStyle();
+	ImGui::StyleColorsDark(&s);
+	s.WindowRounding = 10.0f;
+	s.ChildRounding = 10.0f;
+	s.FrameRounding = 7.0f;
+	s.GrabRounding = 7.0f;
+	s.PopupRounding = 8.0f;
+	s.FramePadding = ImVec2(12, 8);
+	s.ItemSpacing = ImVec2(10, 9);
+	s.WindowPadding = ImVec2(18, 16);
+	s.ScrollbarSize = 12.0f;
+	ImVec4 *c = s.Colors;
+	ImVec4 accent(0.0f, 0.44f, 0.82f, 1.0f); // PlayStation blue
+	c[ImGuiCol_WindowBg] = ImVec4(0.055f, 0.06f, 0.075f, 1.0f);
+	c[ImGuiCol_ChildBg] = ImVec4(0.09f, 0.10f, 0.125f, 1.0f);
+	c[ImGuiCol_PopupBg] = ImVec4(0.08f, 0.09f, 0.11f, 0.98f);
+	c[ImGuiCol_Border] = ImVec4(1, 1, 1, 0.07f);
+	c[ImGuiCol_FrameBg] = ImVec4(0.14f, 0.15f, 0.19f, 1.0f);
+	c[ImGuiCol_FrameBgHovered] = ImVec4(0.18f, 0.20f, 0.25f, 1.0f);
+	c[ImGuiCol_FrameBgActive] = ImVec4(0.20f, 0.23f, 0.30f, 1.0f);
+	c[ImGuiCol_Button] = ImVec4(0.16f, 0.18f, 0.23f, 1.0f);
+	c[ImGuiCol_ButtonHovered] = accent;
+	c[ImGuiCol_ButtonActive] = ImVec4(0.0f, 0.36f, 0.70f, 1.0f);
+	c[ImGuiCol_CheckMark] = ImVec4(0.35f, 0.65f, 1.0f, 1.0f);
+	c[ImGuiCol_SliderGrab] = accent;
+	c[ImGuiCol_SliderGrabActive] = ImVec4(0.35f, 0.65f, 1.0f, 1.0f);
+	c[ImGuiCol_Header] = ImVec4(0.16f, 0.18f, 0.23f, 1.0f);
+	c[ImGuiCol_HeaderHovered] = ImVec4(0.0f, 0.44f, 0.82f, 0.6f);
+	c[ImGuiCol_HeaderActive] = accent;
+	c[ImGuiCol_NavCursor] = ImVec4(0.35f, 0.65f, 1.0f, 1.0f);
+	c[ImGuiCol_Separator] = ImVec4(1, 1, 1, 0.08f);
+	c[ImGuiCol_ModalWindowDimBg] = ImVec4(0, 0, 0, 0.6f);
+	s.ScaleAllSizes(scale);
+}
+
+void App::SetFullscreen(bool fullscreen)
+{
+	SDL_SetWindowFullscreen(window, fullscreen);
+}
+
+bool App::FrameGenUsable() const
+{
+	int fps = session ? session->Config().fps : settings.fps;
+	return renderer.DisplayHz() >= fps * 2 - 5;
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+
+void App::Run()
+{
+	while(!quit)
+	{
+		PumpEvents();
+		Tick();
+		HandleSessionEvents();
+		SendInput();
+
+		bool streaming = phase == Phase::Streaming && session;
+		bool new_frame = false;
+		if(streaming)
+		{
+			AVFrame *frame = session->PullFrame();
+			if(frame)
+			{
+				new_frame = renderer.SubmitFrame(frame);
+				av_frame_free(&frame);
+			}
+		}
+
+		bool ui_needed = !streaming || overlay_open || settings.show_stats || login_pin_open || keyboard_open || !message.empty()
+			|| !renderer.HasVideo();
+		if(streaming && !new_frame && !ui_needed)
+		{
+			// Nothing to draw: wait briefly for the decoder, keep polling input at ~500 Hz.
+			WaitForSingleObject(session->FrameEvent(), 2);
+			continue;
+		}
+		PresentFrame(new_frame);
+	}
+}
+
+void App::PumpEvents()
+{
+	SDL_Event e;
+	while(SDL_PollEvent(&e))
+	{
+		ImGui_ImplSDL3_ProcessEvent(&e);
+		gamepads.HandleEvent(e);
+		switch(e.type)
+		{
+			case SDL_EVENT_QUIT:
+			case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+				quit = true;
+				break;
+			case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+				renderer.Resize(e.window.data1, e.window.data2);
+				break;
+			case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+			case SDL_EVENT_WINDOW_MOVED:
+				last_display_refresh = 0;
+				break;
+			case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+			{
+				float s = SDL_GetWindowDisplayScale(window);
+				if(s > 0.0f && std::fabs(s - ui_scale) > 0.01f)
+				{
+					ui_scale = s;
+					SetupStyle(ui_scale);
+					ImGui_ImplDX11_InvalidateDeviceObjects();
+				}
+				break;
+			}
+			case SDL_EVENT_KEY_DOWN:
+				if(e.key.key == SDLK_F11 || (e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT)))
+				{
+					settings.fullscreen = !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN);
+					SetFullscreen(settings.fullscreen);
+					MarkSettingsDirty();
+				}
+				else if(phase == Phase::Streaming && (e.key.key == SDLK_F1 || e.key.key == SDLK_ESCAPE) && !keyboard_open && !login_pin_open)
+				{
+					overlay_open = !overlay_open;
+					if(!overlay_open)
+						input_guard = true;
+				}
+				else if(phase == Phase::Streaming && e.key.key == SDLK_F2)
+				{
+					settings.show_stats = !settings.show_stats;
+					MarkSettingsDirty();
+				}
+				break;
+			default:
+				break;
+		}
+	}
+	gamepads.SetOptions({ settings.motion_controls, settings.view_is_touchpad, settings.adaptive_triggers, settings.rumble_gain });
+}
+
+void App::Tick()
+{
+	uint64_t now = NowMs();
+
+	if(now - last_display_refresh > 2000)
+	{
+		renderer.RefreshDisplayInfo();
+		last_display_refresh = now;
+	}
+
+	// Probe consoles by IP: manual entries and the last address of paired consoles.
+	if(now - last_probe > 1500 && phase != Phase::Streaming)
+	{
+		for(const auto &m : settings.manual_hosts)
+			discovery.ProbeAddress(m.address);
+		for(const auto &h : settings.hosts)
+			discovery.ProbeAddress(h.last_address);
+		last_probe = now;
+	}
+
+	if(settings_dirty && now - last_settings_save > 1000)
+	{
+		settings.Save(settings_path);
+		settings_dirty = false;
+		last_settings_save = now;
+	}
+
+	// Waking: wait for the console to report "ready", re-sending the wakeup packet now and then.
+	if(phase == Phase::Waking)
+	{
+		DiscoveredHost d;
+		bool found = discovery.Find(active_host.mac, &d);
+		if(found && d.ready)
+		{
+			active_address = d.address;
+			StartStream();
+		}
+		else if(now > phase_deadline)
+		{
+			phase = Phase::Idle;
+			message = "The console didn't wake up. Check that \"Enable turning on PS5 from network\" is on in "
+				"Settings > System > Power Saving > Features Available in Rest Mode.";
+			message_is_error = true;
+		}
+		else if(now - last_wakeup > 5000)
+		{
+			Discovery::Wakeup(found ? d.address : active_address, active_host.regist_key, active_host.ps5);
+			last_wakeup = now;
+		}
+	}
+
+	// Connecting -> Streaming once the first frame arrives (handled in HandleSessionEvents)
+	if(phase == Phase::Connecting && now > phase_deadline)
+		EndStream("Connection timed out. Make sure Remote Play is enabled on the console.", true);
+
+	// Hot-plugged DualSense: (re)try opening the haptics audio device
+	if(phase == Phase::Streaming && session && settings.dualsense_features && !audio.HapticsActive()
+		&& now - last_haptics_try > 3000 && gamepads.AnyWiredDualSense())
+	{
+		audio.OpenHaptics();
+		last_haptics_try = now;
+	}
+
+	if(session)
+		session->SetHapticsGain(settings.haptics_gain);
+
+	if(now - present_window_start >= 1000)
+	{
+		present_fps = present_count * 1000.0 / (double)(now - present_window_start);
+		present_count = 0;
+		present_window_start = now;
+	}
+}
+
+void App::HandleSessionEvents()
+{
+	if(!session)
+		return;
+	for(const SessionEvent &e : session->TakeEvents())
+	{
+		switch(e.type)
+		{
+			case SessionEvent::Connected:
+				phase = Phase::Streaming;
+				overlay_open = false;
+				input_guard = true;
+				gamepads.SetMicLed(false);
+				if(settings.dualsense_features && gamepads.AnyWiredDualSense())
+					audio.OpenHaptics();
+				break;
+			case SessionEvent::Quit:
+				EndStream(e.flag ? "Disconnected: " + e.text : "", e.flag);
+				return; // session is gone
+			case SessionEvent::Rumble:
+				gamepads.SetRumble(e.a, e.b);
+				break;
+			case SessionEvent::HapticRumble:
+				gamepads.SetHapticRumble(e.strength);
+				break;
+			case SessionEvent::TriggerEffects:
+				gamepads.SetTriggerEffects(e.a, e.left, e.b, e.right);
+				break;
+			case SessionEvent::LedColor:
+				gamepads.SetLed(e.rgb);
+				break;
+			case SessionEvent::PlayerIndex:
+				gamepads.SetPlayerIndex(e.a);
+				break;
+			case SessionEvent::MotionReset:
+				gamepads.ResetMotion();
+				break;
+			case SessionEvent::Intensity:
+				gamepads.SetIntensity(e.a);
+				break;
+			case SessionEvent::LoginPinRequest:
+				login_pin_open = true;
+				login_pin_incorrect = e.flag;
+				memset(login_pin_buf, 0, sizeof(login_pin_buf));
+				break;
+			case SessionEvent::KeyboardOpen:
+				keyboard_open = true;
+				memset(keyboard_buf, 0, sizeof(keyboard_buf));
+				strncpy(keyboard_buf, e.text.c_str(), sizeof(keyboard_buf) - 1);
+				break;
+			case SessionEvent::KeyboardClose:
+				keyboard_open = false;
+				break;
+			case SessionEvent::Nickname:
+				if(!e.text.empty())
+					active_host.nickname = e.text;
+				break;
+		}
+	}
+}
+
+void App::SendInput()
+{
+	if(!session || phase != Phase::Streaming)
+		return;
+
+	if(gamepads.TakeMenuCombo())
+	{
+		overlay_open = !overlay_open;
+		if(!overlay_open)
+			input_guard = true;
+	}
+	if(gamepads.TakeMicButton())
+	{
+		bool muted = !session->MicMuted();
+		session->SetMicMuted(muted);
+		gamepads.SetMicLed(!muted);
+	}
+
+	// While the overlay or a dialog has focus, the pad drives the UI instead of the console.
+	ImGuiIO &io = ImGui::GetIO();
+	bool ui_focus = overlay_open || keyboard_open || login_pin_open;
+	if(ui_focus)
+		io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+	else
+		io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+
+	ChiakiControllerState state = gamepads.State();
+	if(input_guard)
+	{
+		if(state.buttons == 0 && state.l2_state < 16 && state.r2_state < 16)
+			input_guard = false;
+		else
+			ui_focus = true;
+	}
+	if(ui_focus)
+	{
+		if(!sent_idle)
+		{
+			ChiakiControllerState idle;
+			chiaki_controller_state_set_idle(&idle);
+			session->SetControllerState(idle);
+			last_sent = idle;
+			sent_idle = true;
+		}
+		return;
+	}
+	sent_idle = false;
+	if(!chiaki_controller_state_equals(&state, &last_sent))
+	{
+		session->SetControllerState(state);
+		last_sent = state;
+	}
+}
+
+void App::PresentFrame(bool new_frame)
+{
+	ImGui_ImplDX11_NewFrame();
+	ImGui_ImplSDL3_NewFrame();
+	ImGui::NewFrame();
+	BuildUi();
+	ImGui::Render();
+	renderer.BeginOverlay();
+	ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+	bool streaming = phase == Phase::Streaming && session;
+	RenderOptions opt;
+	opt.upscale = settings.upscale;
+	opt.sharpness = settings.sharpness;
+	opt.paper_white = settings.paper_white_nits;
+
+	bool frame_gen = streaming && settings.frame_gen && FrameGenUsable();
+	renderer.SetFrameGenEnabled(frame_gen);
+	opt.sync_interval = (settings.vsync || frame_gen || !streaming) ? 1 : 0;
+
+	if(frame_gen && new_frame && renderer.BuildInterpolatedFrame())
+	{
+		// Show the in-between frame on this refresh and the real frame on the next.
+		renderer.Present(VideoView::Interpolated, opt);
+		present_count++;
+		PumpEvents();
+		SendInput();
+		renderer.Present(VideoView::Latest, opt);
+		present_count++;
+	}
+	else
+	{
+		renderer.Present(streaming || phase == Phase::Connecting ? VideoView::Latest : VideoView::None, opt);
+		present_count++;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Connecting
+
+void App::BeginConnect(const std::string &mac)
+{
+	RegisteredHost *h = settings.FindHost(mac);
+	if(!h)
+		return;
+	active_host = *h;
+	active_address = h->last_address;
+	message.clear();
+
+	DiscoveredHost d;
+	bool found = discovery.Find(mac, &d);
+	if(found)
+	{
+		active_address = d.address;
+		if(d.address != h->last_address)
+		{
+			h->last_address = d.address;
+			MarkSettingsDirty();
+		}
+	}
+	if(active_address.empty())
+	{
+		message = "This console hasn't been seen on the network yet. Turn it on, or add it by IP address.";
+		message_is_error = true;
+		return;
+	}
+	if(found && d.ready)
+	{
+		StartStream();
+		return;
+	}
+	// In rest mode (or not answering discovery): wake it and wait.
+	Discovery::Wakeup(active_address, active_host.regist_key, active_host.ps5);
+	last_wakeup = NowMs();
+	phase = Phase::Waking;
+	phase_deadline = NowMs() + kWakeTimeoutMs;
+}
+
+void App::StartStream()
+{
+	StreamConfig cfg;
+	cfg.host = active_host;
+	cfg.address = active_address;
+	cfg.psn_account_id = settings.psn_account_id;
+	cfg.resolution = settings.resolution;
+	cfg.fps = settings.fps;
+	cfg.bitrate_kbps = settings.bitrate_kbps;
+	cfg.codec = settings.codec;
+	cfg.hdr = settings.hdr && (renderer.DisplayHdr() || settings.hdr_force);
+	cfg.dualsense = settings.dualsense_features;
+	cfg.haptics_gain = settings.haptics_gain;
+
+	session = std::make_unique<StreamSession>();
+	renderer.ResetVideo();
+	std::string error;
+	if(!session->Start(cfg, renderer.Device(), renderer.Context(), &audio, &error))
+	{
+		session.reset();
+		phase = Phase::Idle;
+		message = error;
+		message_is_error = true;
+		return;
+	}
+	phase = Phase::Connecting;
+	phase_deadline = NowMs() + 30000;
+	chiaki_controller_state_set_idle(&last_sent);
+	sent_idle = false;
+}
+
+void App::EndStream(const std::string &msg, bool is_error)
+{
+	if(session)
+	{
+		session->Stop();
+		session.reset();
+	}
+	gamepads.StopAllFeedback();
+	audio.CloseGame();
+	audio.CloseHaptics();
+	renderer.ResetVideo();
+	phase = Phase::Idle;
+	overlay_open = keyboard_open = login_pin_open = false;
+	ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+	message = msg;
+	message_is_error = is_error;
+}
+
+// ---------------------------------------------------------------------------
+// UI
+
+static void SectionTitle(const char *text)
+{
+	ImGui::Spacing();
+	ImGui::TextColored(ImVec4(0.55f, 0.72f, 1.0f, 1.0f), "%s", text);
+	ImGui::Separator();
+}
+
+static bool PrimaryButton(const char *label, const ImVec2 &size = ImVec2(0, 0))
+{
+	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.44f, 0.82f, 1.0f));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.12f, 0.53f, 0.92f, 1.0f));
+	bool r = ImGui::Button(label, size);
+	ImGui::PopStyleColor(2);
+	return r;
+}
+
+static void HelpText(const char *text)
+{
+	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.65f, 0.72f, 1.0f));
+	ImGui::PushTextWrapPos(0.0f);
+	ImGui::TextUnformatted(text);
+	ImGui::PopTextWrapPos();
+	ImGui::PopStyleColor();
+}
+
+void App::BuildUi()
+{
+	if(phase == Phase::Streaming && renderer.HasVideo())
+	{
+		if(settings.show_stats)
+			UiStats();
+		if(overlay_open)
+			UiStreamOverlay();
+		UiStreamDialogs();
+		UiMessage();
+		return;
+	}
+
+	ImGuiViewport *vp = ImGui::GetMainViewport();
+	ImGui::SetNextWindowPos(vp->Pos);
+	ImGui::SetNextWindowSize(vp->Size);
+	ImGui::Begin("##main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings
+		| ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+	UiSidebar();
+	ImGui::SameLine();
+	ImGui::BeginChild("##content", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_None);
+	switch(screen)
+	{
+		case Screen::Consoles: UiConsoles(); break;
+		case Screen::Settings: UiSettings(); break;
+		case Screen::Log: UiLog(); break;
+	}
+	ImGui::EndChild();
+	ImGui::End();
+
+	if(phase == Phase::Waking || phase == Phase::Connecting || (phase == Phase::Streaming && !renderer.HasVideo()))
+		UiConnecting();
+	UiPairDialog();
+	UiStreamDialogs();
+	UiMessage();
+}
+
+void App::UiSidebar()
+{
+	float w = 230.0f * ui_scale;
+	ImGui::BeginChild("##sidebar", ImVec2(w, 0), ImGuiChildFlags_Borders);
+	ImGui::Dummy(ImVec2(0, 6 * ui_scale));
+	ImGui::SetWindowFontScale(1.35f);
+	ImGui::TextColored(ImVec4(0.35f, 0.65f, 1.0f, 1.0f), "Orbit Play");
+	ImGui::SetWindowFontScale(1.0f);
+	HelpText("PS5 Remote Play");
+	ImGui::Dummy(ImVec2(0, 14 * ui_scale));
+
+	auto nav = [&](const char *label, Screen s) {
+		bool sel = screen == s;
+		if(ImGui::Selectable(label, sel, 0, ImVec2(0, 34 * ui_scale)))
+			screen = s;
+	};
+	nav("  Consoles", Screen::Consoles);
+	nav("  Settings", Screen::Settings);
+	nav("  Log", Screen::Log);
+
+	ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 150 * ui_scale);
+	ImGui::Separator();
+	HelpText("Controllers");
+	auto names = gamepads.Names();
+	if(names.empty())
+		ImGui::TextDisabled("None connected");
+	for(auto &n : names)
+		ImGui::TextUnformatted(n.c_str());
+	ImGui::Text("Display: %d Hz %s", renderer.DisplayHz(), renderer.DisplayHdr() ? "HDR" : "SDR");
+	ImGui::EndChild();
+}
+
+void App::UiConsoles()
+{
+	ImGui::SetWindowFontScale(1.25f);
+	ImGui::TextUnformatted("Consoles");
+	ImGui::SetWindowFontScale(1.0f);
+	HelpText("Your PS5 must be on the same network with Remote Play enabled (Settings > System > Remote Play).");
+	ImGui::Spacing();
+
+	std::vector<DiscoveredHost> found = discovery.Hosts();
+	auto discovered = [&](const std::string &mac) -> const DiscoveredHost * {
+		for(auto &d : found)
+			if(d.mac == mac)
+				return &d;
+		return nullptr;
+	};
+
+	float card_h = 128.0f * ui_scale;
+	int idx = 0;
+	std::string forget_mac;
+
+	// Paired consoles first
+	for(auto &h : settings.hosts)
+	{
+		const DiscoveredHost *d = discovered(h.mac);
+		ImGui::PushID(idx++);
+		ImGui::BeginChild("##card", ImVec2(0, card_h), ImGuiChildFlags_Borders);
+		ImGui::SetWindowFontScale(1.15f);
+		ImGui::TextUnformatted(h.nickname.empty() ? "PlayStation 5" : h.nickname.c_str());
+		ImGui::SetWindowFontScale(1.0f);
+		if(d)
+		{
+			ImGui::TextColored(d->ready ? ImVec4(0.4f, 0.9f, 0.5f, 1) : ImVec4(1.0f, 0.75f, 0.3f, 1),
+				d->ready ? "Ready" : "Rest mode");
+			ImGui::SameLine();
+			ImGui::TextDisabled("%s  |  %s", d->address.c_str(), d->ps5 ? "PS5" : "PS4");
+			if(!d->running_app.empty())
+			{
+				ImGui::SameLine();
+				ImGui::TextDisabled("|  Playing %s", d->running_app.c_str());
+			}
+		}
+		else
+			ImGui::TextDisabled("Not found right now  |  last seen at %s", h.last_address.empty() ? "?" : h.last_address.c_str());
+
+		ImGui::Spacing();
+		bool busy = phase != Phase::Idle;
+		ImGui::BeginDisabled(busy);
+		if(PrimaryButton(d && !d->ready ? "Wake & Play" : "Play", ImVec2(150 * ui_scale, 0)))
+			BeginConnect(h.mac);
+		ImGui::SameLine();
+		if(ImGui::Button("Wake"))
+			Discovery::Wakeup(d ? d->address : h.last_address, h.regist_key, h.ps5);
+		ImGui::SameLine();
+		if(ImGui::Button("Forget"))
+			forget_mac = h.mac;
+		ImGui::EndDisabled();
+		ImGui::EndChild();
+		ImGui::PopID();
+	}
+	if(!forget_mac.empty())
+	{
+		settings.RemoveHost(forget_mac);
+		MarkSettingsDirty();
+	}
+
+	// Discovered but not paired
+	for(auto &d : found)
+	{
+		if(settings.FindHost(d.mac))
+			continue;
+		ImGui::PushID(idx++);
+		ImGui::BeginChild("##card", ImVec2(0, card_h), ImGuiChildFlags_Borders);
+		ImGui::SetWindowFontScale(1.15f);
+		ImGui::TextUnformatted(d.name.empty() ? "PlayStation" : d.name.c_str());
+		ImGui::SetWindowFontScale(1.0f);
+		ImGui::TextDisabled("%s  |  %s  |  %s  |  not paired", d.address.c_str(), d.ps5 ? "PS5" : "PS4", d.ready ? "Ready" : "Rest mode");
+		ImGui::Spacing();
+		ImGui::BeginDisabled(!d.ready || phase != Phase::Idle);
+		if(PrimaryButton("Pair", ImVec2(150 * ui_scale, 0)))
+		{
+			pair_open = true;
+			pair_address = d.address;
+			pair_target = chiaki_target_is_unknown((ChiakiTarget)d.target) ? (d.ps5 ? CHIAKI_TARGET_PS5_1 : CHIAKI_TARGET_PS4_10) : d.target;
+			memset(pin_buf, 0, sizeof(pin_buf));
+		}
+		ImGui::EndDisabled();
+		if(!d.ready)
+		{
+			ImGui::SameLine();
+			HelpText("Turn the console fully on to pair it.");
+		}
+		ImGui::EndChild();
+		ImGui::PopID();
+	}
+
+	if(settings.hosts.empty() && found.empty())
+	{
+		ImGui::Spacing();
+		ImGui::TextDisabled("Searching for consoles on your network...");
+	}
+
+	SectionTitle("Add a console by IP address");
+	HelpText("Use this if your PS5 doesn't show up (e.g. it's on another subnet, or the PC has VPN adapters). "
+		"The PS5's IP is in Settings > Network > Connection Status.");
+	ImGui::SetNextItemWidth(260 * ui_scale);
+	ImGui::InputTextWithHint("##ip", "192.168.1.50", manual_ip_buf, sizeof(manual_ip_buf));
+	ImGui::SameLine();
+	if(ImGui::Button("Add") && manual_ip_buf[0])
+	{
+		std::string ip = manual_ip_buf;
+		bool exists = false;
+		for(auto &m : settings.manual_hosts)
+			exists |= m.address == ip;
+		if(!exists)
+			settings.manual_hosts.push_back({ ip });
+		discovery.ProbeAddress(ip);
+		memset(manual_ip_buf, 0, sizeof(manual_ip_buf));
+		MarkSettingsDirty();
+	}
+	for(size_t i = 0; i < settings.manual_hosts.size(); i++)
+	{
+		ImGui::PushID((int)(1000 + i));
+		ImGui::BulletText("%s", settings.manual_hosts[i].address.c_str());
+		ImGui::SameLine();
+		if(ImGui::SmallButton("Remove"))
+		{
+			settings.manual_hosts.erase(settings.manual_hosts.begin() + i);
+			MarkSettingsDirty();
+			ImGui::PopID();
+			break;
+		}
+		ImGui::PopID();
+	}
+
+}
+
+void App::UiPairDialog()
+{
+	if(!pair_open)
+		return;
+	ImGui::SetNextWindowSize(ImVec2(620 * ui_scale, 0));
+	ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+	if(!ImGui::IsPopupOpen("Pair console"))
+		ImGui::OpenPopup("Pair console");
+	if(!ImGui::BeginPopupModal("Pair console", nullptr, ImGuiWindowFlags_NoResize))
+		return;
+
+	ImGui::Text("Console: %s", pair_address.c_str());
+	ImGui::Spacing();
+
+	SectionTitle("1. Your PSN Account ID");
+	HelpText("Remote Play needs the ID of the PSN account signed in on the PS5. Sign in once to fetch it.");
+	ImGui::SetNextItemWidth(-1);
+	if(ImGui::InputTextWithHint("##acc", "Account ID (base64, e.g. AbCdEfGhIjk=)", account_buf, sizeof(account_buf)))
+	{
+		settings.psn_account_id = account_buf;
+		MarkSettingsDirty();
+	}
+	if(ImGui::Button("Sign in with PSN in browser"))
+		PsnLogin::OpenLoginPage();
+	HelpText("After signing in you'll land on a blank page. Copy that page's full address and paste it here:");
+	ImGui::SetNextItemWidth(-140 * ui_scale);
+	ImGui::InputTextWithHint("##redir", "https://remoteplay.dl.playstation.net/remoteplay/redirect?code=...", redirect_buf, sizeof(redirect_buf));
+	ImGui::SameLine();
+	ImGui::BeginDisabled(psn_login.GetState() == PsnLogin::State::Running);
+	if(ImGui::Button("Get ID", ImVec2(-1, 0)))
+		psn_login.Start(redirect_buf);
+	ImGui::EndDisabled();
+	switch(psn_login.GetState())
+	{
+		case PsnLogin::State::Running:
+			ImGui::TextDisabled("Contacting Sony...");
+			break;
+		case PsnLogin::State::Success:
+		{
+			std::string id = psn_login.AccountId();
+			if(id != account_buf)
+			{
+				strncpy(account_buf, id.c_str(), sizeof(account_buf) - 1);
+				settings.psn_account_id = id;
+				MarkSettingsDirty();
+			}
+			ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1), "Account ID fetched.");
+			break;
+		}
+		case PsnLogin::State::Failed:
+			ImGui::TextColored(ImVec4(1, 0.45f, 0.45f, 1), "%s", psn_login.Error().c_str());
+			break;
+		default:
+			break;
+	}
+
+	SectionTitle("2. Link code from the PS5");
+	HelpText("On the PS5: Settings > System > Remote Play > Link Device. Enter the 8-digit code shown.");
+	ImGui::SetNextItemWidth(220 * ui_scale);
+	ImGui::InputTextWithHint("##pin", "12345678", pin_buf, 9, ImGuiInputTextFlags_CharsDecimal);
+
+	ImGui::Spacing();
+	Registration::State rs = registration.GetState();
+	bool can_pair = strlen(pin_buf) == 8 && strlen(account_buf) > 0 && rs != Registration::State::Running;
+	ImGui::BeginDisabled(!can_pair);
+	if(PrimaryButton("Pair", ImVec2(160 * ui_scale, 0)))
+		registration.Start(pair_address, pair_target, account_buf, (uint32_t)strtoul(pin_buf, nullptr, 10));
+	ImGui::EndDisabled();
+	ImGui::SameLine();
+	if(ImGui::Button("Close", ImVec2(120 * ui_scale, 0)))
+	{
+		registration.Cancel();
+		pair_open = false;
+		ImGui::CloseCurrentPopup();
+	}
+
+	if(rs == Registration::State::Running)
+		ImGui::TextDisabled("Pairing...");
+	else if(rs == Registration::State::Failed)
+		ImGui::TextColored(ImVec4(1, 0.45f, 0.45f, 1), "%s", registration.Error().c_str());
+	else if(rs == Registration::State::Success)
+	{
+		RegisteredHost h = registration.Result();
+		settings.AddOrUpdateHost(h);
+		settings.Save(settings_path);
+		registration.Cancel();
+		pair_open = false;
+		message = "Paired with " + (h.nickname.empty() ? std::string("your console") : h.nickname) + ". Press Play to start.";
+		message_is_error = false;
+		ImGui::CloseCurrentPopup();
+	}
+	ImGui::EndPopup();
+}
+
+void App::UiSettings()
+{
+	bool changed = false;
+	ImGui::SetWindowFontScale(1.25f);
+	ImGui::TextUnformatted("Settings");
+	ImGui::SetWindowFontScale(1.0f);
+
+	float label_w = 260.0f * ui_scale;
+	auto label = [&](const char *t) {
+		ImGui::AlignTextToFramePadding();
+		ImGui::TextUnformatted(t);
+		ImGui::SameLine(label_w);
+		ImGui::SetNextItemWidth(320 * ui_scale);
+	};
+
+	SectionTitle("Stream");
+	{
+		label("Resolution");
+		const char *res_names[] = { "720p", "1080p (max for PS5 Remote Play)" };
+		int res_idx = settings.resolution >= 1080 ? 1 : 0;
+		if(ImGui::Combo("##res", &res_idx, res_names, 2))
+		{
+			settings.resolution = res_idx == 1 ? 1080 : 720;
+			changed = true;
+		}
+		label("Frame rate");
+		const char *fps_names[] = { "30 fps", "60 fps" };
+		int fps_idx = settings.fps >= 60 ? 1 : 0;
+		if(ImGui::Combo("##fps", &fps_idx, fps_names, 2))
+		{
+			settings.fps = fps_idx == 1 ? 60 : 30;
+			changed = true;
+		}
+		label("Codec");
+		const char *codec_names[] = { "H.264", "H.265 / HEVC (better quality, needed for HDR)" };
+		int codec_idx = (int)settings.codec;
+		if(ImGui::Combo("##codec", &codec_idx, codec_names, 2))
+		{
+			settings.codec = (VideoCodec)codec_idx;
+			changed = true;
+		}
+		label("Bitrate");
+		int mbps = settings.bitrate_kbps / 1000;
+		if(ImGui::SliderInt("##bitrate", &mbps, 0, 50, mbps == 0 ? "Auto (preset)" : "%d Mbps"))
+		{
+			settings.bitrate_kbps = mbps * 1000;
+			changed = true;
+		}
+		label("HDR");
+		changed |= ImGui::Checkbox("Stream in HDR10 when the display is in HDR mode", &settings.hdr);
+		ImGui::SameLine(label_w);
+		ImGui::Dummy(ImVec2(0, 0));
+		ImGui::SetCursorPosX(label_w);
+		changed |= ImGui::Checkbox("Also on SDR displays (tone-mapped on the PC)", &settings.hdr_force);
+		ImGui::SetCursorPosX(label_w);
+		HelpText(renderer.DisplayHdr() ? "This display is in HDR mode." :
+			"This display is in SDR mode. Turn on \"Use HDR\" in Windows Settings > Display to get real HDR.");
+		label("SDR / UI brightness in HDR");
+		changed |= ImGui::SliderFloat("##pw", &settings.paper_white_nits, 80.0f, 400.0f, "%.0f nits");
+	}
+
+	SectionTitle("Enhancements (optional)");
+	{
+		label("4K upscaling");
+		changed |= ImGui::Checkbox("Upscale the 1080p stream to the display (Lanczos + sharpening)", &settings.upscale);
+		label("Sharpness");
+		ImGui::BeginDisabled(!settings.upscale);
+		changed |= ImGui::SliderFloat("##sharp", &settings.sharpness, 0.0f, 1.0f, "%.2f");
+		ImGui::EndDisabled();
+		ImGui::SetCursorPosX(label_w);
+		HelpText("The PS5 sends at most 1080p. This makes it look sharper on a 1440p/4K screen; it can't add real 4K detail.");
+
+		label("120 fps frame generation");
+		changed |= ImGui::Checkbox("Insert motion-interpolated frames (60 -> 120 fps)", &settings.frame_gen);
+		ImGui::SetCursorPosX(label_w);
+		char buf[256];
+		if(FrameGenUsable())
+			snprintf(buf, sizeof(buf), "Your display runs at %d Hz - OK. Adds about half a frame of latency and can show "
+				"artifacts around fast-moving edges; best for slower games.", renderer.DisplayHz());
+		else
+			snprintf(buf, sizeof(buf), "Needs a display running at %d Hz or more (this one is at %d Hz). "
+				"It stays off until then.", settings.fps * 2, renderer.DisplayHz());
+		HelpText(buf);
+	}
+
+	SectionTitle("Display");
+	{
+		label("Fullscreen");
+		bool fs = settings.fullscreen;
+		if(ImGui::Checkbox("Borderless fullscreen (F11)", &fs))
+		{
+			settings.fullscreen = fs;
+			SetFullscreen(fs);
+			changed = true;
+		}
+		label("V-Sync");
+		changed |= ImGui::Checkbox("Sync to the display (off = lowest latency, may tear)", &settings.vsync);
+		label("Statistics");
+		changed |= ImGui::Checkbox("Show stream statistics while playing (F2)", &settings.show_stats);
+	}
+
+	SectionTitle("Controller");
+	{
+		label("DualSense features");
+		changed |= ImGui::Checkbox("Haptic feedback and adaptive triggers", &settings.dualsense_features);
+		ImGui::SetCursorPosX(label_w);
+		HelpText("Full haptics need the DualSense connected by USB cable (Windows doesn't expose its haptics over Bluetooth); "
+			"over Bluetooth it falls back to rumble. Adaptive triggers work either way.");
+		label("Haptics intensity");
+		changed |= ImGui::SliderFloat("##hg", &settings.haptics_gain, 0.0f, 2.0f, "%.2fx");
+		label("Adaptive triggers");
+		changed |= ImGui::Checkbox("Enabled##trig", &settings.adaptive_triggers);
+		label("Motion controls");
+		changed |= ImGui::Checkbox("Gyro / accelerometer", &settings.motion_controls);
+		label("Rumble strength");
+		changed |= ImGui::SliderFloat("##rg", &settings.rumble_gain, 0.0f, 2.0f, "%.2fx");
+		label("Xbox-style controllers");
+		changed |= ImGui::Checkbox("View button acts as touchpad press", &settings.view_is_touchpad);
+		ImGui::SetCursorPosX(label_w);
+		HelpText("Open the stream menu with Create + PS (View + Guide on Xbox pads), or F1/Esc on the keyboard.");
+	}
+
+	SectionTitle("Audio");
+	{
+		label("Volume");
+		if(ImGui::SliderFloat("##vol", &settings.volume, 0.0f, 1.5f, "%.2f"))
+		{
+			audio.SetVolume(settings.volume);
+			changed = true;
+		}
+		label("Microphone");
+		changed |= ImGui::Checkbox("Allow voice chat (toggle with the DualSense mute button)", &settings.microphone);
+	}
+
+	SectionTitle("Account");
+	{
+		label("PSN Account ID");
+		if(ImGui::InputText("##acc2", account_buf, sizeof(account_buf)))
+		{
+			settings.psn_account_id = account_buf;
+			changed = true;
+		}
+	}
+	ImGui::Dummy(ImVec2(0, 30 * ui_scale));
+
+	if(changed)
+		MarkSettingsDirty();
+}
+
+void App::UiLog()
+{
+	ImGui::SetWindowFontScale(1.25f);
+	ImGui::TextUnformatted("Log");
+	ImGui::SetWindowFontScale(1.0f);
+	HelpText(("Saved to " + data_dir + "\\orbitplay.log").c_str());
+	ImGui::BeginChild("##logtext", ImVec2(0, 0), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
+	for(const auto &line : Log::Get().Recent())
+	{
+		bool err = line.find("[E]") != std::string::npos;
+		bool warn = line.find("[W]") != std::string::npos;
+		if(err)
+			ImGui::TextColored(ImVec4(1, 0.45f, 0.45f, 1), "%s", line.c_str());
+		else if(warn)
+			ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "%s", line.c_str());
+		else
+			ImGui::TextUnformatted(line.c_str());
+	}
+	if(ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 20)
+		ImGui::SetScrollHereY(1.0f);
+	ImGui::EndChild();
+}
+
+void App::UiConnecting()
+{
+	ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+	ImGui::SetNextWindowSize(ImVec2(440 * ui_scale, 0));
+	ImGui::Begin("##connecting", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+	const char *what = phase == Phase::Waking ? "Waking up" : "Connecting to";
+	ImGui::Text("%s %s...", what, active_host.nickname.empty() ? "your PS5" : active_host.nickname.c_str());
+	float t = (float)ImGui::GetTime();
+	ImGui::ProgressBar(-1.0f * t, ImVec2(-1, 6 * ui_scale), "");
+	if(ImGui::Button("Cancel", ImVec2(-1, 0)))
+	{
+		if(phase == Phase::Waking)
+			phase = Phase::Idle;
+		else
+			EndStream("", false);
+	}
+	ImGui::End();
+}
+
+void App::UiStats()
+{
+	if(!session)
+		return;
+	StreamStats s = session->Stats();
+	ImGui::SetNextWindowPos(ImVec2(16 * ui_scale, 16 * ui_scale));
+	ImGui::SetNextWindowBgAlpha(0.65f);
+	ImGui::Begin("##stats", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs
+		| ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+	ImGui::Text("Stream   %dx%d  %s  %s", renderer.VideoWidth(), renderer.VideoHeight(), s.codec.c_str(),
+		renderer.VideoHdr() ? "HDR10" : "SDR");
+	ImGui::Text("Output   %s  %d Hz  %s", renderer.OutputHdr() ? "HDR10" : "SDR", renderer.DisplayHz(),
+		settings.upscale ? "Lanczos+CAS" : "Bilinear");
+	ImGui::Text("Decode   %.1f fps    Present %.1f fps%s", s.decode_fps, present_fps,
+		settings.frame_gen ? (FrameGenUsable() ? "  (frame gen)" : "  (frame gen needs 120 Hz)") : "");
+	ImGui::Text("Network  %.1f Mbps   RTT %.1f ms   lost frames %llu", s.mbps, s.rtt_ms, (unsigned long long)s.frames_lost);
+	ImGui::Text("Audio    %d ms queued   Haptics %s   Mic %s", audio.QueuedMs(),
+		audio.HapticsActive() ? "DualSense" : "rumble", session->MicMuted() ? "off" : "on");
+	ImGui::End();
+}
+
+void App::UiStreamOverlay()
+{
+	ImGuiViewport *vp = ImGui::GetMainViewport();
+	ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+	ImGui::SetNextWindowSize(ImVec2(520 * ui_scale, 0));
+	ImGui::SetNextWindowBgAlpha(0.92f);
+	ImGui::SetNextWindowFocus();
+	ImGui::Begin("Stream menu", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
+		| ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+	ImGui::Text("%s", active_host.nickname.empty() ? "PlayStation 5" : active_host.nickname.c_str());
+	ImGui::Separator();
+
+	if(PrimaryButton("Resume", ImVec2(-1, 0)) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight))
+	{
+		overlay_open = false;
+		input_guard = true;
+	}
+	if(session && settings.microphone)
+	{
+		bool muted = session->MicMuted();
+		if(ImGui::Button(muted ? "Turn microphone on" : "Mute microphone", ImVec2(-1, 0)))
+		{
+			session->SetMicMuted(!muted);
+			gamepads.SetMicLed(muted);
+		}
+	}
+	bool changed = false;
+	changed |= ImGui::Checkbox("4K upscaling", &settings.upscale);
+	if(settings.upscale)
+	{
+		ImGui::SetNextItemWidth(-1);
+		changed |= ImGui::SliderFloat("##sharp_o", &settings.sharpness, 0.0f, 1.0f, "Sharpness %.2f");
+	}
+	ImGui::BeginDisabled(!FrameGenUsable());
+	changed |= ImGui::Checkbox("120 fps frame generation", &settings.frame_gen);
+	ImGui::EndDisabled();
+	changed |= ImGui::Checkbox("Show statistics", &settings.show_stats);
+	bool fs = settings.fullscreen;
+	if(ImGui::Checkbox("Fullscreen", &fs))
+	{
+		settings.fullscreen = fs;
+		SetFullscreen(fs);
+		changed = true;
+	}
+	ImGui::SetNextItemWidth(-1);
+	if(ImGui::SliderFloat("##vol_o", &settings.volume, 0.0f, 1.5f, "Volume %.2f"))
+	{
+		audio.SetVolume(settings.volume);
+		changed = true;
+	}
+	if(changed)
+		MarkSettingsDirty();
+
+	ImGui::Separator();
+	if(ImGui::Button("PS Home screen", ImVec2(-1, 0)) && session)
+	{
+		session->GoHome();
+		overlay_open = false;
+		input_guard = true;
+	}
+	if(ImGui::Button("Put console in rest mode", ImVec2(-1, 0)) && session)
+	{
+		session->GotoBed();
+		EndStream("", false);
+	}
+	if(ImGui::Button("Disconnect", ImVec2(-1, 0)))
+		EndStream("", false);
+	ImGui::End();
+}
+
+void App::UiStreamDialogs()
+{
+	if(login_pin_open && session)
+	{
+		ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+		ImGui::SetNextWindowSize(ImVec2(440 * ui_scale, 0));
+		ImGui::Begin("Console login passcode", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings);
+		if(login_pin_incorrect)
+			ImGui::TextColored(ImVec4(1, 0.45f, 0.45f, 1), "Incorrect passcode, try again.");
+		HelpText("This PS5 user has a login passcode. Enter it to continue.");
+		ImGui::SetNextItemWidth(-1);
+		if(ImGui::IsWindowAppearing())
+			ImGui::SetKeyboardFocusHere();
+		bool enter = ImGui::InputText("##lpin", login_pin_buf, 5, ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_Password
+			| ImGuiInputTextFlags_EnterReturnsTrue);
+		if((PrimaryButton("OK", ImVec2(120 * ui_scale, 0)) || enter) && strlen(login_pin_buf) == 4)
+		{
+			session->SetLoginPin(login_pin_buf);
+			login_pin_open = false;
+			input_guard = true;
+		}
+		ImGui::SameLine();
+		if(ImGui::Button("Cancel", ImVec2(120 * ui_scale, 0)))
+		{
+			login_pin_open = false;
+			EndStream("", false);
+		}
+		ImGui::End();
+	}
+
+	if(keyboard_open && session)
+	{
+		ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+		ImGui::SetNextWindowSize(ImVec2(560 * ui_scale, 0));
+		ImGui::Begin("Text input", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings);
+		HelpText("The PS5 asked for text. Type it here and press Enter.");
+		ImGui::SetNextItemWidth(-1);
+		if(ImGui::IsWindowAppearing())
+			ImGui::SetKeyboardFocusHere();
+		bool enter = ImGui::InputText("##kb", keyboard_buf, sizeof(keyboard_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+		if(PrimaryButton("Send", ImVec2(120 * ui_scale, 0)) || enter)
+		{
+			session->KeyboardSetText(keyboard_buf);
+			session->KeyboardAccept();
+			keyboard_open = false;
+			input_guard = true;
+		}
+		ImGui::SameLine();
+		if(ImGui::Button("Cancel", ImVec2(120 * ui_scale, 0)))
+		{
+			session->KeyboardReject();
+			keyboard_open = false;
+			input_guard = true;
+		}
+		ImGui::End();
+	}
+}
+
+void App::UiMessage()
+{
+	if(message.empty())
+		return;
+	ImGuiViewport *vp = ImGui::GetMainViewport();
+	ImGui::SetNextWindowPos(ImVec2(vp->GetCenter().x, vp->Pos.y + vp->Size.y - 40 * ui_scale), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+	ImGui::SetNextWindowSize(ImVec2(std::min(760.0f * ui_scale, vp->Size.x - 40), 0));
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, message_is_error ? ImVec4(0.30f, 0.08f, 0.09f, 0.96f) : ImVec4(0.06f, 0.20f, 0.35f, 0.96f));
+	ImGui::Begin("##message", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings
+		| ImGuiWindowFlags_AlwaysAutoResize);
+	ImGui::PushTextWrapPos(0.0f);
+	ImGui::TextUnformatted(message.c_str());
+	ImGui::PopTextWrapPos();
+	if(ImGui::Button("OK", ImVec2(100 * ui_scale, 0)))
+		message.clear();
+	ImGui::End();
+	ImGui::PopStyleColor();
+}
