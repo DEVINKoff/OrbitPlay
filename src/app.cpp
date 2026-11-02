@@ -165,10 +165,70 @@ void App::SetFullscreen(bool fullscreen)
 	SDL_SetWindowFullscreen(window, fullscreen);
 }
 
-bool App::FrameGenUsable() const
+int App::FrameGenMultiplier() const
 {
+	if(settings.frame_gen == 0)
+		return 1;
 	int fps = session ? session->Config().fps : settings.fps;
-	return renderer.DisplayHz() >= fps * 2 - 5;
+	int hz = renderer.DisplayHz();
+	int max_mult = 1;
+	for(int m = 4; m >= 2; m--)
+		if(fps * m <= hz + 5) // e.g. 60 fps x 4 = 240 Hz; tolerate 239.76 Hz modes
+		{
+			max_mult = m;
+			break;
+		}
+	if(settings.frame_gen == 1)
+		return max_mult;
+	return std::min(settings.frame_gen, max_mult);
+}
+
+ProcessOptions App::MakeProcessOptions() const
+{
+	ProcessOptions o;
+	o.upscale = (UpscaleMode)std::clamp(settings.upscale_mode, 0, 2);
+	o.target_height = settings.upscale_target;
+	o.artifact_reduction = settings.artifact_reduction;
+	o.sharpness = settings.sharpness;
+	o.ai_hdr = settings.ai_hdr;
+	o.frame_gen = FrameGenMultiplier() > 1;
+	o.ambient = settings.ambient && settings.aspect_mode == 0;
+	o.aspect = (AspectMode)std::clamp(settings.aspect_mode, 0, 2);
+	return o;
+}
+
+PresentOptions App::MakePresentOptions(int sync_interval) const
+{
+	PresentOptions o;
+	o.sync_interval = sync_interval;
+	o.paper_white = settings.paper_white_nits;
+	o.hdr_boost = settings.hdr_boost;
+	o.ambient = (settings.ambient && settings.aspect_mode == 0) ? settings.ambient_intensity : 0.0f;
+	o.aspect = (AspectMode)std::clamp(settings.aspect_mode, 0, 2);
+	o.brightness = settings.brightness;
+	o.contrast = settings.contrast;
+	o.saturation = settings.saturation;
+	o.vibrance = settings.vibrance;
+	return o;
+}
+
+void App::TakeScreenshot()
+{
+	if(!renderer.HasVideo())
+		return;
+	wchar_t profile[MAX_PATH] = {};
+	DWORD n = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+	std::wstring dir = (n ? std::wstring(profile) : std::wstring(L".")) + L"\\Pictures\\Orbit Play";
+	CreateDirectoryW(dir.c_str(), nullptr);
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+	wchar_t name[64];
+	swprintf(name, 64, L"\\OrbitPlay_%04d%02d%02d_%02d%02d%02d.png", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+	if(renderer.SaveScreenshot(dir + name, MakePresentOptions(1)))
+	{
+		toast = "Screenshot saved to Pictures\\Orbit Play";
+		toast_until = NowMs() + 2500;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -190,12 +250,13 @@ void App::Run()
 			AVFrame *frame = session->PullFrame();
 			if(frame)
 			{
-				new_frame = renderer.SubmitFrame(frame);
+				new_frame = renderer.SubmitFrame(frame, MakeProcessOptions());
 				av_frame_free(&frame);
 			}
 		}
 
 		bool ui_needed = !streaming || overlay_open || settings.show_stats || login_pin_open || keyboard_open || !message.empty()
+			|| NowMs() < toast_until
 			|| !renderer.HasVideo();
 		if(streaming && !new_frame && !ui_needed)
 		{
@@ -251,6 +312,8 @@ void App::PumpEvents()
 					if(!overlay_open)
 						input_guard = true;
 				}
+				else if(phase == Phase::Streaming && e.key.key == SDLK_F12)
+					TakeScreenshot();
 				else if(phase == Phase::Streaming && e.key.key == SDLK_F2)
 				{
 					settings.show_stats = !settings.show_stats;
@@ -330,6 +393,12 @@ void App::Tick()
 	if(session)
 		session->SetHapticsGain(settings.haptics_gain);
 
+	if(reconnect_at && now >= reconnect_at && phase == Phase::Idle)
+	{
+		reconnect_at = 0;
+		BeginConnect(active_host.mac);
+	}
+
 	if(now - present_window_start >= 1000)
 	{
 		present_fps = present_count * 1000.0 / (double)(now - present_window_start);
@@ -348,6 +417,7 @@ void App::HandleSessionEvents()
 		{
 			case SessionEvent::Connected:
 				phase = Phase::Streaming;
+				reconnect_attempts = 0;
 				overlay_open = false;
 				input_guard = true;
 				gamepads.SetMicLed(false);
@@ -355,8 +425,21 @@ void App::HandleSessionEvents()
 					audio.OpenHaptics();
 				break;
 			case SessionEvent::Quit:
+			{
+				// Unexpected drop (Wi-Fi hiccup, console busy): try to get back in automatically.
+				bool was_streaming = phase == Phase::Streaming;
+				if(e.flag && was_streaming && settings.auto_reconnect && reconnect_attempts < 3)
+				{
+					reconnect_attempts++;
+					EndStream("", false);
+					reconnect_at = NowMs() + 2000;
+					toast = "Connection lost - reconnecting (" + std::to_string(reconnect_attempts) + "/3)...";
+					toast_until = reconnect_at + 4000;
+					return;
+				}
 				EndStream(e.flag ? "Disconnected: " + e.text : "", e.flag);
 				return; // session is gone
+			}
 			case SessionEvent::Rumble:
 				gamepads.SetRumble(e.a, e.b);
 				break;
@@ -464,30 +547,37 @@ void App::PresentFrame(bool new_frame)
 	ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
 	bool streaming = phase == Phase::Streaming && session;
-	RenderOptions opt;
-	opt.upscale = settings.upscale;
-	opt.sharpness = settings.sharpness;
-	opt.paper_white = settings.paper_white_nits;
+	int mult = streaming ? FrameGenMultiplier() : 1;
+	PresentOptions opt = MakePresentOptions((settings.vsync || mult > 1 || !streaming) ? 1 : 0);
 
-	bool frame_gen = streaming && settings.frame_gen && FrameGenUsable();
-	renderer.SetFrameGenEnabled(frame_gen);
-	opt.sync_interval = (settings.vsync || frame_gen || !streaming) ? 1 : 0;
+	auto present = [&](VideoView view) {
+		renderer.Present(view, opt);
+		present_count++;
+		uint64_t now_us = chiaki_time_now_monotonic_us();
+		if(last_present_us)
+		{
+			frame_times[frame_time_pos] = (float)((now_us - last_present_us) / 1000.0);
+			frame_time_pos = (frame_time_pos + 1) % (int)(sizeof(frame_times) / sizeof(frame_times[0]));
+		}
+		last_present_us = now_us;
+	};
 
-	if(frame_gen && new_frame && renderer.BuildInterpolatedFrame())
+	if(mult > 1 && new_frame && renderer.PrepareMotion())
 	{
-		// Show the in-between frame on this refresh and the real frame on the next.
-		renderer.Present(VideoView::Interpolated, opt);
-		present_count++;
-		PumpEvents();
-		SendInput();
-		renderer.Present(VideoView::Latest, opt);
-		present_count++;
+		// Show (mult - 1) generated frames on the next refreshes, then the real frame:
+		// 2x = 120 fps, 3x = 180 fps, 4x = 240 fps from a 60 fps stream.
+		for(int k = 1; k < mult; k++)
+		{
+			if(!renderer.BuildInterpolatedFrame((float)k / (float)mult))
+				break;
+			present(VideoView::Interpolated);
+			PumpEvents();
+			SendInput();
+		}
+		present(VideoView::Latest);
 	}
 	else
-	{
-		renderer.Present(streaming || phase == Phase::Connecting ? VideoView::Latest : VideoView::None, opt);
-		present_count++;
-	}
+		present(streaming || phase == Phase::Connecting ? VideoView::Latest : VideoView::None);
 }
 
 // ---------------------------------------------------------------------------
@@ -564,6 +654,7 @@ void App::StartStream()
 
 void App::EndStream(const std::string &msg, bool is_error)
 {
+	reconnect_at = 0;
 	if(session)
 	{
 		session->Stop();
@@ -969,29 +1060,11 @@ void App::UiSettings()
 		changed |= ImGui::SliderFloat("##pw", &settings.paper_white_nits, 80.0f, 400.0f, "%.0f nits");
 	}
 
-	SectionTitle("Enhancements (optional)");
-	{
-		label("4K upscaling");
-		changed |= ImGui::Checkbox("Upscale the 1080p stream to the display (Lanczos + sharpening)", &settings.upscale);
-		label("Sharpness");
-		ImGui::BeginDisabled(!settings.upscale);
-		changed |= ImGui::SliderFloat("##sharp", &settings.sharpness, 0.0f, 1.0f, "%.2f");
-		ImGui::EndDisabled();
-		ImGui::SetCursorPosX(label_w);
-		HelpText("The PS5 sends at most 1080p. This makes it look sharper on a 1440p/4K screen; it can't add real 4K detail.");
+	SectionTitle("Upscaling & frame generation (optional)");
+	UiEnhancementControls(false);
 
-		label("120 fps frame generation");
-		changed |= ImGui::Checkbox("Insert motion-interpolated frames (60 -> 120 fps)", &settings.frame_gen);
-		ImGui::SetCursorPosX(label_w);
-		char buf[256];
-		if(FrameGenUsable())
-			snprintf(buf, sizeof(buf), "Your display runs at %d Hz - OK. Adds about half a frame of latency and can show "
-				"artifacts around fast-moving edges; best for slower games.", renderer.DisplayHz());
-		else
-			snprintf(buf, sizeof(buf), "Needs a display running at %d Hz or more (this one is at %d Hz). "
-				"It stays off until then.", settings.fps * 2, renderer.DisplayHz());
-		HelpText(buf);
-	}
+	SectionTitle("Picture");
+	UiPictureControls(false);
 
 	SectionTitle("Display");
 	{
@@ -1007,6 +1080,10 @@ void App::UiSettings()
 		changed |= ImGui::Checkbox("Sync to the display (off = lowest latency, may tear)", &settings.vsync);
 		label("Statistics");
 		changed |= ImGui::Checkbox("Show stream statistics while playing (F2)", &settings.show_stats);
+		label("Reconnect");
+		changed |= ImGui::Checkbox("Reconnect automatically if the stream drops", &settings.auto_reconnect);
+		ImGui::SetCursorPosX(label_w);
+		HelpText("F12 saves a screenshot to Pictures\\Orbit Play.");
 	}
 
 	SectionTitle("Controller");
@@ -1053,6 +1130,173 @@ void App::UiSettings()
 	}
 	ImGui::Dummy(ImVec2(0, 30 * ui_scale));
 
+	if(changed)
+		MarkSettingsDirty();
+}
+
+// Shared between the Settings page (labelled rows) and the in-stream menu (compact).
+void App::UiEnhancementControls(bool compact)
+{
+	bool changed = false;
+	float label_w = 260.0f * ui_scale;
+	auto row = [&](const char *t) {
+		if(compact)
+		{
+			ImGui::TextDisabled("%s", t);
+			ImGui::SetNextItemWidth(-1);
+			return;
+		}
+		ImGui::AlignTextToFramePadding();
+		ImGui::TextUnformatted(t);
+		ImGui::SameLine(label_w);
+		ImGui::SetNextItemWidth(360 * ui_scale);
+	};
+	auto help = [&](const char *t) {
+		if(compact)
+			return;
+		ImGui::SetCursorPosX(label_w);
+		HelpText(t);
+	};
+
+	// Upscaling
+	row("Upscaling");
+	std::string ai_name = renderer.AiSuperResolutionAvailable()
+		? "AI super resolution (" + renderer.GpuVendorName() + ")"
+		: std::string("AI super resolution (needs NVIDIA RTX / Intel)");
+	const char *modes[] = { "Off", "Enhanced (any GPU)", ai_name.c_str() };
+	changed |= ImGui::Combo("##upmode", &settings.upscale_mode, modes, 3);
+
+	ImGui::BeginDisabled(settings.upscale_mode == 0);
+	row("Upscale to");
+	const char *targets[] = { "Match display", "1440p (2K)", "1800p", "2160p (4K)" };
+	const int target_values[] = { 0, 1440, 1800, 2160 };
+	int ti = 0;
+	for(int i = 0; i < 4; i++)
+		if(settings.upscale_target == target_values[i])
+			ti = i;
+	if(ImGui::Combo("##uptarget", &ti, targets, 4))
+	{
+		settings.upscale_target = target_values[ti];
+		changed = true;
+	}
+	bool ai = settings.upscale_mode == 2 && renderer.AiSuperResolutionAvailable();
+	ImGui::BeginDisabled(ai);
+	row("Artifact reduction");
+	changed |= ImGui::SliderFloat("##artifact", &settings.artifact_reduction, 0.0f, 1.0f, "%.2f");
+	row("Sharpness");
+	changed |= ImGui::SliderFloat("##sharp", &settings.sharpness, 0.0f, 1.0f, "%.2f");
+	ImGui::EndDisabled();
+	ImGui::EndDisabled();
+	if(settings.upscale_mode == 2)
+	{
+		if(renderer.AiSuperResolutionAvailable() && renderer.GpuVendorName() == "NVIDIA")
+			help("Uses NVIDIA RTX Video Super Resolution (RTX 20-series or newer). If the stats show no change, turn on "
+				"\"RTX Video Enhancement > Super Resolution\" in the NVIDIA App / Control Panel and pick quality 4 for the best result.");
+		else if(renderer.AiSuperResolutionAvailable())
+			help("Uses Intel Video Super Resolution (Arc or Iris Xe graphics with a current driver).");
+		else
+			help("This GPU has no driver AI upscaler, so the Enhanced upscaler is used. On AMD you can also turn on "
+				"\"Video Upscale\" in AMD Software.");
+	}
+	else if(settings.upscale_mode == 1)
+		help("Removes compression blocking first, then upscales along edges and only sharpens real detail, so it stays clean instead of grainy.");
+	if(!compact)
+	{
+		ImGui::SetCursorPosX(label_w);
+		HelpText(("Now: " + renderer.UpscalerStatus()).c_str());
+	}
+
+	// AI HDR
+	row("AI HDR for SDR games");
+	ImGui::BeginDisabled(!renderer.AiHdrAvailable());
+	changed |= ImGui::Checkbox(renderer.AiHdrAvailable() ? "NVIDIA RTX Video HDR##aihdr" : "Needs an NVIDIA RTX GPU##aihdr", &settings.ai_hdr);
+	ImGui::EndDisabled();
+	row("HDR boost (any GPU)");
+	changed |= ImGui::SliderFloat("##hdrboost", &settings.hdr_boost, 0.0f, 1.0f, settings.hdr_boost < 0.01f ? "Off" : "%.2f");
+	help("For SDR games on an HDR display: expands highlights toward your display's peak brightness. AI HDR (if available) takes priority.");
+
+	// Frame generation
+	row("Frame generation");
+	const char *fg[] = { "Off", "Auto (best for this display)", "2x (120 fps)", "3x (180 fps)", "4x (240 fps)" };
+	changed |= ImGui::Combo("##fg", &settings.frame_gen, fg, 5);
+	if(!compact)
+	{
+		int mult = FrameGenMultiplier();
+		int fps = session ? session->Config().fps : settings.fps;
+		char buf[320];
+		if(settings.frame_gen == 0)
+			snprintf(buf, sizeof(buf), "Your display runs at %d Hz.", renderer.DisplayHz());
+		else if(mult <= 1)
+			snprintf(buf, sizeof(buf), "Needs a display at %d Hz or more (this one is %d Hz).", fps * 2, renderer.DisplayHz());
+		else
+			snprintf(buf, sizeof(buf), "Active: %d fps on your %d Hz display. Generated frames add about %.0f ms of latency "
+				"and can show artifacts on fast, complex motion.", fps * mult, renderer.DisplayHz(),
+				1000.0 / fps * (mult - 1) / mult);
+		ImGui::SetCursorPosX(label_w);
+		HelpText(buf);
+	}
+
+	if(changed)
+		MarkSettingsDirty();
+}
+
+void App::UiPictureControls(bool compact)
+{
+	bool changed = false;
+	float label_w = 260.0f * ui_scale;
+	auto row = [&](const char *t) {
+		if(compact)
+		{
+			ImGui::TextDisabled("%s", t);
+			ImGui::SetNextItemWidth(-1);
+			return;
+		}
+		ImGui::AlignTextToFramePadding();
+		ImGui::TextUnformatted(t);
+		ImGui::SameLine(label_w);
+		ImGui::SetNextItemWidth(360 * ui_scale);
+	};
+
+	row("Aspect ratio");
+	const char *aspects[] = { "Fit (16:9, with ambient bars)", "Fill (crop to screen)", "Stretch" };
+	changed |= ImGui::Combo("##aspect", &settings.aspect_mode, aspects, 3);
+	ImGui::BeginDisabled(settings.aspect_mode != 0);
+	row("Ambient lighting");
+	changed |= ImGui::Checkbox("Glow the picture's edge colors into the bars##amb", &settings.ambient);
+	if(settings.ambient)
+	{
+		row("Ambient intensity");
+		changed |= ImGui::SliderFloat("##ambi", &settings.ambient_intensity, 0.1f, 1.0f, "%.2f");
+	}
+	ImGui::EndDisabled();
+	if(!compact)
+	{
+		ImGui::SetCursorPosX(label_w);
+		HelpText("Shows up on ultrawide screens (or any window wider or taller than 16:9).");
+	}
+
+	row("Picture mode");
+	const char *presets[] = { "Natural", "Vivid", "Cinema", "Custom" };
+	int preset = settings.picture_preset;
+	if(ImGui::Combo("##preset", &preset, presets, 4))
+	{
+		settings.ApplyPicturePreset(preset);
+		changed = true;
+	}
+	bool custom = false;
+	row("Brightness");
+	custom |= ImGui::SliderFloat("##bri", &settings.brightness, -0.2f, 0.2f, "%+.2f");
+	row("Contrast");
+	custom |= ImGui::SliderFloat("##con", &settings.contrast, 0.7f, 1.3f, "%.2f");
+	row("Saturation");
+	custom |= ImGui::SliderFloat("##sat", &settings.saturation, 0.0f, 1.6f, "%.2f");
+	row("Vibrance");
+	custom |= ImGui::SliderFloat("##vib", &settings.vibrance, 0.0f, 1.0f, "%.2f");
+	if(custom)
+	{
+		settings.picture_preset = 3;
+		changed = true;
+	}
 	if(changed)
 		MarkSettingsDirty();
 }
@@ -1110,13 +1354,26 @@ void App::UiStats()
 		| ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
 	ImGui::Text("Stream   %dx%d  %s  %s", renderer.VideoWidth(), renderer.VideoHeight(), s.codec.c_str(),
 		renderer.VideoHdr() ? "HDR10" : "SDR");
-	ImGui::Text("Output   %s  %d Hz  %s", renderer.OutputHdr() ? "HDR10" : "SDR", renderer.DisplayHz(),
-		settings.upscale ? "Lanczos+CAS" : "Bilinear");
-	ImGui::Text("Decode   %.1f fps    Present %.1f fps%s", s.decode_fps, present_fps,
-		settings.frame_gen ? (FrameGenUsable() ? "  (frame gen)" : "  (frame gen needs 120 Hz)") : "");
+	ImGui::Text("Output   %dx%d  %s  %d Hz", renderer.OutputVideoWidth(), renderer.OutputVideoHeight(),
+		renderer.OutputHdr() ? "HDR10" : "SDR", renderer.DisplayHz());
+	ImGui::Text("Upscale  %s", renderer.UpscalerStatus().c_str());
+	int mult = FrameGenMultiplier();
+	char fg[48] = "";
+	if(mult > 1)
+		snprintf(fg, sizeof(fg), "  (frame gen %dx)", mult);
+	ImGui::Text("Decode   %.1f fps    Present %.1f fps%s", s.decode_fps, present_fps, fg);
 	ImGui::Text("Network  %.1f Mbps   RTT %.1f ms   lost frames %llu", s.mbps, s.rtt_ms, (unsigned long long)s.frames_lost);
 	ImGui::Text("Audio    %d ms queued   Haptics %s   Mic %s", audio.QueuedMs(),
 		audio.HapticsActive() ? "DualSense" : "rumble", session->MicMuted() ? "off" : "on");
+	// Frame pacing graph: time between presented frames (flat line = smooth)
+	const int n = (int)(sizeof(frame_times) / sizeof(frame_times[0]));
+	float worst = 0.0f;
+	for(int i = 0; i < n; i++)
+		worst = std::max(worst, frame_times[i]);
+	char overlay_txt[48];
+	snprintf(overlay_txt, sizeof(overlay_txt), "frame time (max %.1f ms)", worst);
+	ImGui::PlotLines("##ft", frame_times, n, frame_time_pos, overlay_txt, 0.0f, std::max(34.0f, worst),
+		ImVec2(420 * ui_scale, 60 * ui_scale));
 	ImGui::End();
 }
 
@@ -1124,7 +1381,8 @@ void App::UiStreamOverlay()
 {
 	ImGuiViewport *vp = ImGui::GetMainViewport();
 	ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-	ImGui::SetNextWindowSize(ImVec2(520 * ui_scale, 0));
+	ImGui::SetNextWindowSize(ImVec2(560 * ui_scale, 0));
+	ImGui::SetNextWindowSizeConstraints(ImVec2(560 * ui_scale, 0), ImVec2(560 * ui_scale, vp->Size.y * 0.9f));
 	ImGui::SetNextWindowBgAlpha(0.92f);
 	ImGui::SetNextWindowFocus();
 	ImGui::Begin("Stream menu", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
@@ -1146,16 +1404,13 @@ void App::UiStreamOverlay()
 			gamepads.SetMicLed(muted);
 		}
 	}
+	if(ImGui::Button("Save screenshot (F12)", ImVec2(-1, 0)))
+		TakeScreenshot();
+	if(ImGui::CollapsingHeader("Image quality & frame rate"))
+		UiEnhancementControls(true);
+	if(ImGui::CollapsingHeader("Picture & ambient light"))
+		UiPictureControls(true);
 	bool changed = false;
-	changed |= ImGui::Checkbox("4K upscaling", &settings.upscale);
-	if(settings.upscale)
-	{
-		ImGui::SetNextItemWidth(-1);
-		changed |= ImGui::SliderFloat("##sharp_o", &settings.sharpness, 0.0f, 1.0f, "Sharpness %.2f");
-	}
-	ImGui::BeginDisabled(!FrameGenUsable());
-	changed |= ImGui::Checkbox("120 fps frame generation", &settings.frame_gen);
-	ImGui::EndDisabled();
 	changed |= ImGui::Checkbox("Show statistics", &settings.show_stats);
 	bool fs = settings.fullscreen;
 	if(ImGui::Checkbox("Fullscreen", &fs))
@@ -1250,6 +1505,16 @@ void App::UiStreamDialogs()
 
 void App::UiMessage()
 {
+	if(!toast.empty() && NowMs() < toast_until)
+	{
+		ImGuiViewport *tv = ImGui::GetMainViewport();
+		ImGui::SetNextWindowPos(ImVec2(tv->GetCenter().x, tv->Pos.y + 24 * ui_scale), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+		ImGui::SetNextWindowBgAlpha(0.8f);
+		ImGui::Begin("##toast", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs
+			| ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+		ImGui::TextUnformatted(toast.c_str());
+		ImGui::End();
+	}
 	if(message.empty())
 		return;
 	ImGuiViewport *vp = ImGui::GetMainViewport();

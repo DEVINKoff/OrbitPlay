@@ -43,11 +43,26 @@ struct Settings
 	bool hdr = true;            // request HDR (HEVC Main10, PQ) when the display supports it
 	bool hdr_force = false;     // request HDR even if the display reports SDR (tone-mapped locally)
 
-	// Optional enhancements (both off by default)
-	bool upscale = false;       // upscale the 1080p stream to the display (e.g. 4K) with Lanczos + sharpening
-	float sharpness = 0.5f;     // 0..1
-	bool frame_gen = false;     // motion-interpolated frames: 60 fps stream -> 120 fps output
+	// Optional enhancements (off by default)
+	int upscale_mode = 0;       // 0 off, 1 enhanced (shader), 2 AI super resolution (NVIDIA RTX / Intel, falls back to enhanced)
+	int upscale_target = 0;     // output height: 0 = match the display, or 1440 / 1800 / 2160
+	float artifact_reduction = 0.4f; // removes compression blocking/noise before upscaling (enhanced mode)
+	float sharpness = 0.3f;     // 0..1, noise-gated (enhanced mode)
+	int frame_gen = 0;          // 0 off, 1 auto (highest your display allows), 2/3/4 = 2x/3x/4x (120/180/240 fps)
 	float paper_white_nits = 203.0f; // brightness of SDR content/UI on an HDR display
+	bool ai_hdr = false;        // NVIDIA RTX Video HDR: AI SDR->HDR for SDR games on an HDR display
+	float hdr_boost = 0.0f;     // shader SDR->HDR highlight expansion (any GPU), 0..1
+
+	// Picture
+	int aspect_mode = 0;        // 0 fit, 1 fill (crop), 2 stretch
+	bool ambient = true;        // ambient light in the bars (ultrawide / non-16:9 windows)
+	float ambient_intensity = 0.7f;
+	int picture_preset = 0;     // 0 natural, 1 vivid, 2 cinema, 3 custom
+	float brightness = 0.0f, contrast = 1.0f, saturation = 1.0f, vibrance = 0.0f;
+	void ApplyPicturePreset(int preset);
+
+	// Behaviour
+	bool auto_reconnect = true;
 
 	// Display
 	bool fullscreen = true;

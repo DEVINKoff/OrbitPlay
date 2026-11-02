@@ -117,6 +117,21 @@ std::string NormalizeMac(const std::string &host_id)
 }
 
 // ---------------------------------------------------------------------------
+// Picture presets
+
+void Settings::ApplyPicturePreset(int preset)
+{
+	picture_preset = preset;
+	switch(preset)
+	{
+		case 0: brightness = 0.0f;  contrast = 1.0f;  saturation = 1.0f;  vibrance = 0.0f;  break; // Natural
+		case 1: brightness = 0.0f;  contrast = 1.06f; saturation = 1.08f; vibrance = 0.35f; break; // Vivid
+		case 2: brightness = -0.02f; contrast = 1.04f; saturation = 0.94f; vibrance = 0.0f; break; // Cinema
+		default: break; // Custom keeps the current values
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Hosts
 
 RegisteredHost *Settings::FindHost(const std::string &mac)
@@ -197,10 +212,28 @@ void Settings::Load(const std::string &path)
 	int codec_i = (int)codec; num("codec", codec_i); codec = codec_i == 0 ? VideoCodec::H264 : VideoCodec::H265;
 	bol("hdr", hdr);
 	bol("hdr_force", hdr_force);
-	bol("upscale", upscale);
+	// v1.0 used booleans for upscaling and frame generation
+	if(g.count("upscale") && !g.count("upscale_mode"))
+		upscale_mode = (g["upscale"] == "1") ? 2 : 0;
+	if(g.count("frame_gen") && !g.count("frame_gen_mode"))
+		frame_gen = (g["frame_gen"] == "1") ? 1 : 0;
+	num("upscale_mode", upscale_mode);
+	num("upscale_target", upscale_target);
+	flt("artifact_reduction", artifact_reduction);
 	flt("sharpness", sharpness);
-	bol("frame_gen", frame_gen);
+	num("frame_gen_mode", frame_gen);
 	flt("paper_white_nits", paper_white_nits);
+	bol("ai_hdr", ai_hdr);
+	flt("hdr_boost", hdr_boost);
+	num("aspect_mode", aspect_mode);
+	bol("ambient", ambient);
+	flt("ambient_intensity", ambient_intensity);
+	num("picture_preset", picture_preset);
+	flt("brightness", brightness);
+	flt("contrast", contrast);
+	flt("saturation", saturation);
+	flt("vibrance", vibrance);
+	bol("auto_reconnect", auto_reconnect);
 	bol("fullscreen", fullscreen);
 	bol("vsync", vsync);
 	bol("show_stats", show_stats);
@@ -255,10 +288,23 @@ void Settings::Save(const std::string &path) const
 	o << "codec=" << (int)codec << "\n";
 	o << "hdr=" << hdr << "\n";
 	o << "hdr_force=" << hdr_force << "\n";
-	o << "upscale=" << upscale << "\n";
+	o << "upscale_mode=" << upscale_mode << "\n";
+	o << "upscale_target=" << upscale_target << "\n";
+	o << "artifact_reduction=" << artifact_reduction << "\n";
 	o << "sharpness=" << sharpness << "\n";
-	o << "frame_gen=" << frame_gen << "\n";
+	o << "frame_gen_mode=" << frame_gen << "\n";
 	o << "paper_white_nits=" << paper_white_nits << "\n";
+	o << "ai_hdr=" << ai_hdr << "\n";
+	o << "hdr_boost=" << hdr_boost << "\n";
+	o << "aspect_mode=" << aspect_mode << "\n";
+	o << "ambient=" << ambient << "\n";
+	o << "ambient_intensity=" << ambient_intensity << "\n";
+	o << "picture_preset=" << picture_preset << "\n";
+	o << "brightness=" << brightness << "\n";
+	o << "contrast=" << contrast << "\n";
+	o << "saturation=" << saturation << "\n";
+	o << "vibrance=" << vibrance << "\n";
+	o << "auto_reconnect=" << auto_reconnect << "\n";
 	o << "fullscreen=" << fullscreen << "\n";
 	o << "vsync=" << vsync << "\n";
 	o << "show_stats=" << show_stats << "\n";

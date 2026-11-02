@@ -2,8 +2,10 @@
 #include "renderer.h"
 #include "log.h"
 #include "shaders.h"
+#include "vpscaler.h"
 
 #include <d3dcompiler.h>
+#include <wincodec.h>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -15,20 +17,44 @@ extern "C" {
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <thread>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Constant buffer layouts (16-byte aligned, must match shaders.h)
 
 struct YuvCB { float rows[12]; float uv_scale[2]; float pad[2]; };
-struct CasCB { float sharpness; float pad[3]; };
-struct OutCB { float src_size[2]; int scaler; int mode; float paper_white; float content_peak; float pad[2]; };
+struct DenoiseCB { float strength; float pad[3]; };
+struct UpCB { float src_size[2]; float edge_strength; float pad; };
+struct SharpCB { float sharpness; float noise_floor; float pad[2]; };
+struct OutCB
+{
+	float vid_rect[4];
+	float uv_rect[4];
+	float src_size[2]; int scaler; int mode;
+	float paper_white; float peak; float ambient; float hdr_boost;
+	float brightness; float contrast; float saturation; float vibrance;
+	float win_size[2]; float pad[2];
+};
 struct UiCB { int hdr_out; float ui_nits; float pad[2]; };
-struct MeCB { int grid[2]; int block; int radius; int level_scale; float lambda; int use_pred; int pad; };
-struct InterpCB { float size[2]; float grid_scale[2]; };
+struct MeCB
+{
+	int grid[2]; int block; int radius;
+	int level_scale; float lambda; int use_pred; int use_temporal;
+	float pred_scale[2]; float temporal_scale[2];
+};
+struct InterpCB { float src_size[2]; float grid_scale[2]; float t; float pad[3]; };
+struct AmbCB { float alpha; float pad[3]; };
 
-static const int kMotionBlockPx = 16; // motion field resolution in full-res pixels
+static const int kCoarseBlockPx = 16; // coarse motion field: one vector per 16x16 pixels
+static const int kFineBlockPx = 8;    // final motion field: one vector per 8x8 pixels
+static const DXGI_FORMAT kProcFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
+
+Renderer::Renderer() : vp(new VpScaler()) {}
+Renderer::~Renderer() = default;
 
 // ---------------------------------------------------------------------------
+// Init / shutdown
 
 bool Renderer::Init(HWND window)
 {
@@ -53,6 +79,8 @@ bool Renderer::Init(HWND window)
 	if(SUCCEEDED(context.As(&mt)))
 		mt->SetMultithreadProtected(TRUE);
 
+	vp->Init(device.Get(), context.Get());
+
 	if(!CompileShaders())
 		return false;
 
@@ -65,11 +93,14 @@ bool Renderer::Init(HWND window)
 		device->CreateBuffer(&d, nullptr, out.Put());
 	};
 	make_cb(sizeof(YuvCB), cb_yuv);
-	make_cb(sizeof(CasCB), cb_cas);
+	make_cb(sizeof(DenoiseCB), cb_denoise);
+	make_cb(sizeof(UpCB), cb_up);
+	make_cb(sizeof(SharpCB), cb_sharp);
 	make_cb(sizeof(OutCB), cb_out);
 	make_cb(sizeof(UiCB), cb_ui);
 	make_cb(sizeof(MeCB), cb_me);
 	make_cb(sizeof(InterpCB), cb_interp);
+	make_cb(sizeof(AmbCB), cb_amb);
 
 	D3D11_SAMPLER_DESC sd = {};
 	sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -146,14 +177,18 @@ bool Renderer::CompileShaders()
 
 	bool ok = ps(std::string(shaders::kYuvCB) + shaders::kPsYuvNv12, ps_nv12)
 		&& ps(std::string(shaders::kYuvCB) + shaders::kPsYuvPlanar, ps_planar)
-		&& ps(shaders::kPsCas, ps_cas)
+		&& ps(shaders::kPsDenoise, ps_denoise)
+		&& ps(shaders::kPsEdgeUpscale, ps_edge)
+		&& ps(shaders::kPsSharpen, ps_sharpen)
 		&& ps(shaders::kPsVideoOut, ps_out)
 		&& ps(shaders::kPsOverlay, ps_overlay)
 		&& ps(shaders::kPsInterp, ps_interp)
 		&& cs(shaders::kCsLumaHalf, cs_luma_half)
 		&& cs(shaders::kCsDown2, cs_down2)
 		&& cs(std::string(shaders::kMeCB) + shaders::kCsMotionSearch, cs_search)
-		&& cs(shaders::kCsMedian, cs_median);
+		&& cs(shaders::kCsMedian, cs_median)
+		&& cs(shaders::kCsBox8, cs_box8)
+		&& cs(shaders::kCsAmbientBlend, cs_amb_blend);
 	if(!ok)
 		LOGE("Failed to build shaders");
 	return ok;
@@ -222,9 +257,7 @@ void Renderer::ReleaseBackbufferTargets()
 	if(context)
 		context->OMSetRenderTargets(0, nullptr, nullptr);
 	bb_rtv.Reset();
-	overlay_rtv.Reset();
-	overlay_srv.Reset();
-	overlay_tex.Reset();
+	overlay.Reset();
 }
 
 void Renderer::CreateBackbufferTargets()
@@ -232,19 +265,7 @@ void Renderer::CreateBackbufferTargets()
 	Com<ID3D11Texture2D> bb;
 	swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)bb.Put());
 	device->CreateRenderTargetView(bb.Get(), nullptr, bb_rtv.Put());
-
-	D3D11_TEXTURE2D_DESC td = {};
-	td.Width = width;
-	td.Height = height;
-	td.MipLevels = 1;
-	td.ArraySize = 1;
-	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	td.SampleDesc.Count = 1;
-	td.Usage = D3D11_USAGE_DEFAULT;
-	td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-	device->CreateTexture2D(&td, nullptr, overlay_tex.Put());
-	device->CreateRenderTargetView(overlay_tex.Get(), nullptr, overlay_rtv.Put());
-	device->CreateShaderResourceView(overlay_tex.Get(), nullptr, overlay_srv.Put());
+	MakeTarget(overlay, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, true, false);
 }
 
 void Renderer::Resize(int w, int h)
@@ -267,7 +288,6 @@ void Renderer::RefreshDisplayInfo()
 {
 	HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
 
-	// Refresh rate
 	MONITORINFOEXW mi = {};
 	mi.cbSize = sizeof(mi);
 	if(GetMonitorInfoW(monitor, &mi))
@@ -278,7 +298,7 @@ void Renderer::RefreshDisplayInfo()
 			display_hz = (int)dm.dmDisplayFrequency;
 	}
 
-	// HDR state: a fresh factory is needed to see changes to the Windows HDR toggle.
+	// A fresh factory is needed to see changes to the Windows HDR toggle.
 	bool hdr = false;
 	float peak = 1000.0f;
 	Com<IDXGIFactory1> factory;
@@ -335,6 +355,20 @@ void Renderer::ApplyOutputMode()
 		LOGW("Swap chain does not accept the HDR10 color space");
 }
 
+bool Renderer::AiSuperResolutionAvailable() const { return vp->SuperResolutionSupported(); }
+bool Renderer::AiHdrAvailable() const { return vp->AiHdrSupported(); }
+
+std::string Renderer::GpuVendorName() const
+{
+	switch(vp->GetVendor())
+	{
+		case VpScaler::Vendor::Nvidia: return "NVIDIA";
+		case VpScaler::Vendor::Intel: return "Intel";
+		case VpScaler::Vendor::Amd: return "AMD";
+		default: return "Unknown";
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 
@@ -351,8 +385,8 @@ void Renderer::UpdateCB(ID3D11Buffer *cb, const void *data, size_t size)
 void Renderer::DrawFullscreen(ID3D11PixelShader *ps, ID3D11RenderTargetView *rtv, int w, int h,
 		ID3D11ShaderResourceView *const *srvs, int srv_count, ID3D11Buffer *cb)
 {
-	D3D11_VIEWPORT vp = { 0, 0, (float)w, (float)h, 0, 1 };
-	context->RSSetViewports(1, &vp);
+	D3D11_VIEWPORT vpt = { 0, 0, (float)w, (float)h, 0, 1 };
+	context->RSSetViewports(1, &vpt);
 	context->RSSetState(raster.Get());
 	context->OMSetRenderTargets(1, &rtv, nullptr);
 	context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
@@ -385,10 +419,9 @@ void Renderer::Dispatch(ID3D11ComputeShader *cs, ID3D11ShaderResourceView *const
 	context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
 }
 
-static bool MakeTarget(ID3D11Device *dev, int w, int h, DXGI_FORMAT fmt, bool rtv_bind, bool uav_bind,
-		Com<ID3D11Texture2D> &tex, Com<ID3D11RenderTargetView> *rtv, Com<ID3D11ShaderResourceView> &srv,
-		Com<ID3D11UnorderedAccessView> *uav)
+bool Renderer::MakeTarget(Target &t, int w, int h, DXGI_FORMAT fmt, bool rtv, bool uav)
 {
+	t.Reset();
 	D3D11_TEXTURE2D_DESC td = {};
 	td.Width = w;
 	td.Height = h;
@@ -397,14 +430,27 @@ static bool MakeTarget(ID3D11Device *dev, int w, int h, DXGI_FORMAT fmt, bool rt
 	td.Format = fmt;
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
-	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | (rtv_bind ? D3D11_BIND_RENDER_TARGET : 0) | (uav_bind ? D3D11_BIND_UNORDERED_ACCESS : 0);
-	if(FAILED(dev->CreateTexture2D(&td, nullptr, tex.Put())))
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | (rtv ? D3D11_BIND_RENDER_TARGET : 0) | (uav ? D3D11_BIND_UNORDERED_ACCESS : 0);
+	if(FAILED(device->CreateTexture2D(&td, nullptr, t.tex.Put()))
+		|| (rtv && FAILED(device->CreateRenderTargetView(t.tex.Get(), nullptr, t.rtv.Put())))
+		|| (uav && FAILED(device->CreateUnorderedAccessView(t.tex.Get(), nullptr, t.uav.Put())))
+		|| FAILED(device->CreateShaderResourceView(t.tex.Get(), nullptr, t.srv.Put())))
+	{
+		LOGE("Could not create a %dx%d render target (format %d)", w, h, (int)fmt);
+		t.Reset();
 		return false;
-	if(rtv_bind && rtv && FAILED(dev->CreateRenderTargetView(tex.Get(), nullptr, rtv->Put())))
-		return false;
-	if(uav_bind && uav && FAILED(dev->CreateUnorderedAccessView(tex.Get(), nullptr, uav->Put())))
-		return false;
-	return SUCCEEDED(dev->CreateShaderResourceView(tex.Get(), nullptr, srv.Put()));
+	}
+	t.w = w;
+	t.h = h;
+	t.format = fmt;
+	return true;
+}
+
+bool Renderer::EnsureTarget(Target &t, int w, int h, DXGI_FORMAT fmt, bool rtv, bool uav)
+{
+	if(t.tex && t.w == w && t.h == h && t.format == fmt)
+		return true;
+	return MakeTarget(t, w, h, fmt, rtv, uav);
 }
 
 // YUV -> RGB matrix for normalized texture values.
@@ -415,7 +461,7 @@ static void YuvMatrix(bool bt2020, bool full_range, int bits, bool msb_aligned, 
 	double kb = bt2020 ? 0.0593 : 0.0722;
 	double kg = 1.0 - kr - kb;
 
-	double scale; // normalized texture value -> integer code
+	double scale;
 	if(bits == 8)
 		scale = 255.0;
 	else
@@ -434,18 +480,54 @@ static void YuvMatrix(bool bt2020, bool full_range, int bits, bool msb_aligned, 
 		coff = 128.0 * sh; crange = 224.0 * sh;
 	}
 
-	double ya = scale / yrange, yb = -yoff / yrange;  // y' = ya*n + yb
-	double ca = scale / crange, cb = -coff / crange;  // c  = ca*n + cb
+	double ya = scale / yrange, yb = -yoff / yrange;
+	double ca = scale / crange, cb = -coff / crange;
 
 	double r_cr = 2.0 * (1.0 - kr);
 	double b_cb = 2.0 * (1.0 - kb);
 	double g_cb = -2.0 * kb * (1.0 - kb) / kg;
 	double g_cr = -2.0 * kr * (1.0 - kr) / kg;
 
-	// rows: (n_y, n_u, n_v, 1)
 	out[0] = (float)ya; out[1] = 0.0f;               out[2] = (float)(r_cr * ca);  out[3] = (float)(yb + r_cr * cb);
 	out[4] = (float)ya; out[5] = (float)(g_cb * ca); out[6] = (float)(g_cr * ca);  out[7] = (float)(yb + (g_cb + g_cr) * cb);
 	out[8] = (float)ya; out[9] = (float)(b_cb * ca); out[10] = 0.0f;               out[11] = (float)(yb + b_cb * cb);
+}
+
+void Renderer::VideoRect(AspectMode aspect, int win_w, int win_h, float rect[4], float uv[4]) const
+{
+	float va = (video_w > 0 && video_h > 0) ? (float)video_w / (float)video_h : 16.0f / 9.0f;
+	float wa = (float)win_w / (float)win_h;
+	uv[0] = 0; uv[1] = 0; uv[2] = 1; uv[3] = 1;
+	if(aspect == AspectMode::Stretch)
+	{
+		rect[0] = 0; rect[1] = 0; rect[2] = (float)win_w; rect[3] = (float)win_h;
+		return;
+	}
+	if(aspect == AspectMode::Fill)
+	{
+		rect[0] = 0; rect[1] = 0; rect[2] = (float)win_w; rect[3] = (float)win_h;
+		if(wa > va)
+		{
+			float span = va / wa; // crop top/bottom
+			uv[1] = 0.5f - span * 0.5f; uv[3] = 0.5f + span * 0.5f;
+		}
+		else
+		{
+			float span = wa / va; // crop left/right
+			uv[0] = 0.5f - span * 0.5f; uv[2] = 0.5f + span * 0.5f;
+		}
+		return;
+	}
+	float vw = (float)win_w, vh = vw / va;
+	if(vh > win_h)
+	{
+		vh = (float)win_h;
+		vw = vh * va;
+	}
+	rect[0] = std::floor((win_w - vw) * 0.5f);
+	rect[1] = std::floor((win_h - vh) * 0.5f);
+	rect[2] = std::floor(vw);
+	rect[3] = std::floor(vh);
 }
 
 // ---------------------------------------------------------------------------
@@ -455,53 +537,54 @@ void Renderer::ResetVideo()
 {
 	frames_submitted = 0;
 	interp_ready = false;
+	motion_ready = false;
+	final_valid = false;
+	amb_valid = false;
 	luma_valid[0] = luma_valid[1] = false;
+	slot_gen[0] = slot_gen[1] = -1;
+	last_mode = -1;
+	upscaler_status = "Off";
+	vp->Reset(); // decoder textures are recreated per session
 }
 
 bool Renderer::EnsureVideoTargets(int w, int h)
 {
-	if(w == video_w && h == video_h && rgb_tex[0])
+	if(w == video_w && h == video_h && rgb[0].tex)
 		return true;
 	video_w = w;
 	video_h = h;
-	frames_submitted = 0;
-	interp_ready = false;
+	ResetVideo();
 	for(int i = 0; i < 2; i++)
-	{
-		if(!MakeTarget(device.Get(), w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false, rgb_tex[i], &rgb_rtv[i], rgb_srv[i], nullptr))
+		if(!MakeTarget(rgb[i], w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false))
 			return false;
-		luma_valid[i] = false;
-	}
-	if(!MakeTarget(device.Get(), w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false, cas_tex, &cas_rtv, cas_srv, nullptr))
-		return false;
-	// Interpolation targets depend on the stream size too.
-	interp_tex.Reset();
+	// Everything sized from the stream is rebuilt lazily
+	mv_coarse[0].Reset();
+	interp.Reset();
 	LOGI("Video size %dx%d", w, h);
 	return true;
 }
 
-bool Renderer::EnsureInterpTargets()
+int Renderer::OutputVideoWidth() const
 {
-	if(interp_tex)
-		return true;
-	int hw = (video_w + 1) / 2, hh = (video_h + 1) / 2;
-	int qw = (hw + 1) / 2, qh = (hh + 1) / 2;
-	grid_w = (video_w + kMotionBlockPx - 1) / kMotionBlockPx;
-	grid_h = (video_h + kMotionBlockPx - 1) / kMotionBlockPx;
-	for(int i = 0; i < 2; i++)
+	return (slot_gen[latest] >= 0 && proc[latest].tex) ? proc[latest].w : video_w;
+}
+
+int Renderer::OutputVideoHeight() const
+{
+	return (slot_gen[latest] >= 0 && proc[latest].tex) ? proc[latest].h : video_h;
+}
+
+ID3D11ShaderResourceView *Renderer::DisplaySrv(int slot, int *w, int *h) const
+{
+	if(slot_gen[slot] >= 0 && proc[slot].tex)
 	{
-		if(!MakeTarget(device.Get(), hw, hh, DXGI_FORMAT_R16_FLOAT, false, true, luma_half_tex[i], nullptr, luma_half_srv[i], &luma_half_uav[i])
-			|| !MakeTarget(device.Get(), qw, qh, DXGI_FORMAT_R16_FLOAT, false, true, luma_quarter_tex[i], nullptr, luma_quarter_srv[i], &luma_quarter_uav[i])
-			|| !MakeTarget(device.Get(), grid_w, grid_h, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true, mv_tex[i], nullptr, mv_srv[i], &mv_uav[i]))
-		{
-			LOGE("Could not create frame generation textures");
-			return false;
-		}
-		luma_valid[i] = false;
+		*w = proc[slot].w;
+		*h = proc[slot].h;
+		return proc[slot].srv.Get();
 	}
-	if(!MakeTarget(device.Get(), video_w, video_h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false, interp_tex, &interp_rtv, interp_srv, nullptr))
-		return false;
-	return true;
+	*w = video_w;
+	*h = video_h;
+	return rgb[slot].srv.Get();
 }
 
 void Renderer::ConvertToRgb(ID3D11ShaderResourceView *const *planes, int plane_count, bool semi_planar,
@@ -512,13 +595,11 @@ void Renderer::ConvertToRgb(ID3D11ShaderResourceView *const *planes, int plane_c
 	cb.uv_scale[0] = uv_sx;
 	cb.uv_scale[1] = uv_sy;
 	UpdateCB(cb_yuv.Get(), &cb, sizeof(cb));
-
-	latest = (int)(frames_submitted % 2);
-	DrawFullscreen(semi_planar ? ps_nv12.Get() : ps_planar.Get(), rgb_rtv[latest].Get(), video_w, video_h,
+	DrawFullscreen(semi_planar ? ps_nv12.Get() : ps_planar.Get(), rgb[latest].rtv.Get(), video_w, video_h,
 			planes, plane_count, cb_yuv.Get());
 }
 
-bool Renderer::SubmitFrame(AVFrame *frame)
+bool Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o)
 {
 	if(!frame || frame->width <= 0 || frame->height <= 0)
 		return false;
@@ -533,11 +614,11 @@ bool Renderer::SubmitFrame(AVFrame *frame)
 		LOGI("Stream is %s", hdr ? "HDR10 (PQ, BT.2020)" : "SDR (BT.709)");
 	video_hdr = hdr;
 
+	latest = (int)(frames_submitted % 2);
 	float matrix[12];
 
 	if(frame->format == AV_PIX_FMT_D3D11)
 	{
-		// Hardware frame: data[0] = texture array, data[1] = slice index
 		auto *tex = reinterpret_cast<ID3D11Texture2D *>(frame->data[0]);
 		UINT index = (UINT)(intptr_t)frame->data[1];
 		D3D11_TEXTURE2D_DESC sd;
@@ -581,7 +662,6 @@ bool Renderer::SubmitFrame(AVFrame *frame)
 	}
 	else
 	{
-		// Software frame fallback
 		int fmt = frame->format;
 		bool semi = fmt == AV_PIX_FMT_NV12 || fmt == AV_PIX_FMT_P010LE;
 		bool ten = fmt == AV_PIX_FMT_YUV420P10LE || fmt == AV_PIX_FMT_P010LE;
@@ -643,29 +723,236 @@ bool Renderer::SubmitFrame(AVFrame *frame)
 
 	frames_submitted++;
 	interp_ready = false;
+	motion_ready = false;
+	luma_valid[latest] = false;
 
-	if(frame_gen_enabled && EnsureInterpTargets())
+	ProcessFrame(frame, o);
+
+	if(o.ambient)
+		UpdateAmbient();
+	else
+		amb_valid = false;
+
+	frame_gen_enabled = o.frame_gen;
+	if(frame_gen_enabled && EnsureMotionTargets())
 		ComputeLumaPyramid(latest);
+	return true;
+}
+
+// Upscaling / AI processing of the frame that was just converted into rgb[latest].
+void Renderer::ProcessFrame(AVFrame *frame, const ProcessOptions &o)
+{
+	float rect[4], uvr[4];
+	VideoRect(o.aspect, width, height, rect, uvr);
+
+	// Target size
+	int tw = video_w, th = video_h;
+	if(o.upscale != UpscaleMode::Off)
+	{
+		if(o.target_height > 0)
+		{
+			th = o.target_height;
+			tw = (int)std::lround((double)th * video_w / video_h);
+		}
+		else
+		{
+			// Match the on-screen video area (accounting for the crop in "fill" mode)
+			tw = (int)std::lround(rect[2] / std::max(uvr[2] - uvr[0], 0.01f));
+			th = (int)std::lround(rect[3] / std::max(uvr[3] - uvr[1], 0.01f));
+		}
+		tw = std::min((tw + 1) & ~1, 7680);
+		th = std::min((th + 1) & ~1, 4320);
+	}
+	bool upscaling = o.upscale != UpscaleMode::Off && th > video_h + 8;
+	bool hw = frame->format == AV_PIX_FMT_D3D11;
+	bool want_ai_sr = upscaling && o.upscale == UpscaleMode::AI && vp->SuperResolutionSupported() && hw;
+	bool want_ai_hdr = o.ai_hdr && output_hdr && !video_hdr && vp->AiHdrSupported() && hw;
+	if(!upscaling)
+	{
+		tw = video_w;
+		th = video_h;
+	}
+
+	if(!upscaling && !want_ai_hdr)
+	{
+		slot_gen[latest] = -1;
+		upscaler_status = o.upscale == UpscaleMode::Off ? "Off" : "Not needed (display is not larger than the stream)";
+		return;
+	}
+
+	int mode_key = (want_ai_sr ? 1 : 0) | (want_ai_hdr ? 2 : 0) | ((int)o.upscale << 2);
+	if(tw != last_tw || th != last_th || mode_key != last_mode || want_ai_hdr != last_ai_hdr)
+	{
+		proc_gen++;
+		last_tw = tw;
+		last_th = th;
+		last_mode = mode_key;
+		last_ai_hdr = want_ai_hdr;
+	}
+	for(int i = 0; i < 2; i++)
+		if(proc[i].tex && (proc[i].w != tw || proc[i].h != th))
+		{
+			vp->Reset(); // output views reference the old textures
+			break;
+		}
+	if(!EnsureTarget(proc[latest], tw, th, kProcFormat, true, false))
+	{
+		slot_gen[latest] = -1;
+		return;
+	}
+
+	// 1) Driver AI path (decoder texture -> video processor -> proc[latest])
+	if(want_ai_sr || want_ai_hdr)
+	{
+		auto *tex = reinterpret_cast<ID3D11Texture2D *>(frame->data[0]);
+		UINT index = (UINT)(intptr_t)frame->data[1];
+		bool out_hdr = video_hdr || want_ai_hdr;
+		if(vp->Process(tex, index, video_w, video_h, video_hdr, proc[latest].tex.Get(), tw, th, out_hdr, want_ai_sr, want_ai_hdr))
+		{
+			proc_hdr = out_hdr;
+			slot_gen[latest] = proc_gen;
+			std::string s;
+			if(want_ai_sr)
+				s = vp->GetVendor() == VpScaler::Vendor::Nvidia ? "NVIDIA RTX Video Super Resolution" : "Intel Video Super Resolution";
+			if(want_ai_hdr)
+				s += s.empty() ? "NVIDIA RTX Video HDR" : " + RTX Video HDR";
+			if(!vp->SuperResolutionActive() && want_ai_sr)
+				s += " (driver declined - check driver settings)";
+			char res[48];
+			snprintf(res, sizeof(res), "  %dx%d", tw, th);
+			upscaler_status = s + res;
+			return;
+		}
+		// fall through to the shader upscaler
+	}
+
+	// 2) Enhanced shader upscaler
+	if(upscaling && ShaderUpscale(tw, th, o))
+	{
+		proc_hdr = video_hdr;
+		slot_gen[latest] = proc_gen;
+		char res[96];
+		snprintf(res, sizeof(res), "Enhanced (edge-directed + artifact reduction)  %dx%d", tw, th);
+		upscaler_status = res;
+		if(o.upscale == UpscaleMode::AI)
+			upscaler_status += vp->SuperResolutionSupported() ? "  [AI unavailable for software decoding]"
+				: "  [no AI super resolution on this GPU]";
+		return;
+	}
+	slot_gen[latest] = -1;
+}
+
+bool Renderer::ShaderUpscale(int tw, int th, const ProcessOptions &o)
+{
+	ID3D11ShaderResourceView *src = rgb[latest].srv.Get();
+
+	// Artifact reduction at stream resolution
+	if(o.artifact_reduction > 0.01f)
+	{
+		if(!EnsureTarget(clean, video_w, video_h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false))
+			return false;
+		DenoiseCB d = {};
+		d.strength = o.artifact_reduction;
+		UpdateCB(cb_denoise.Get(), &d, sizeof(d));
+		DrawFullscreen(ps_denoise.Get(), clean.rtv.Get(), video_w, video_h, &src, 1, cb_denoise.Get());
+		src = clean.srv.Get();
+	}
+
+	// Edge-directed upscale
+	UpCB u = {};
+	u.src_size[0] = (float)video_w;
+	u.src_size[1] = (float)video_h;
+	u.edge_strength = 1.0f;
+	UpdateCB(cb_up.Get(), &u, sizeof(u));
+	bool sharpen = o.sharpness > 0.01f;
+	if(sharpen)
+	{
+		if(!EnsureTarget(up_tmp, tw, th, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false))
+			return false;
+		DrawFullscreen(ps_edge.Get(), up_tmp.rtv.Get(), tw, th, &src, 1, cb_up.Get());
+
+		// Noise-gated sharpening at output resolution
+		SharpCB s = {};
+		s.sharpness = o.sharpness;
+		s.noise_floor = 0.02f + 0.04f * o.artifact_reduction;
+		UpdateCB(cb_sharp.Get(), &s, sizeof(s));
+		ID3D11ShaderResourceView *up = up_tmp.srv.Get();
+		DrawFullscreen(ps_sharpen.Get(), proc[latest].rtv.Get(), tw, th, &up, 1, cb_sharp.Get());
+	}
+	else
+		DrawFullscreen(ps_edge.Get(), proc[latest].rtv.Get(), tw, th, &src, 1, cb_up.Get());
+	return true;
+}
+
+void Renderer::UpdateAmbient()
+{
+	int w1 = std::max(1, video_w / 8), h1 = std::max(1, video_h / 8);
+	int w2 = std::max(1, w1 / 8), h2 = std::max(1, h1 / 8);
+	if(!EnsureTarget(amb_small1, w1, h1, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true)
+		|| !EnsureTarget(amb_small2, w2, h2, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true)
+		|| !EnsureTarget(amb[0], w2, h2, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true)
+		|| !EnsureTarget(amb[1], w2, h2, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true))
+		return;
+	ID3D11ShaderResourceView *s = rgb[latest].srv.Get();
+	Dispatch(cs_box8.Get(), &s, 1, amb_small1.uav.Get(), nullptr, w1, h1);
+	s = amb_small1.srv.Get();
+	Dispatch(cs_box8.Get(), &s, 1, amb_small2.uav.Get(), nullptr, w2, h2);
+
+	int next = 1 - amb_index;
+	AmbCB a = {};
+	a.alpha = amb_valid ? 0.18f : 1.0f; // smooth over ~5 frames so the glow doesn't flicker
+	UpdateCB(cb_amb.Get(), &a, sizeof(a));
+	ID3D11ShaderResourceView *srvs[2] = { amb_small2.srv.Get(), amb[amb_index].srv.Get() };
+	Dispatch(cs_amb_blend.Get(), srvs, 2, amb[next].uav.Get(), cb_amb.Get(), w2, h2);
+	amb_index = next;
+	amb_valid = true;
+}
+
+// ---------------------------------------------------------------------------
+// Frame generation
+
+bool Renderer::EnsureMotionTargets()
+{
+	if(mv_coarse[0].tex)
+		return true;
+	int hw = (video_w + 1) / 2, hh = (video_h + 1) / 2;
+	int qw = (hw + 1) / 2, qh = (hh + 1) / 2;
+	grid_w = (video_w + kCoarseBlockPx - 1) / kCoarseBlockPx;
+	grid_h = (video_h + kCoarseBlockPx - 1) / kCoarseBlockPx;
+	fine_w = (video_w + kFineBlockPx - 1) / kFineBlockPx;
+	fine_h = (video_h + kFineBlockPx - 1) / kFineBlockPx;
+	for(int i = 0; i < 2; i++)
+	{
+		if(!MakeTarget(luma_half[i], hw, hh, DXGI_FORMAT_R16_FLOAT, false, true)
+			|| !MakeTarget(luma_quarter[i], qw, qh, DXGI_FORMAT_R16_FLOAT, false, true)
+			|| !MakeTarget(mv_coarse[i], grid_w, grid_h, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true)
+			|| !MakeTarget(mv_fine[i], fine_w, fine_h, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true)
+			|| !MakeTarget(mv_final[i], fine_w, fine_h, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true))
+		{
+			LOGE("Could not create frame generation textures");
+			mv_coarse[0].Reset();
+			return false;
+		}
+		luma_valid[i] = false;
+	}
+	final_valid = false;
 	return true;
 }
 
 void Renderer::ComputeLumaPyramid(int slot)
 {
-	D3D11_TEXTURE2D_DESC hd, qd;
-	luma_half_tex[slot]->GetDesc(&hd);
-	luma_quarter_tex[slot]->GetDesc(&qd);
-	ID3D11ShaderResourceView *src = rgb_srv[slot].Get();
-	Dispatch(cs_luma_half.Get(), &src, 1, luma_half_uav[slot].Get(), nullptr, hd.Width, hd.Height);
-	src = luma_half_srv[slot].Get();
-	Dispatch(cs_down2.Get(), &src, 1, luma_quarter_uav[slot].Get(), nullptr, qd.Width, qd.Height);
+	ID3D11ShaderResourceView *src = rgb[slot].srv.Get();
+	Dispatch(cs_luma_half.Get(), &src, 1, luma_half[slot].uav.Get(), nullptr, luma_half[slot].w, luma_half[slot].h);
+	src = luma_half[slot].srv.Get();
+	Dispatch(cs_down2.Get(), &src, 1, luma_quarter[slot].uav.Get(), nullptr, luma_quarter[slot].w, luma_quarter[slot].h);
 	luma_valid[slot] = true;
 }
 
-bool Renderer::BuildInterpolatedFrame()
+bool Renderer::PrepareMotion()
 {
-	if(interp_ready)
+	if(motion_ready)
 		return true;
-	if(!frame_gen_enabled || frames_submitted < 2 || !EnsureInterpTargets())
+	if(!frame_gen_enabled || frames_submitted < 2 || !EnsureMotionTargets())
 		return false;
 	int cur = latest, prev = 1 - latest;
 	if(!luma_valid[cur])
@@ -673,46 +960,79 @@ bool Renderer::BuildInterpolatedFrame()
 	if(!luma_valid[prev])
 		ComputeLumaPyramid(prev);
 
-	// 1) Coarse search at quarter resolution: 4x4 px blocks (= 16x16 full-res), +-8 px (= +-32 full-res).
+	// 1) Coarse search at quarter resolution: 4x4 blocks (= 16x16 px), +-8 (= +-32 px half-step,
+	//    i.e. up to 64 px of motion per frame), plus last frame's vectors for faster motion.
 	MeCB me = {};
 	me.grid[0] = grid_w;
 	me.grid[1] = grid_h;
-	me.block = kMotionBlockPx / 4;
+	me.block = kCoarseBlockPx / 4;
 	me.radius = 8;
 	me.level_scale = 4;
 	me.lambda = 0.2f;
 	me.use_pred = 0;
+	me.use_temporal = final_valid ? 1 : 0;
+	me.pred_scale[0] = me.pred_scale[1] = 1.0f;
+	me.temporal_scale[0] = (float)fine_w / grid_w;
+	me.temporal_scale[1] = (float)fine_h / grid_h;
 	UpdateCB(cb_me.Get(), &me, sizeof(me));
-	ID3D11ShaderResourceView *srvs[3] = { luma_quarter_srv[prev].Get(), luma_quarter_srv[cur].Get(), nullptr };
-	Dispatch(cs_search.Get(), srvs, 3, mv_uav[0].Get(), cb_me.Get(), grid_w, grid_h);
+	int prev_final = 1 - final_idx;
+	ID3D11ShaderResourceView *srvs[4] = { luma_quarter[prev].srv.Get(), luma_quarter[cur].srv.Get(), nullptr,
+		final_valid ? mv_final[prev_final].srv.Get() : nullptr };
+	Dispatch(cs_search.Get(), srvs, 4, mv_coarse[0].uav.Get(), cb_me.Get(), grid_w, grid_h);
 
-	// 2) Remove outliers
-	ID3D11ShaderResourceView *msrc = mv_srv[0].Get();
-	Dispatch(cs_median.Get(), &msrc, 1, mv_uav[1].Get(), nullptr, grid_w, grid_h);
+	ID3D11ShaderResourceView *m = mv_coarse[0].srv.Get();
+	Dispatch(cs_median.Get(), &m, 1, mv_coarse[1].uav.Get(), nullptr, grid_w, grid_h);
 
-	// 3) Refine at half resolution around the coarse vector: 8x8 px blocks, +-2 px.
-	me.block = kMotionBlockPx / 2;
+	// 2) Refine at half resolution on the finer 8x8 px grid, +-2 around the coarse vector.
+	me.grid[0] = fine_w;
+	me.grid[1] = fine_h;
+	me.block = kFineBlockPx / 2;
 	me.radius = 2;
 	me.level_scale = 2;
 	me.lambda = 0.5f;
 	me.use_pred = 1;
+	me.use_temporal = 0;
+	me.pred_scale[0] = (float)grid_w / fine_w;
+	me.pred_scale[1] = (float)grid_h / fine_h;
 	UpdateCB(cb_me.Get(), &me, sizeof(me));
-	ID3D11ShaderResourceView *rsrvs[3] = { luma_half_srv[prev].Get(), luma_half_srv[cur].Get(), mv_srv[1].Get() };
-	Dispatch(cs_search.Get(), rsrvs, 3, mv_uav[0].Get(), cb_me.Get(), grid_w, grid_h);
+	ID3D11ShaderResourceView *rsrvs[4] = { luma_half[prev].srv.Get(), luma_half[cur].srv.Get(), mv_coarse[1].srv.Get(), nullptr };
+	Dispatch(cs_search.Get(), rsrvs, 4, mv_fine[0].uav.Get(), cb_me.Get(), fine_w, fine_h);
 
-	msrc = mv_srv[0].Get();
-	Dispatch(cs_median.Get(), &msrc, 1, mv_uav[1].Get(), nullptr, grid_w, grid_h);
+	m = mv_fine[0].srv.Get();
+	Dispatch(cs_median.Get(), &m, 1, mv_final[final_idx].uav.Get(), nullptr, fine_w, fine_h);
 
-	// 4) Warp both frames to the midpoint and blend
+	motion_ready = true;
+	final_valid = true;
+	final_idx = 1 - final_idx; // next frame reads this field as its temporal predictor
+	return true;
+}
+
+bool Renderer::BuildInterpolatedFrame(float t)
+{
+	if(!PrepareMotion())
+		return false;
+	int cur = latest, prev = 1 - latest;
+	if(slot_gen[cur] != slot_gen[prev])
+		return false; // processing changed between the two frames
+	int w, h, pw, ph;
+	ID3D11ShaderResourceView *cur_srv = DisplaySrv(cur, &w, &h);
+	ID3D11ShaderResourceView *prev_srv = DisplaySrv(prev, &pw, &ph);
+	if(w != pw || h != ph)
+		return false;
+	DXGI_FORMAT fmt = slot_gen[cur] >= 0 ? kProcFormat : DXGI_FORMAT_R16G16B16A16_FLOAT;
+	if(!EnsureTarget(interp, w, h, fmt, true, false))
+		return false;
+
 	InterpCB ic = {};
-	ic.size[0] = (float)video_w;
-	ic.size[1] = (float)video_h;
-	ic.grid_scale[0] = (float)video_w / (float)(grid_w * kMotionBlockPx);
-	ic.grid_scale[1] = (float)video_h / (float)(grid_h * kMotionBlockPx);
+	ic.src_size[0] = (float)video_w;
+	ic.src_size[1] = (float)video_h;
+	ic.grid_scale[0] = (float)video_w / (float)(fine_w * kFineBlockPx);
+	ic.grid_scale[1] = (float)video_h / (float)(fine_h * kFineBlockPx);
+	ic.t = std::clamp(t, 0.0f, 1.0f);
 	UpdateCB(cb_interp.Get(), &ic, sizeof(ic));
-	ID3D11ShaderResourceView *isrvs[3] = { rgb_srv[prev].Get(), rgb_srv[cur].Get(), mv_srv[1].Get() };
-	DrawFullscreen(ps_interp.Get(), interp_rtv.Get(), video_w, video_h, isrvs, 3, cb_interp.Get());
-
+	int last_final = 1 - final_idx; // the field PrepareMotion just wrote
+	ID3D11ShaderResourceView *isrvs[3] = { prev_srv, cur_srv, mv_final[last_final].srv.Get() };
+	DrawFullscreen(ps_interp.Get(), interp.rtv.Get(), w, h, isrvs, 3, cb_interp.Get());
 	interp_ready = true;
 	return true;
 }
@@ -723,77 +1043,74 @@ bool Renderer::BuildInterpolatedFrame()
 void Renderer::BeginOverlay()
 {
 	const float clear[4] = { 0, 0, 0, 0 };
-	context->ClearRenderTargetView(overlay_rtv.Get(), clear);
-	ID3D11RenderTargetView *rtv = overlay_rtv.Get();
+	context->ClearRenderTargetView(overlay.rtv.Get(), clear);
+	ID3D11RenderTargetView *rtv = overlay.rtv.Get();
 	context->OMSetRenderTargets(1, &rtv, nullptr);
-	D3D11_VIEWPORT vp = { 0, 0, (float)width, (float)height, 0, 1 };
-	context->RSSetViewports(1, &vp);
+	D3D11_VIEWPORT vpt = { 0, 0, (float)width, (float)height, 0, 1 };
+	context->RSSetViewports(1, &vpt);
 }
 
-void Renderer::Present(VideoView view, const RenderOptions &opt)
+void Renderer::DrawVideoOut(ID3D11RenderTargetView *rtv, int w, int h, ID3D11ShaderResourceView *video, int vw, int vh,
+		bool content_hdr, bool out_hdr, const PresentOptions &o, bool with_ambient, bool full_rect)
+{
+	OutCB c = {};
+	float rect[4], uvr[4];
+	if(full_rect)
+	{
+		rect[0] = rect[1] = 0; rect[2] = (float)w; rect[3] = (float)h;
+		uvr[0] = uvr[1] = 0; uvr[2] = uvr[3] = 1;
+	}
+	else
+		VideoRect(o.aspect, w, h, rect, uvr);
+	memcpy(c.vid_rect, rect, sizeof(rect));
+	memcpy(c.uv_rect, uvr, sizeof(uvr));
+	c.src_size[0] = (float)vw;
+	c.src_size[1] = (float)vh;
+	// Bicubic when the picture is enlarged on screen (e.g. a 1440p target on a 4K display)
+	float shown_w = rect[2] / std::max(uvr[2] - uvr[0], 0.01f);
+	c.scaler = shown_w > vw * 1.01f ? 1 : 0;
+	c.mode = content_hdr ? (out_hdr ? 2 : 3) : (out_hdr ? 1 : 0);
+	c.paper_white = o.paper_white;
+	c.peak = c.mode == 1 ? display_peak_nits : 1000.0f;
+	c.ambient = (with_ambient && amb_valid) ? o.ambient : 0.0f;
+	c.hdr_boost = o.hdr_boost;
+	c.brightness = o.brightness;
+	c.contrast = o.contrast;
+	c.saturation = o.saturation;
+	c.vibrance = o.vibrance;
+	c.win_size[0] = (float)w;
+	c.win_size[1] = (float)h;
+	UpdateCB(cb_out.Get(), &c, sizeof(c));
+	ID3D11ShaderResourceView *srvs[2] = { video, amb_valid ? amb[amb_index].srv.Get() : nullptr };
+	DrawFullscreen(ps_out.Get(), rtv, w, h, srvs, 2, cb_out.Get());
+}
+
+void Renderer::Present(VideoView view, const PresentOptions &opt)
 {
 	if(frame_wait)
 		WaitForSingleObjectEx(frame_wait, 100, TRUE);
 
 	ID3D11ShaderResourceView *video = nullptr;
-	if(view == VideoView::Interpolated && interp_ready)
-		video = interp_srv.Get();
-	else if(view != VideoView::None && frames_submitted > 0)
-		video = rgb_srv[latest].Get();
-
-	// Optional sharpening at stream resolution before upscaling
-	if(video && opt.upscale && opt.sharpness > 0.01f)
+	int vw = 0, vh = 0;
+	bool content_hdr = false;
+	if(view != VideoView::None && frames_submitted > 0)
 	{
-		CasCB c = {};
-		c.sharpness = opt.sharpness;
-		UpdateCB(cb_cas.Get(), &c, sizeof(c));
-		DrawFullscreen(ps_cas.Get(), cas_rtv.Get(), video_w, video_h, &video, 1, cb_cas.Get());
-		video = cas_srv.Get();
+		bool processed = slot_gen[latest] >= 0;
+		content_hdr = processed ? proc_hdr : video_hdr;
+		if(view == VideoView::Interpolated && interp_ready)
+		{
+			video = interp.srv.Get();
+			vw = interp.w;
+			vh = interp.h;
+		}
+		else
+			video = DisplaySrv(latest, &vw, &vh);
 	}
 
 	const float black[4] = { 0, 0, 0, 1 };
 	context->ClearRenderTargetView(bb_rtv.Get(), black);
-
 	if(video)
-	{
-		// Letterbox to the stream aspect ratio
-		float aspect = (float)video_w / (float)video_h;
-		float vw = (float)width, vh = vw / aspect;
-		if(vh > height)
-		{
-			vh = (float)height;
-			vw = vh * aspect;
-		}
-		float vx = std::floor((width - vw) * 0.5f), vy = std::floor((height - vh) * 0.5f);
-
-		OutCB o = {};
-		o.src_size[0] = (float)video_w;
-		o.src_size[1] = (float)video_h;
-		o.scaler = opt.upscale ? 1 : 0;
-		o.mode = video_hdr ? (output_hdr ? 2 : 3) : (output_hdr ? 1 : 0);
-		o.paper_white = opt.paper_white;
-		o.content_peak = 1000.0f;
-		UpdateCB(cb_out.Get(), &o, sizeof(o));
-
-		D3D11_VIEWPORT vp = { vx, vy, vw, vh, 0, 1 };
-		ID3D11RenderTargetView *rtv = bb_rtv.Get();
-		context->RSSetViewports(1, &vp);
-		context->RSSetState(raster.Get());
-		context->OMSetRenderTargets(1, &rtv, nullptr);
-		context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
-		context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-		context->IASetInputLayout(nullptr);
-		context->VSSetShader(vs.Get(), nullptr, 0);
-		context->PSSetShader(ps_out.Get(), nullptr, 0);
-		ID3D11SamplerState *s = samp_linear.Get();
-		context->PSSetSamplers(0, 1, &s);
-		context->PSSetShaderResources(0, 1, &video);
-		ID3D11Buffer *cb = cb_out.Get();
-		context->PSSetConstantBuffers(0, 1, &cb);
-		context->Draw(3, 0);
-		ID3D11ShaderResourceView *null_srv = nullptr;
-		context->PSSetShaderResources(0, 1, &null_srv);
-	}
+		DrawVideoOut(bb_rtv.Get(), width, height, video, vw, vh, content_hdr, output_hdr, opt, true, false);
 
 	// UI overlay (premultiplied alpha)
 	{
@@ -801,14 +1118,17 @@ void Renderer::Present(VideoView view, const RenderOptions &opt)
 		u.hdr_out = output_hdr ? 1 : 0;
 		u.ui_nits = opt.paper_white;
 		UpdateCB(cb_ui.Get(), &u, sizeof(u));
-		D3D11_VIEWPORT vp = { 0, 0, (float)width, (float)height, 0, 1 };
+		D3D11_VIEWPORT vpt = { 0, 0, (float)width, (float)height, 0, 1 };
 		ID3D11RenderTargetView *rtv = bb_rtv.Get();
-		context->RSSetViewports(1, &vp);
+		context->RSSetViewports(1, &vpt);
+		context->RSSetState(raster.Get());
 		context->OMSetRenderTargets(1, &rtv, nullptr);
 		context->OMSetBlendState(blend_premul.Get(), nullptr, 0xffffffff);
+		context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		context->IASetInputLayout(nullptr);
 		context->VSSetShader(vs.Get(), nullptr, 0);
 		context->PSSetShader(ps_overlay.Get(), nullptr, 0);
-		ID3D11ShaderResourceView *srv = overlay_srv.Get();
+		ID3D11ShaderResourceView *srv = overlay.srv.Get();
 		context->PSSetShaderResources(0, 1, &srv);
 		ID3D11Buffer *cb = cb_ui.Get();
 		context->PSSetConstantBuffers(0, 1, &cb);
@@ -824,4 +1144,84 @@ void Renderer::Present(VideoView view, const RenderOptions &opt)
 	HRESULT hr = swapchain->Present(opt.sync_interval, flags);
 	if(hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
 		LOGE("GPU device lost (0x%08lx)", (unsigned long)device->GetDeviceRemovedReason());
+}
+
+// ---------------------------------------------------------------------------
+// Screenshots
+
+static bool WritePng(const std::wstring &path, int w, int h, const std::vector<uint8_t> &rgba)
+{
+	bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+	bool ok = false;
+	{
+		Com<IWICImagingFactory> factory;
+		Com<IWICStream> stream;
+		Com<IWICBitmapEncoder> encoder;
+		Com<IWICBitmapFrameEncode> frame;
+		WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppRGBA;
+		if(SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory), (void **)factory.Put()))
+			&& SUCCEEDED(factory->CreateStream(stream.Put()))
+			&& SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE))
+			&& SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, encoder.Put()))
+			&& SUCCEEDED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache))
+			&& SUCCEEDED(encoder->CreateNewFrame(frame.Put(), nullptr))
+			&& SUCCEEDED(frame->Initialize(nullptr))
+			&& SUCCEEDED(frame->SetSize(w, h))
+			&& SUCCEEDED(frame->SetPixelFormat(&fmt))
+			&& SUCCEEDED(frame->WritePixels(h, w * 4, (UINT)rgba.size(), (BYTE *)rgba.data()))
+			&& SUCCEEDED(frame->Commit())
+			&& SUCCEEDED(encoder->Commit()))
+			ok = true;
+	}
+	if(com)
+		CoUninitialize();
+	return ok;
+}
+
+bool Renderer::SaveScreenshot(const std::wstring &path, const PresentOptions &opt)
+{
+	if(frames_submitted == 0)
+		return false;
+	int vw, vh;
+	ID3D11ShaderResourceView *video = DisplaySrv(latest, &vw, &vh);
+	bool content_hdr = slot_gen[latest] >= 0 ? proc_hdr : video_hdr;
+
+	Target shot;
+	if(!MakeTarget(shot, vw, vh, DXGI_FORMAT_R8G8B8A8_UNORM, true, false))
+		return false;
+	PresentOptions o = opt;
+	o.aspect = AspectMode::Stretch;
+	o.hdr_boost = 0.0f;
+	DrawVideoOut(shot.rtv.Get(), vw, vh, video, vw, vh, content_hdr, false, o, false, true);
+
+	D3D11_TEXTURE2D_DESC td;
+	shot.tex->GetDesc(&td);
+	td.Usage = D3D11_USAGE_STAGING;
+	td.BindFlags = 0;
+	td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	Com<ID3D11Texture2D> staging;
+	if(FAILED(device->CreateTexture2D(&td, nullptr, staging.Put())))
+		return false;
+	context->CopyResource(staging.Get(), shot.tex.Get());
+	D3D11_MAPPED_SUBRESOURCE m;
+	if(FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m)))
+		return false;
+	std::vector<uint8_t> pixels((size_t)vw * vh * 4);
+	for(int y = 0; y < vh; y++)
+	{
+		uint8_t *row = pixels.data() + (size_t)y * vw * 4;
+		memcpy(row, (uint8_t *)m.pData + (size_t)y * m.RowPitch, (size_t)vw * 4);
+		for(int x = 0; x < vw; x++)
+			row[x * 4 + 3] = 255;
+	}
+	context->Unmap(staging.Get(), 0);
+
+	// Encode off the render thread
+	std::thread([path, vw, vh, px = std::move(pixels)]() {
+		if(WritePng(path, vw, vh, px))
+			LOGI("Screenshot saved (%dx%d)", vw, vh);
+		else
+			LOGE("Could not save screenshot");
+	}).detach();
+	return true;
 }

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(OrbitPlay VERSION 1.0.0 LANGUAGES C CXX)
+project(OrbitPlay VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -71,6 +71,7 @@ add_executable(OrbitPlay WIN32
 	src/renderer.cpp
 	src/settings.cpp
 	src/stream_session.cpp
+	src/vpscaler.cpp
 	res/orbitplay.rc)
 
 target_compile_definitions(OrbitPlay PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
@@ -79,7 +80,7 @@ target_link_libraries(OrbitPlay PRIVATE
 	imgui
 	SDL3::SDL3
 	PkgConfig::FFMPEG
-	d3d11 dxgi d3dcompiler winmm winhttp shell32 iphlpapi ws2_32)
+	d3d11 dxgi d3dcompiler winmm winhttp shell32 iphlpapi ws2_32 windowscodecs ole32 uuid)
 
 if(MINGW)
 	target_link_options(OrbitPlay PRIVATE -static-libgcc -static-libstdc++)

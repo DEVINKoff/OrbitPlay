@@ -6,8 +6,11 @@
 #include <dxgi1_6.h>
 
 #include <cstdint>
+#include <memory>
+#include <string>
 
 struct AVFrame;
+class VpScaler;
 
 // Minimal COM smart pointer (avoids depending on WRL).
 template<class T>
@@ -28,12 +31,31 @@ private:
 	T *p = nullptr;
 };
 
-struct RenderOptions
+enum class UpscaleMode : int { Off = 0, Enhanced = 1, AI = 2 };
+enum class AspectMode : int { Fit = 0, Fill = 1, Stretch = 2 };
+
+// How each decoded frame is processed (applied in SubmitFrame).
+struct ProcessOptions
 {
-	bool upscale = false;      // Lanczos scaling (+ sharpening) instead of bilinear
-	float sharpness = 0.5f;
+	UpscaleMode upscale = UpscaleMode::Off;
+	int target_height = 0;          // 0 = match the video area on screen
+	float artifact_reduction = 0.4f;
+	float sharpness = 0.3f;
+	bool ai_hdr = false;            // NVIDIA RTX Video HDR for SDR streams on an HDR display
+	bool frame_gen = false;
+	bool ambient = false;
+	AspectMode aspect = AspectMode::Fit;
+};
+
+// How the picture is shown (applied in Present).
+struct PresentOptions
+{
+	int sync_interval = 1;          // 0 = present immediately (tearing allowed if supported)
 	float paper_white = 203.0f;
-	int sync_interval = 1;     // 0 = present immediately (tearing allowed if supported)
+	float hdr_boost = 0.0f;         // SDR -> HDR highlight expansion (shader), 0..1
+	float ambient = 0.0f;           // ambient light intensity, 0 = off
+	AspectMode aspect = AspectMode::Fit;
+	float brightness = 0.0f, contrast = 1.0f, saturation = 1.0f, vibrance = 0.0f;
 };
 
 enum class VideoView { None, Latest, Interpolated };
@@ -42,6 +64,9 @@ enum class VideoView { None, Latest, Interpolated };
 class Renderer
 {
 public:
+	Renderer();
+	~Renderer();
+
 	bool Init(HWND hwnd);
 	void Shutdown();
 	void Resize(int width, int height);
@@ -49,7 +74,6 @@ public:
 	ID3D11Device *Device() const { return device.Get(); }
 	ID3D11DeviceContext *Context() const { return context.Get(); }
 
-	// Monitor capabilities of the display the window is on.
 	void RefreshDisplayInfo();
 	bool DisplayHdr() const { return display_hdr; }
 	float DisplayPeakNits() const { return display_peak_nits; }
@@ -57,32 +81,52 @@ public:
 	bool OutputHdr() const { return output_hdr; }
 
 	// Video ------------------------------------------------------------------
-	// Takes a decoded frame (D3D11 hardware frame or software YUV) and converts it to RGB.
-	bool SubmitFrame(AVFrame *frame);
+	bool SubmitFrame(AVFrame *frame, const ProcessOptions &options);
 	void ResetVideo();
 	bool HasVideo() const { return frames_submitted > 0; }
 	bool VideoHdr() const { return video_hdr; }
 	int VideoWidth() const { return video_w; }
 	int VideoHeight() const { return video_h; }
+	int OutputVideoWidth() const;   // size of what's shown (after upscaling)
+	int OutputVideoHeight() const;
+	const std::string &UpscalerStatus() const { return upscaler_status; }
+	bool AiSuperResolutionAvailable() const;
+	bool AiHdrAvailable() const;
+	std::string GpuVendorName() const;
 
-	// Frame generation: builds the frame halfway between the last two submitted frames.
-	void SetFrameGenEnabled(bool enabled) { frame_gen_enabled = enabled; }
-	bool BuildInterpolatedFrame();
+	// Frame generation: motion is estimated once per new frame, then any number of
+	// in-between frames can be built (t in 0..1, 0 = previous frame, 1 = current).
+	bool PrepareMotion();
+	bool BuildInterpolatedFrame(float t);
 
 	// UI ---------------------------------------------------------------------
-	// Binds the UI overlay target; render ImGui after this, then call Present.
 	void BeginOverlay();
+	void Present(VideoView view, const PresentOptions &options);
 
-	void Present(VideoView view, const RenderOptions &options);
+	// Saves the current frame (SDR, tone mapped if needed) as a PNG.
+	bool SaveScreenshot(const std::wstring &path, const PresentOptions &options);
 
 private:
+	struct Target
+	{
+		Com<ID3D11Texture2D> tex;
+		Com<ID3D11RenderTargetView> rtv;
+		Com<ID3D11ShaderResourceView> srv;
+		Com<ID3D11UnorderedAccessView> uav;
+		int w = 0, h = 0;
+		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+		void Reset() { tex.Reset(); rtv.Reset(); srv.Reset(); uav.Reset(); w = h = 0; format = DXGI_FORMAT_UNKNOWN; }
+	};
+
 	bool CreateSwapChain();
 	void CreateBackbufferTargets();
 	void ReleaseBackbufferTargets();
 	void ApplyOutputMode();
 	bool CompileShaders();
+	bool MakeTarget(Target &t, int w, int h, DXGI_FORMAT fmt, bool rtv, bool uav);
+	bool EnsureTarget(Target &t, int w, int h, DXGI_FORMAT fmt, bool rtv, bool uav);
 	bool EnsureVideoTargets(int w, int h);
-	bool EnsureInterpTargets();
+	bool EnsureMotionTargets();
 	void ConvertToRgb(ID3D11ShaderResourceView *const *planes, int plane_count, bool semi_planar, const float matrix[12], float uv_sx, float uv_sy);
 	void DrawFullscreen(ID3D11PixelShader *ps, ID3D11RenderTargetView *rtv, int w, int h,
 			ID3D11ShaderResourceView *const *srvs, int srv_count, ID3D11Buffer *cb);
@@ -90,6 +134,13 @@ private:
 			ID3D11UnorderedAccessView *uav, ID3D11Buffer *cb, int gx, int gy);
 	void UpdateCB(ID3D11Buffer *cb, const void *data, size_t size);
 	void ComputeLumaPyramid(int slot);
+	void UpdateAmbient();
+	void VideoRect(AspectMode aspect, int win_w, int win_h, float rect[4], float uv[4]) const;
+	void ProcessFrame(AVFrame *frame, const ProcessOptions &o);
+	bool ShaderUpscale(int tw, int th, const ProcessOptions &o);
+	void DrawVideoOut(ID3D11RenderTargetView *rtv, int w, int h, ID3D11ShaderResourceView *video, int vw, int vh,
+			bool content_hdr, bool out_hdr, const PresentOptions &o, bool with_ambient, bool full_rect);
+	ID3D11ShaderResourceView *DisplaySrv(int slot, int *w, int *h) const;
 
 	HWND hwnd = nullptr;
 	int width = 0, height = 0;
@@ -101,6 +152,7 @@ private:
 	HANDLE frame_wait = nullptr;
 	bool tearing_supported = false;
 	UINT swap_flags = 0;
+	std::unique_ptr<VpScaler> vp;
 
 	bool display_hdr = false;
 	float display_peak_nits = 1000.0f;
@@ -109,15 +161,13 @@ private:
 	DXGI_FORMAT bb_format = DXGI_FORMAT_B8G8R8A8_UNORM;
 
 	Com<ID3D11RenderTargetView> bb_rtv;
-	Com<ID3D11Texture2D> overlay_tex;
-	Com<ID3D11RenderTargetView> overlay_rtv;
-	Com<ID3D11ShaderResourceView> overlay_srv;
+	Target overlay;
 
 	// Shaders and states
 	Com<ID3D11VertexShader> vs;
-	Com<ID3D11PixelShader> ps_nv12, ps_planar, ps_cas, ps_out, ps_overlay, ps_interp;
-	Com<ID3D11ComputeShader> cs_luma_half, cs_down2, cs_search, cs_median;
-	Com<ID3D11Buffer> cb_yuv, cb_cas, cb_out, cb_ui, cb_me, cb_interp;
+	Com<ID3D11PixelShader> ps_nv12, ps_planar, ps_denoise, ps_edge, ps_sharpen, ps_out, ps_overlay, ps_interp;
+	Com<ID3D11ComputeShader> cs_luma_half, cs_down2, cs_search, cs_median, cs_box8, cs_amb_blend;
+	Com<ID3D11Buffer> cb_yuv, cb_denoise, cb_up, cb_sharp, cb_out, cb_ui, cb_me, cb_interp, cb_amb;
 	Com<ID3D11SamplerState> samp_linear;
 	Com<ID3D11BlendState> blend_premul;
 	Com<ID3D11RasterizerState> raster;
@@ -131,30 +181,37 @@ private:
 	Com<ID3D11ShaderResourceView> sw_srvs[3];
 	int sw_format = -1, sw_w = 0, sw_h = 0;
 
-	// RGB history (stream resolution, RGBA16F, still gamma/PQ encoded)
+	// Stream-resolution RGB history (RGBA16F, still gamma/PQ encoded)
 	int video_w = 0, video_h = 0;
 	bool video_hdr = false;
 	uint64_t frames_submitted = 0;
 	int latest = 0;
-	Com<ID3D11Texture2D> rgb_tex[2];
-	Com<ID3D11RenderTargetView> rgb_rtv[2];
-	Com<ID3D11ShaderResourceView> rgb_srv[2];
-	Com<ID3D11Texture2D> cas_tex;
-	Com<ID3D11RenderTargetView> cas_rtv;
-	Com<ID3D11ShaderResourceView> cas_srv;
+	Target rgb[2];
 
-	// Frame generation resources
+	// Processed (upscaled / AI) history
+	Target proc[2];
+	int slot_gen[2] = { -1, -1 };   // processing generation of each slot, -1 = not processed
+	int proc_gen = 0;
+	bool proc_hdr = false;          // processed output is PQ/BT.2020
+	int last_tw = 0, last_th = 0, last_mode = -1;
+	bool last_ai_hdr = false;
+	Target clean, up_tmp;
+	std::string upscaler_status = "Off";
+
+	// Ambient light
+	Target amb_small1, amb_small2, amb[2];
+	int amb_index = 0;
+	bool amb_valid = false;
+
+	// Frame generation
 	bool frame_gen_enabled = false;
-	bool interp_ready = false;
-	int grid_w = 0, grid_h = 0;
-	Com<ID3D11Texture2D> luma_half_tex[2], luma_quarter_tex[2];
-	Com<ID3D11ShaderResourceView> luma_half_srv[2], luma_quarter_srv[2];
-	Com<ID3D11UnorderedAccessView> luma_half_uav[2], luma_quarter_uav[2];
+	bool motion_ready = false;
+	int grid_w = 0, grid_h = 0, fine_w = 0, fine_h = 0;
+	Target luma_half[2], luma_quarter[2];
 	bool luma_valid[2] = {};
-	Com<ID3D11Texture2D> mv_tex[2];
-	Com<ID3D11ShaderResourceView> mv_srv[2];
-	Com<ID3D11UnorderedAccessView> mv_uav[2];
-	Com<ID3D11Texture2D> interp_tex;
-	Com<ID3D11RenderTargetView> interp_rtv;
-	Com<ID3D11ShaderResourceView> interp_srv;
+	Target mv_coarse[2], mv_fine[2], mv_final[2];
+	int final_idx = 0;
+	bool final_valid = false;
+	Target interp;
+	bool interp_ready = false;
 };

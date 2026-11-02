@@ -39,7 +39,10 @@ private:
 	void EndStream(const std::string &message, bool is_error);
 	void SetFullscreen(bool fullscreen);
 	void MarkSettingsDirty() { settings_dirty = true; }
-	bool FrameGenUsable() const;
+	int FrameGenMultiplier() const;      // 1 = off / not possible on this display
+	ProcessOptions MakeProcessOptions() const;
+	PresentOptions MakePresentOptions(int sync_interval) const;
+	void TakeScreenshot();
 
 	// UI
 	void SetupStyle(float scale);
@@ -53,6 +56,8 @@ private:
 	void UiStreamDialogs();
 	void UiConnecting();
 	void UiMessage();
+	void UiEnhancementControls(bool compact);
+	void UiPictureControls(bool compact);
 
 	std::string data_dir;
 	std::string settings_path;
@@ -103,6 +108,17 @@ private:
 	char keyboard_buf[1024] = {};
 	std::string message;
 	bool message_is_error = false;
+
+	// auto-reconnect
+	int reconnect_attempts = 0;
+	uint64_t reconnect_at = 0;
+
+	// performance graph (ms between presented frames)
+	float frame_times[180] = {};
+	int frame_time_pos = 0;
+	uint64_t last_present_us = 0;
+	std::string toast;
+	uint64_t toast_until = 0;
 
 	uint64_t last_display_refresh = 0;
 	uint64_t last_probe = 0;

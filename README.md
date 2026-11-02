@@ -10,8 +10,14 @@ hardware video decoding, an HDR10 swap chain and SDL3 for controllers.
 |---|---|
 | 1080p at 60 fps | Yes. This is the most the PS5 sends over Remote Play. |
 | HDR10 | Yes, HEVC Main10 straight to an HDR10 swap chain. On SDR displays it can tone-map locally. |
-| **4K upscaling** (optional, off by default) | Lanczos-2 upscale plus contrast-adaptive sharpening of the 1080p stream to your display resolution. |
-| **120 fps frame generation** (optional, off by default) | GPU block-matching motion estimation and a motion-compensated in-between frame for every real frame. Needs a display at 120 Hz or more. |
+| **AI upscaling** (optional) | NVIDIA RTX Video Super Resolution (RTX 20-series+) or Intel Video Super Resolution (Arc / Iris Xe), the same driver AI that Chrome and VLC use. Upscale to 1440p, 1800p, 2160p or your display's size. |
+| **Enhanced upscaling** (any GPU) | Compression-artifact reduction, then an edge-directed upscale and noise-gated sharpening, so the picture stays clean instead of grainy. |
+| **Frame generation** (optional) | 2x / 3x / 4x from a 60 fps stream gives 120 / 180 / 240 fps on a fast enough display. It uses hierarchical GPU motion estimation with temporal prediction and occlusion fallback. |
+| **AI HDR** | NVIDIA RTX Video HDR turns SDR games into HDR on an HDR display. A shader "HDR boost" works on any GPU. |
+| **Ambient lighting** | On ultrawide (or any non-16:9) windows, the bars glow with the picture's edge colors, smoothed over time. |
+| Aspect modes, picture modes | Fit, Fill (crop) and Stretch. Natural, Vivid and Cinema presets, plus brightness, contrast, saturation and vibrance. |
+| Screenshots | **F12** saves a PNG to `Pictures\Orbit Play`, at the upscaled resolution and tone-mapped if the stream is HDR. |
+| Frame pacing graph, auto-reconnect | Shown in the stats overlay (F2). After a Wi-Fi hiccup it reconnects up to 3 times. |
 | DualSense haptics | Yes, over USB. Over Bluetooth it falls back to rumble because Windows doesn't expose the haptics audio device over Bluetooth. |
 | Adaptive triggers, lightbar, player LEDs | Yes (USB and Bluetooth) |
 | Gyro, accelerometer, touchpad | Yes |
@@ -21,10 +27,15 @@ hardware video decoding, an HDR10 swap chain and SDL3 for controllers.
 | On-screen keyboard text, console login passcode | Yes |
 | Hardware decoding | D3D11VA, frames stay on the GPU. It falls back to software decoding. |
 
-The 4K and 120 fps options are local enhancements. The console still sends 1080p/60.
-Upscaling makes the image cleaner on a 1440p/4K screen but can't add detail that isn't in the
-stream. Frame generation makes motion look smoother, adds about half a frame (~8 ms) of
-latency, and can show artifacts around fast-moving edges, so it suits slower games best.
+The console still sends 1080p/60, so upscaling and frame generation happen on your PC. AI super
+resolution does reconstruct convincingly sharp detail, but it can't recover detail that the stream's
+compression discarded. Generated frames look like real 120/240 fps motion, but they add latency
+(about 8 ms at 2x and 12 ms at 4x) and can show artifacts on very fast or chaotic motion. For
+competitive games, leave frame generation off.
+
+**NVIDIA tip:** if AI upscaling seems to do nothing, open the NVIDIA App (or NVIDIA Control Panel) →
+*RTX Video Enhancement*, turn on **Super Resolution** and pick quality **4**. For AI HDR, turn on
+**RTX Video HDR** there and enable Windows HDR.
 
 ## First-time setup
 
@@ -48,6 +59,7 @@ For the best results, connect the PS5 by Ethernet and use a wired or 5 GHz conne
 | Stream menu (enhancements, mic, rest mode, disconnect) | **Create + PS** together (View + Guide on Xbox pads), or **F1 / Esc** |
 | Fullscreen | **F11** or **Alt+Enter** |
 | Statistics overlay | **F2** |
+| Screenshot | **F12** |
 | Microphone on/off | DualSense **mute button** |
 
 ## Settings worth knowing
