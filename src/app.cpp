@@ -247,23 +247,43 @@ void App::PullAndSubmit(bool frame_gen)
 	if(!frame)
 		return;
 	double arrival_ms = session->LastFrameTimeUs() / 1000.0;
-	// Repeated frames (30 fps games inside the 60 fps stream) are skipped so motion is
-	// interpolated across the real frames. Never skip more than 2 in a row: in a still scene
-	// the picture can still change a little.
-	bool skip = frame_gen && dup_streak < 2;
-	SubmitResult r = renderer.SubmitFrame(frame, MakeProcessOptions(), skip);
+	SubmitResult r = renderer.SubmitFrame(frame, MakeProcessOptions());
 	av_frame_free(&frame);
-	if(r.serial)
+	if(r.serial && frame_gen)
+		pending_frames.push_back({ r.serial, arrival_ms, NowMs() });
+	ProcessPendingFrames();
+}
+
+// Frames enter the frame-generation timeline once the GPU has said whether they repeat the
+// previous frame (30 fps games inside the 60 fps stream). The check is read back without
+// waiting, so the GPU is never stalled; it is normally ready within a millisecond or two.
+void App::ProcessPendingFrames()
+{
+	size_t done = 0;
+	for(; done < pending_frames.size(); done++)
 	{
-		if(frame_gen)
-			timeline.Add(r.serial, arrival_ms, r.scene_cut, r.duplicate);
-		dup_streak = 0;
+		PendingFrame &p = pending_frames[done];
+		bool dup = false, cut = false;
+		int st = renderer.PollFrameDiff(p.serial, &dup, &cut);
+		if(st == 0 && NowMs() - p.submitted_ms < 30)
+			break; // not ready yet; keep order
+		if(st == 0)
+			dup = cut = false; // took too long: treat as a normal frame
+		if(!renderer.HasFrame(p.serial))
+			continue;
+		// Never skip more than 2 in a row: in a still scene the picture can still change a little.
+		if(dup && dup_streak < 2)
+		{
+			renderer.DiscardFrame(p.serial);
+			dup_streak++;
+			dup_count++;
+			continue;
+		}
+		timeline.Add(p.serial, p.arrival_ms, cut, dup);
+		if(!dup)
+			dup_streak = 0;
 	}
-	else if(r.duplicate)
-	{
-		dup_streak++;
-		dup_count++;
-	}
+	pending_frames.erase(pending_frames.begin(), pending_frames.begin() + done);
 }
 
 void App::Run()
@@ -281,7 +301,10 @@ void App::Run()
 		if(fg != fg_active_last)
 		{
 			timeline.Reset();
+			pending_frames.clear();
 			dup_streak = 0;
+			slow_seconds = 0;
+			slow_warned = false;
 			fg_active_last = fg;
 		}
 
@@ -302,6 +325,7 @@ void App::Run()
 					renderer.MarkFrameWaited();
 			}
 			PullAndSubmit(true);
+			ProcessPendingFrames();
 			PresentFrame(true);
 			continue;
 		}
@@ -507,6 +531,20 @@ void App::Tick()
 	if(now - present_window_start >= 1000)
 	{
 		present_fps = present_count * 1000.0 / (double)(now - present_window_start);
+		// Frame generation should run at the display's refresh rate; if it can't, say why.
+		if(phase == Phase::Streaming && FrameGenActive() && !overlay_open)
+		{
+			slow_seconds = present_fps < renderer.DisplayHz() * 0.85 ? slow_seconds + 1 : 0;
+			if(slow_seconds >= 3 && !slow_warned)
+			{
+				char msg[200];
+				snprintf(msg, sizeof(msg), "Frame generation reaches only %.0f of %d fps: the GPU is too busy. "
+					"Lower the detail level (F7) or upscale target.", present_fps, renderer.DisplayHz());
+				ShowToast(msg);
+				toast_until = now + 6000;
+				slow_warned = true;
+			}
+		}
 		present_count = 0;
 		present_window_start = now;
 	}

@@ -148,7 +148,8 @@ bool Renderer::Init(HWND window)
 		bd2.BindFlags = 0;
 		bd2.MiscFlags = 0;
 		bd2.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-		device->CreateBuffer(&bd2, nullptr, diff_staging.Put());
+		for(int i = 0; i < kSlots; i++)
+			device->CreateBuffer(&bd2, nullptr, diff_staging[i].Put());
 	}
 
 	if(!CreateSwapChain())
@@ -652,29 +653,68 @@ int Renderer::PickWorkSlot() const
 	return 0;
 }
 
-bool Renderer::FrameDiff(int a, int b, bool *duplicate, bool *cut)
+void Renderer::IssueFrameDiff(int a, int b)
 {
-	if(!diff_uav || !diff_staging || !luma_valid[a] || !luma_valid[b])
-		return false;
+	diff_pending[a] = false;
+	if(!diff_uav || !diff_staging[a] || !luma_valid[a] || !luma_valid[b])
+		return;
 	const UINT zeros[4] = {};
 	context->ClearUnorderedAccessViewUint(diff_uav.Get(), zeros);
 	int qw = luma_quarter[a].w, qh = luma_quarter[a].h;
 	int gw = (qw + 3) / 4, gh = (qh + 3) / 4;
 	ID3D11ShaderResourceView *srvs[2] = { luma_quarter[a].srv.Get(), luma_quarter[b].srv.Get() };
 	Dispatch(cs_frame_diff.Get(), srvs, 2, diff_uav.Get(), nullptr, gw, gh);
-	context->CopyResource(diff_staging.Get(), diff_buf.Get());
-	D3D11_MAPPED_SUBRESOURCE m;
-	if(FAILED(context->Map(diff_staging.Get(), 0, D3D11_MAP_READ, 0, &m))) // waits for the GPU (~1 ms)
-		return false;
-	const UINT *c = (const UINT *)m.pData;
-	UINT changed = c[0], big = c[1];
-	context->Unmap(diff_staging.Get(), 0);
-	*duplicate = changed == 0;
-	*cut = big > (UINT)(gw * gh * 0.55);
-	return true;
+	// copy into this slot's readback buffer; read back later without waiting for the GPU
+	context->CopyResource(diff_staging[a].Get(), diff_buf.Get());
+	diff_pending[a] = true;
+	diff_blocks[a] = (UINT)(gw * gh);
 }
 
-SubmitResult Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o, bool skip_duplicates)
+int Renderer::PollFrameDiff(uint64_t serial, bool *duplicate, bool *cut)
+{
+	int slot = FindSlot(serial);
+	if(slot < 0 || !diff_pending[slot])
+		return -1;
+	D3D11_MAPPED_SUBRESOURCE m;
+	HRESULT hr = context->Map(diff_staging[slot].Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+	if(hr == DXGI_ERROR_WAS_STILL_DRAWING)
+		return 0;
+	if(FAILED(hr))
+	{
+		diff_pending[slot] = false;
+		return -1;
+	}
+	const UINT *c = (const UINT *)m.pData;
+	UINT changed = c[0], big = c[1];
+	context->Unmap(diff_staging[slot].Get(), 0);
+	diff_pending[slot] = false;
+	*duplicate = changed == 0;
+	*cut = big > (UINT)(diff_blocks[slot] * 0.55);
+	return 1;
+}
+
+void Renderer::DiscardFrame(uint64_t serial)
+{
+	int slot = FindSlot(serial);
+	if(slot < 0)
+		return;
+	int n = 0;
+	int keep[3] = { -1, -1, -1 };
+	for(int i = 0; i < 3; i++)
+		if(hist[i] >= 0 && hist[i] != slot)
+			keep[n++] = hist[i];
+	for(int i = 0; i < 3; i++)
+		hist[i] = keep[i];
+	slot_serial[slot] = 0;
+	diff_pending[slot] = false;
+	for(auto &f : mvc)
+		if(f.a == serial || f.b == serial)
+			f.a = f.b = 0;
+	if(latest == slot && hist[0] >= 0)
+		latest = hist[0];
+}
+
+SubmitResult Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o)
 {
 	SubmitResult result;
 	if(!frame || frame->width <= 0 || frame->height <= 0)
@@ -803,10 +843,11 @@ SubmitResult Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o, bool
 	if(frame_gen_enabled && EnsureMotionTargets())
 	{
 		ComputeLumaPyramid(work);
-		if(hist[0] >= 0 && luma_valid[hist[0]] && FrameDiff(work, hist[0], &result.duplicate, &result.scene_cut)
-			&& result.duplicate && skip_duplicates)
-			return result; // same picture as the last frame: not stored (no processing needed either)
+		if(hist[0] >= 0 && luma_valid[hist[0]])
+			IssueFrameDiff(work, hist[0]);
 	}
+	else
+		diff_pending[work] = false;
 
 	ProcessFrame(frame, o);
 

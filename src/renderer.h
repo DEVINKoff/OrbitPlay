@@ -97,9 +97,13 @@ public:
 	bool OutputHdr() const { return output_hdr; }
 
 	// Video ------------------------------------------------------------------
-	// Converts and processes a decoded frame. With skip_duplicates (frame generation on), a frame
-	// identical to the previous one is detected on the GPU and not stored.
-	SubmitResult SubmitFrame(AVFrame *frame, const ProcessOptions &options, bool skip_duplicates = false);
+	// Converts, processes and stores a decoded frame. With frame generation on, it is also compared
+	// with the previous frame on the GPU; the result is read later with PollFrameDiff (never stalls).
+	SubmitResult SubmitFrame(AVFrame *frame, const ProcessOptions &options);
+	// 1 = result ready, 0 = GPU not done yet, -1 = no comparison for this frame
+	int PollFrameDiff(uint64_t serial, bool *duplicate, bool *cut);
+	// Drops a stored frame (a repeated frame found by PollFrameDiff) and frees its slot.
+	void DiscardFrame(uint64_t serial);
 	void ResetVideo();
 	bool HasVideo() const { return frames_submitted > 0; }
 	bool VideoHdr() const { return video_hdr; }
@@ -163,7 +167,7 @@ private:
 	int FindSlot(uint64_t serial) const;
 	int PickWorkSlot() const;
 	int EnsureMotionField(int slot_a, int slot_b);   // returns cache index or -1
-	bool FrameDiff(int slot_a, int slot_b, bool *duplicate, bool *cut);
+	void IssueFrameDiff(int slot_a, int slot_b);
 	void UpdateAmbient(float paper_white);
 	void VideoRect(AspectMode aspect, int win_w, int win_h, float rect[4], float uv[4]) const;
 	void ProcessFrame(AVFrame *frame, const ProcessOptions &o);
@@ -257,7 +261,9 @@ private:
 	Target mv_coarse[2], mv_fine;
 	struct MotionField { uint64_t a = 0, b = 0, used = 0; Target field; } mvc[2];
 	uint64_t mv_use_counter = 0;
-	Com<ID3D11Buffer> diff_buf, diff_staging;
+	Com<ID3D11Buffer> diff_buf, diff_staging[kSlots];
+	bool diff_pending[kSlots] = {};
+	UINT diff_blocks[kSlots] = {};
 	Com<ID3D11UnorderedAccessView> diff_uav;
 	Target interp;
 	bool interp_ready = false;
