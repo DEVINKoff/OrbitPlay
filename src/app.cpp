@@ -5,6 +5,8 @@
 #include <chiaki/common.h>
 #include <chiaki/time.h>
 
+#include <shellapi.h>
+
 #include <imgui.h>
 #include <imgui_impl_dx11.h>
 #include <imgui_impl_sdl3.h>
@@ -520,6 +522,21 @@ void App::Tick()
 		compare_split = (float)v;
 	}
 
+	// Instant replay: ask the PS5 for a keyframe every 5 s so a clip can start close to "now - N s"
+	if(phase == Phase::Streaming && session && recorder.ReplayEnabled() && now - last_replay_idr_ms > 5000)
+	{
+		session->RequestKeyframe();
+		last_replay_idr_ms = now;
+	}
+	{
+		std::string m = recorder.TakeMessage();
+		if(!m.empty())
+		{
+			ShowToast(m);
+			toast_until = now + 4000;
+		}
+	}
+
 	if(now - dup_window_start >= 1000)
 	{
 		dup_rate = dup_count * 1000.0 / (double)std::max<uint64_t>(1, now - dup_window_start);
@@ -569,6 +586,22 @@ void App::HandleSessionEvents()
 				overlay_open = false;
 				if(settings.kbm_enabled)
 					ShowToast("Keyboard & mouse ready - Esc or F1 for the menu");
+				{
+					Recorder::StreamInfo ri;
+					const StreamConfig &c = session->Config();
+					ri.hevc = c.codec == VideoCodec::H265 || c.hdr;
+					ri.hdr = c.hdr;
+					StreamStats st = session->Stats();
+					ri.width = st.width > 0 ? st.width : 1920;
+					ri.height = st.height > 0 ? st.height : 1080;
+					ri.fps = c.fps;
+					recorder.SetStreamInfo(ri);
+					recorder.SetReplay(settings.replay_enabled, settings.replay_seconds);
+					session->SetRecorder(&recorder);
+					if(settings.replay_enabled)
+						session->RequestKeyframe();
+					last_replay_idr_ms = NowMs();
+				}
 				input_guard = true;
 				gamepads.SetMicLed(false);
 				if(settings.dualsense_features && gamepads.AnyWiredDualSense())
@@ -812,6 +845,10 @@ void App::StartStream()
 
 void App::EndStream(const std::string &msg, bool is_error)
 {
+	if(recorder.Recording())
+		recorder.StopRecording();
+	if(session)
+		session->SetRecorder(nullptr);
 	reconnect_at = 0;
 	if(session)
 	{
@@ -895,6 +932,7 @@ void App::BuildUi()
 			label("Original", true, smooth(0.0f, 0.12f, compare_split));
 			label(right.c_str(), false, smooth(0.0f, 0.12f, 1.0f - compare_split));
 		}
+		DrawRecordingBadge();
 		if(settings.show_stats)
 			UiStats();
 		if(overlay_open)
@@ -1611,13 +1649,139 @@ void App::UiSystemSection()
 	static const char *keys[][2] = {
 		{ "Esc / F1", "Stream menu (frees the mouse)" }, { "F2", "Statistics" }, { "F3", "Cycle upscaling" },
 		{ "F4", "Cycle frame generation" }, { "F5", "Ambient light on/off" }, { "F6", "Split-screen compare" },
-		{ "F7 / F8", "Detail level - / +   (Ctrl: fine sharpness)" }, { "F9", "Cycle picture mode" }, { "F10", "Microphone on/off" },
+		{ "F7 / F8", "Detail level - / +   (Ctrl: fine sharpness)" }, { "F9", "Start / stop recording" },
+		{ "F10", "Save instant replay" }, { "Shift+F9", "Cycle picture mode" }, { "Ctrl+F10", "Microphone on/off" },
 		{ "F11", "Fullscreen" }, { "F12", "Screenshot" },
 	};
 	for(auto &k : keys)
 	{
 		Row(k[0]);
 		ImGui::TextUnformatted(k[1]);
+	}
+	if(changed)
+		MarkSettingsDirty();
+}
+
+std::string App::CapturePath(const char *prefix)
+{
+	wchar_t profile[MAX_PATH] = {};
+	DWORD n = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+	std::wstring dir = (n ? std::wstring(profile) : std::wstring(L".")) + L"\\Videos\\Orbit Play";
+	CreateDirectoryW((n ? std::wstring(profile) + L"\\Videos" : std::wstring(L".")).c_str(), nullptr);
+	CreateDirectoryW(dir.c_str(), nullptr);
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+	wchar_t name[96];
+	swprintf(name, 96, L"\\%hs_%04d%02d%02d_%02d%02d%02d.mp4", prefix, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+	std::wstring w = dir + name;
+	int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+	std::string out(len > 0 ? len - 1 : 0, '\0');
+	if(len > 0)
+		WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &out[0], len, nullptr, nullptr);
+	return out;
+}
+
+void App::ToggleRecording()
+{
+	if(phase != Phase::Streaming || !session)
+		return;
+	if(recorder.Recording())
+	{
+		recorder.StopRecording();
+		ShowToast("Recording stopped - saving...");
+		return;
+	}
+	if(recorder.StartRecording(CapturePath("OrbitPlay")))
+	{
+		session->RequestKeyframe(); // recording starts on the next keyframe
+		ShowToast("Recording (F9 to stop) - lossless, straight from the PS5 stream");
+	}
+}
+
+void App::SaveReplay()
+{
+	if(phase != Phase::Streaming || !session)
+		return;
+	if(!recorder.ReplayEnabled())
+	{
+		ShowToast("Instant replay is off - turn it on in the menu (Capture tab)");
+		return;
+	}
+	if(recorder.SaveReplay(CapturePath("Replay")))
+		ShowToast("Saving instant replay...");
+}
+
+void App::DrawRecordingBadge()
+{
+	if(!recorder.Recording())
+		return;
+	ImDrawList *dl = ImGui::GetForegroundDrawList();
+	ImGuiViewport *vp = ImGui::GetMainViewport();
+	double secs = recorder.RecordingSeconds();
+	char txt[48];
+	if(secs <= 0.0)
+		snprintf(txt, sizeof(txt), "REC  waiting for keyframe");
+	else
+		snprintf(txt, sizeof(txt), "REC  %02d:%02d", (int)secs / 60, (int)secs % 60);
+	ImVec2 sz = ImGui::CalcTextSize(txt);
+	float pad = 10.0f * ui_scale, r = 6.0f * ui_scale;
+	ImVec2 p(vp->Pos.x + vp->Size.x - sz.x - pad * 3 - r * 2 - 20.0f * ui_scale, vp->Pos.y + 20.0f * ui_scale);
+	dl->AddRectFilled(p, ImVec2(p.x + sz.x + pad * 3 + r * 2, p.y + sz.y + pad), IM_COL32(0, 0, 0, 170), 10.0f * ui_scale);
+	bool blink = ((int)(ImGui::GetTime() * 2.0)) % 2 == 0;
+	dl->AddCircleFilled(ImVec2(p.x + pad + r, p.y + (sz.y + pad) * 0.5f), r, blink ? IM_COL32(235, 60, 60, 255) : IM_COL32(140, 30, 30, 255));
+	dl->AddText(ImVec2(p.x + pad * 2 + r * 2, p.y + pad * 0.5f), IM_COL32(255, 255, 255, 235), txt);
+}
+
+void App::UiCaptureSection()
+{
+	bool changed = false;
+	bool live = phase == Phase::Streaming && session;
+	Row("Record");
+	ImGui::BeginDisabled(!live);
+	if(PrimaryButton(recorder.Recording() ? "Stop recording (F9)" : "Start recording (F9)"))
+		ToggleRecording();
+	ImGui::EndDisabled();
+	RowHelp("Saves the PS5's own video stream into an MP4 without re-encoding it: identical quality, no performance cost, "
+		"HDR kept. Files go to Videos\\Orbit Play.");
+
+	Row("Instant replay");
+	if(ImGui::Checkbox("Keep the last moments in memory##replay", &settings.replay_enabled))
+	{
+		recorder.SetReplay(settings.replay_enabled, settings.replay_seconds);
+		if(settings.replay_enabled && session)
+			session->RequestKeyframe();
+		changed = true;
+	}
+	Row("Replay length");
+	if(ImGui::SliderInt("##replaylen", &settings.replay_seconds, 10, 120, "%d s"))
+	{
+		recorder.SetReplay(settings.replay_enabled, settings.replay_seconds);
+		changed = true;
+	}
+	ImGui::SetCursorPosX(row_label_w);
+	ImGui::BeginDisabled(!live || !settings.replay_enabled);
+	if(ImGui::Button("Save replay now (F10)"))
+		SaveReplay();
+	ImGui::EndDisabled();
+	if(live && settings.replay_enabled)
+	{
+		char b[96];
+		snprintf(b, sizeof(b), "Buffered: %.0f s", recorder.ReplayBufferedSeconds());
+		RowHelp(b);
+	}
+	RowHelp("Missed a great moment? Press F10 and the last seconds are saved as a clip. "
+		"Uses about 2 MB of memory per second of replay.");
+	Row("Folder");
+	if(ImGui::Button("Open Videos\\Orbit Play"))
+	{
+		std::string p = CapturePath("x");
+		size_t slash = p.find_last_of('\\');
+		std::string dir = slash == std::string::npos ? p : p.substr(0, slash);
+		int wl = MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), -1, nullptr, 0);
+		std::wstring wd(wl > 0 ? wl - 1 : 0, L'\0');
+		if(wl > 0)
+			MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), -1, &wd[0], wl);
+		ShellExecuteW(nullptr, L"open", wd.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 	}
 	if(changed)
 		MarkSettingsDirty();
@@ -1808,6 +1972,7 @@ void App::UiStreamOverlay()
 		tab("Motion", [&] { UiFrameGenSection(); });
 		tab("Picture", [&] { UiPictureSection(); });
 		tab("Controls", [&] { UiControlsSection(); });
+		tab("Capture", [&] { UiCaptureSection(); });
 		tab("Stream", [&] { UiStreamSection(); });
 		tab("System", [&] { UiSystemSection(); });
 		ImGui::EndTabBar();
@@ -1946,12 +2111,23 @@ bool App::HandleHotkey(SDL_Keycode key)
 		}
 		case SDLK_F9:
 		{
+			if(!(SDL_GetModState() & SDL_KMOD_SHIFT))
+			{
+				ToggleRecording();
+				return true;
+			}
+			// Shift+F9: cycle picture mode
 			settings.ApplyPicturePreset((std::min(settings.picture_preset, 2) + 1) % 3);
 			const char *names[] = { "Natural", "Vivid", "Cinema" };
 			ShowToast(std::string("Picture mode: ") + names[settings.picture_preset]);
 			break;
 		}
 		case SDLK_F10:
+			if(!(SDL_GetModState() & SDL_KMOD_CTRL))
+			{
+				SaveReplay();
+				return true;
+			}
 			if(settings.microphone)
 			{
 				bool m = !session->MicMuted();

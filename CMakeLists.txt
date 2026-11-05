@@ -40,7 +40,7 @@ add_subdirectory("${CHIAKI_DIR}" chiaki EXCLUDE_FROM_ALL)
 # Dependencies
 find_package(SDL3 REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavutil)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libavutil)
 
 include(FetchContent)
 FetchContent_Declare(imgui
@@ -73,6 +73,7 @@ add_executable(OrbitPlay WIN32
 	src/stream_session.cpp
 	src/vpscaler.cpp
 	src/kbm.cpp
+	src/recorder.cpp
 	res/orbitplay.rc)
 
 target_compile_definitions(OrbitPlay PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)

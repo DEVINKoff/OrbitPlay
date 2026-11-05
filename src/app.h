@@ -6,6 +6,7 @@
 #include "gamepad.h"
 #include "kbm.h"
 #include "frametimeline.h"
+#include "recorder.h"
 #include "registration.h"
 #include "renderer.h"
 #include "settings.h"
@@ -80,6 +81,11 @@ private:
 	void SyncBindingsToSettings();
 	bool WantMouseCapture() const;
 	void UpdateMouseCapture();
+	std::string CapturePath(const char *prefix);
+	void ToggleRecording();
+	void SaveReplay();
+	void UiCaptureSection();
+	void DrawRecordingBadge();
 
 	std::string data_dir;
 	std::string settings_path;
@@ -118,6 +124,8 @@ private:
 	int slow_seconds = 0;                     // frame generation below the display rate
 	bool slow_warned = false;
 	Discovery discovery;
+	Recorder recorder;
+	uint64_t last_replay_idr_ms = 0;
 	std::unique_ptr<StreamSession> session;
 	Registration registration;
 	PsnLogin psn_login;

@@ -78,6 +78,10 @@ struct Settings
 	void ApplyMousePreset(int preset);
 	KeyboardMouse::Binding bindings[KeyboardMouse::ActionCount];
 
+	// Capture
+	bool replay_enabled = false;  // keep the last N seconds for instant replay
+	int replay_seconds = 30;
+
 	// Behaviour
 	bool auto_reconnect = true;
 

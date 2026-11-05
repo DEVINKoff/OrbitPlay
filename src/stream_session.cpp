@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #include "stream_session.h"
 #include "audio.h"
+#include "recorder.h"
 #include "log.h"
 
 #include <chiaki/time.h>
@@ -433,6 +434,8 @@ bool StreamSession::VideoSampleCb(uint8_t *buf, size_t buf_size, int32_t frames_
 		std::lock_guard<std::mutex> lock(self->stats_mutex);
 		self->bytes_window += buf_size;
 	}
+	if(Recorder *r = self->recorder)
+		r->OnVideoPacket(buf, buf_size);
 	return chiaki_ffmpeg_decoder_video_sample_cb(buf, buf_size, frames_lost, frame_recovered, &self->decoder);
 }
 
@@ -447,6 +450,8 @@ void StreamSession::FrameAvailableCb(ChiakiFfmpegDecoder *, void *user)
 void StreamSession::AudioSettingsCb(uint32_t channels, uint32_t rate, void *user)
 {
 	auto *self = static_cast<StreamSession *>(user);
+	self->audio_channels = (int)channels;
+	self->audio_rate = (int)rate;
 	if(self->audio)
 		self->audio->OpenGame((int)channels, (int)rate);
 }
@@ -456,6 +461,8 @@ void StreamSession::AudioFrameCb(int16_t *buf, size_t samples_count, void *user)
 	auto *self = static_cast<StreamSession *>(user);
 	if(self->audio)
 		self->audio->PushGame(buf, samples_count);
+	if(Recorder *r = self->recorder)
+		r->OnAudio(buf, samples_count, self->audio_channels, self->audio_rate);
 }
 
 void StreamSession::HapticsFrameCb(uint8_t *buf, size_t buf_size, void *user)

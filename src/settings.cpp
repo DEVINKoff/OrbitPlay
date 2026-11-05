@@ -299,6 +299,8 @@ void Settings::Load(const std::string &path)
 	flt("saturation", saturation);
 	flt("vibrance", vibrance);
 	bol("auto_reconnect", auto_reconnect);
+	bol("replay_enabled", replay_enabled);
+	num("replay_seconds", replay_seconds);
 	bol("fullscreen", fullscreen);
 	bol("vsync", vsync);
 	bol("show_stats", show_stats);
@@ -387,6 +389,8 @@ void Settings::Save(const std::string &path) const
 	o << "saturation=" << saturation << "\n";
 	o << "vibrance=" << vibrance << "\n";
 	o << "auto_reconnect=" << auto_reconnect << "\n";
+	o << "replay_enabled=" << replay_enabled << "\n";
+	o << "replay_seconds=" << replay_seconds << "\n";
 	o << "fullscreen=" << fullscreen << "\n";
 	o << "vsync=" << vsync << "\n";
 	o << "show_stats=" << show_stats << "\n";

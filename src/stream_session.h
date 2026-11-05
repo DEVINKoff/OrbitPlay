@@ -20,6 +20,7 @@
 
 struct AVFrame;
 class Audio;
+class Recorder;
 
 struct StreamConfig
 {
@@ -66,6 +67,7 @@ public:
 	~StreamSession();
 
 	bool Start(const StreamConfig &config, ID3D11Device *device, ID3D11DeviceContext *ctx, Audio *audio, std::string *error);
+	void SetRecorder(Recorder *r) { recorder = r; }
 	void Stop();
 
 	bool Running() const { return running; }
@@ -111,6 +113,8 @@ private:
 	StreamConfig config;
 	std::string host_str;
 	Audio *audio = nullptr;
+	std::atomic<Recorder *> recorder{ nullptr };
+	std::atomic<int> audio_channels{ 2 }, audio_rate{ 48000 };
 
 	ChiakiSession session = {};
 	ChiakiFfmpegDecoder decoder = {};
