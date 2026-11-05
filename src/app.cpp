@@ -462,14 +462,24 @@ void App::Tick()
 	if(session)
 		session->SetHapticsGain(settings.haptics_gain);
 
-	// Showcase: the divider glides across the picture and back (12 s per round trip),
-	// easing in and out so it pauses briefly with the picture fully original / fully enhanced.
+	// Showcase: stay on the enhanced picture for a while, slowly wipe to the original, stay there,
+	// then wipe back. (split = share of the picture showing the original, from the left)
 	if(showcase_on)
 	{
-		double ph = (double)((now - showcase_start_ms) % 12000) / 12000.0;
-		double tri = ph < 0.5 ? ph * 2.0 : 2.0 - ph * 2.0;          // 0 -> 1 -> 0
-		double eased = tri * tri * (3.0 - 2.0 * tri);
-		compare_split = (float)(0.02 + 0.96 * (1.0 - eased));          // starts fully enhanced
+		const double hold_enh = 7000, wipe = 3500, hold_orig = 5000;
+		const double cycle = hold_enh + wipe + hold_orig + wipe;
+		double t = (double)((now - showcase_start_ms) % (uint64_t)cycle);
+		auto ease = [](double x) { x = std::clamp(x, 0.0, 1.0); return x * x * (3.0 - 2.0 * x); };
+		double v;
+		if(t < hold_enh)
+			v = 0.0;
+		else if(t < hold_enh + wipe)
+			v = ease((t - hold_enh) / wipe);
+		else if(t < hold_enh + wipe + hold_orig)
+			v = 1.0;
+		else
+			v = 1.0 - ease((t - hold_enh - wipe - hold_orig) / wipe);
+		compare_split = (float)v;
 	}
 
 	if(now - dup_window_start >= 1000)
@@ -801,30 +811,34 @@ void App::BuildUi()
 	{
 		if(compare_on || showcase_on)
 		{
-			// labels on both sides of the divider
+			// Big labels in the bottom corners: "Original" on the left, the enhanced one on the right.
+			// Each fades out when its side is no longer on screen.
 			float rect[4];
 			renderer.GetVideoRect((AspectMode)settings.aspect_mode, rect);
-			float x = rect[0] + rect[2] * compare_split;
-			float y = rect[1] + 24.0f * ui_scale;
 			ImDrawList *dl = ImGui::GetForegroundDrawList();
-			auto label = [&](const char *text, bool left) {
-				ImVec2 sz = ImGui::CalcTextSize(text);
-				float pad = 10.0f * ui_scale;
-				float lx = left ? x - sz.x - pad * 2.5f : x + pad * 1.5f;
-				if((left && lx < rect[0]) || (!left && lx + sz.x > rect[0] + rect[2]))
-					return; // no room next to the edge
-				dl->AddRectFilled(ImVec2(lx - pad, y - pad * 0.6f), ImVec2(lx + sz.x + pad, y + sz.y + pad * 0.6f),
-					IM_COL32(0, 0, 0, 150), 8.0f * ui_scale);
-				dl->AddText(ImVec2(lx, y), IM_COL32(255, 255, 255, 230), text);
+			ImFont *font = ImGui::GetFont();
+			float size = ImGui::GetFontSize() * 2.4f;
+			float margin = 36.0f * ui_scale;
+			float pad = 16.0f * ui_scale;
+			auto smooth = [](float e0, float e1, float x) { float t = std::clamp((x - e0) / (e1 - e0), 0.0f, 1.0f); return t * t * (3 - 2 * t); };
+			auto label = [&](const char *text, bool left, float alpha) {
+				if(alpha <= 0.01f)
+					return;
+				ImVec2 sz = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
+				float x = left ? rect[0] + margin : rect[0] + rect[2] - margin - sz.x;
+				float y = rect[1] + rect[3] - margin - sz.y;
+				dl->AddRectFilled(ImVec2(x - pad, y - pad * 0.6f), ImVec2(x + sz.x + pad, y + sz.y + pad * 0.6f),
+					IM_COL32(0, 0, 0, (int)(140 * alpha)), 12.0f * ui_scale);
+				dl->AddText(font, size, ImVec2(x, y), IM_COL32(255, 255, 255, (int)(240 * alpha)), text);
 			};
-			label("Original", true);
 			std::string right = "Enhanced";
 			const std::string &st = renderer.UpscalerStatus();
 			if(st.rfind("NVIDIA RTX", 0) == 0)
-				right = "RTX enhanced";
+				right = "RTX Enhanced";
 			else if(st.rfind("Intel", 0) == 0)
-				right = "AI enhanced";
-			label(right.c_str(), false);
+				right = "AI Enhanced";
+			label("Original", true, smooth(0.0f, 0.12f, compare_split));
+			label(right.c_str(), false, smooth(0.0f, 0.12f, 1.0f - compare_split));
 		}
 		if(settings.show_stats)
 			UiStats();
@@ -1726,7 +1740,7 @@ void App::UiStreamOverlay()
 		float rect[4];
 		renderer.GetVideoRect((AspectMode)settings.aspect_mode, rect);
 		if(rect[2] > 0)
-			compare_split = std::clamp((ImGui::GetIO().MousePos.x - rect[0]) / rect[2], 0.02f, 0.98f);
+			compare_split = std::clamp((ImGui::GetIO().MousePos.x - rect[0]) / rect[2], 0.0f, 1.0f);
 	}
 }
 
