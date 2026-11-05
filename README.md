@@ -12,7 +12,8 @@ hardware video decoding, an HDR10 swap chain and SDL3 for controllers.
 | HDR10 | Yes, HEVC Main10 straight to an HDR10 swap chain. On SDR displays it can tone-map locally. |
 | **AI upscaling** (optional) | NVIDIA RTX Video Super Resolution (RTX 20-series+) or Intel Video Super Resolution (Arc / Iris Xe), the same driver AI that Chrome and VLC use. Upscale to 1440p, 1800p, 2160p or your display's size. |
 | **Enhanced upscaling** (any GPU) | Compression-artifact reduction, then an edge-directed upscale and noise-gated sharpening, so the picture stays clean instead of grainy. |
-| **Frame generation** (optional) | Builds a new in-between picture for every refresh of your display (120, 144, 165, 240 Hz...), on a jitter-smoothed timeline. Repeated frames from 30 fps games are detected on the GPU and skipped, so 30 fps games get smooth too. |
+| **Frame generation** (optional) | A new picture for every refresh of your display (120, 144, 165, 240 Hz...), on a jitter-smoothed timeline. **Predictive** mode extrapolates motion forward from the newest frame, so it adds no delay. **Interpolated** mode blends between the two newest frames and is the smoothest. Repeated frames from 30 fps games are detected on the GPU and skipped. |
+| **Recording & instant replay** | **F9** records the stream to MP4 losslessly (the console's own H.264/HEVC, HDR kept, no re-encode, no GPU cost). **F10** saves the last 30 seconds. Files go to `Videos\Orbit Play`. |
 | **AI HDR** | NVIDIA RTX Video HDR turns SDR games into HDR on an HDR display. A shader "HDR boost" works on any GPU. |
 | **Ambient lighting** | On ultrawide (or any non-16:9) windows, the bars glow with the picture's edge colors, smoothed over time. |
 | Aspect modes, picture modes | Fit, Fill (crop) and Stretch. Natural, Vivid and Cinema presets, plus brightness, contrast, saturation and vibrance. |
@@ -29,9 +30,10 @@ hardware video decoding, an HDR10 swap chain and SDL3 for controllers.
 
 The console still sends 1080p/60, so upscaling and frame generation happen on your PC. AI super
 resolution does reconstruct convincingly sharp detail, but it can't recover detail that the stream's
-compression discarded. Generated frames look like real 120/240 fps motion, but they add latency
-(about 8 ms at 2x and 12 ms at 4x) and can show artifacts on very fast or chaotic motion. For
-competitive games, leave frame generation off.
+compression discarded. Predictive frame generation shows the newest frame sooner than with
+frame generation off, but its guessed motion can wobble at the edges of fast-moving objects.
+Interpolated mode looks cleaner but adds about 13 ms of delay, so use
+Predictive or Off for competitive games. The stats overlay (F2) breaks the delay down.
 
 **Detail levels** (Image tab, or **F7/F8** while playing): Off, Natural, Sharp, Ultra and Maximum.
 They stack edge sharpening (up to 2x, past the usual RCAS limit), fine **Texture**, large-radius
@@ -74,6 +76,12 @@ drives the right stick (mouse-look), and a gamepad keeps working at the same tim
 frees the mouse and opens the menu. All bindings can be changed in *Controls*: click a binding,
 then press a key, mouse button or wheel direction.
 
+Mouse movement is measured over the same 8 ms window the console reads the stick, and input is
+read every 2 ms, so turning follows your hand instead of lagging behind. Console games put a
+curve and a deadzone on the stick, and Orbit Play reverses both so small movements register and
+fast flicks turn fast. *Mouse feel* presets: **PC-like** (default), **Direct**, **Smooth**, **Raw**
+(no compensation), or **Custom**.
+
 | Default | PS5 |
 |---|---|
 | WASD | Left stick (hold **Left Alt** to walk) |
@@ -95,13 +103,17 @@ then press a key, mouse button or wheel direction.
 | Cycle upscaling / frame generation | **F3** / **F4** |
 | Ambient light on/off, compare -> showcase -> off | **F5** / **F6** |
 | Detail level - / + (Ctrl: fine sharpness) | **F7** / **F8** |
-| Picture mode, microphone | **F9** / **F10** |
+| Record on/off, save instant replay | **F9** / **F10** |
+| Picture mode, microphone | **Shift+F9** / **Ctrl+F10** |
 | Screenshot | **F12** |
+| Microphone on/off | DualSense **mute button** |
+
+The stream menu can be dragged anywhere by its header and resized from its edges. It remembers
+where you put it; the center button in its header puts it back.
 
 Every setting can be changed while you play in the tabbed stream menu. Stream-level settings
 (resolution, frame rate, codec, bitrate, HDR) show a **Reconnect now** button that re-joins in a
 few seconds.
-| Microphone on/off | DualSense **mute button** |
 
 ## Settings worth knowing
 

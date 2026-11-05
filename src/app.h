@@ -52,6 +52,7 @@ private:
 	// UI
 	void SetupStyle(float scale);
 	void UiSidebar();
+	bool NavItem(const char *icon, const char *label, bool active);
 	void UiConsoles();
 	void UiSettings();
 	void UiLog();
@@ -106,6 +107,7 @@ private:
 	bool mouse_captured = false;
 	bool window_focused = true;
 	bool overlay_just_opened = false;
+	bool menu_reset_pos = true;          // center the stream menu next time it opens
 	bool compare_on = false;
 	bool showcase_on = false;            // compare divider sweeps by itself
 	uint64_t showcase_start_ms = 0;

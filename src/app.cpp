@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #include "app.h"
 #include "log.h"
+#include "icons.h"
 
 #include <chiaki/common.h>
 #include <chiaki/time.h>
@@ -113,64 +114,116 @@ void App::Shutdown()
 	LOGI("Bye");
 }
 
+static bool g_icons = false;
+static ImFont *g_heading = nullptr, *g_title = nullptr;
+static const char *Ico(const char *icon) { return g_icons ? icon : ""; }
+
+// Colors
+static const ImVec4 kAccent(0.00f, 0.44f, 0.86f, 1.0f);       // PlayStation blue
+static const ImVec4 kAccentHi(0.20f, 0.58f, 1.00f, 1.0f);
+static const ImU32 kAccentU = IM_COL32(0, 112, 219, 255);
+static const ImVec4 kTextDim(0.62f, 0.66f, 0.74f, 1.0f);
+static const ImVec4 kGood(0.35f, 0.88f, 0.55f, 1.0f);
+static const ImVec4 kWarn(1.00f, 0.74f, 0.30f, 1.0f);
+
 void App::SetupStyle(float scale)
 {
 	ImGuiIO &io = ImGui::GetIO();
 	io.Fonts->Clear();
-	ImFontConfig cfg;
-	cfg.OversampleH = 2;
-	const char *font = "C:\\Windows\\Fonts\\segoeui.ttf";
-	if(GetFileAttributesA(font) != INVALID_FILE_ATTRIBUTES)
-		io.Fonts->AddFontFromFileTTF(font, 19.0f * scale, &cfg);
-	else
-	{
-		cfg.SizePixels = 15.0f * scale;
-		io.Fonts->AddFontDefault(&cfg);
-	}
-	// Large font rasterized at its real size, so the compare labels stay sharp
-	label_font = nullptr;
+	const char *regular = "C:\\Windows\\Fonts\\segoeui.ttf";
+	const char *semibold = "C:\\Windows\\Fonts\\seguisb.ttf";
 	const char *bold = "C:\\Windows\\Fonts\\segoeuib.ttf";
-	ImFontConfig big;
-	big.OversampleH = 2;
-	if(GetFileAttributesA(bold) != INVALID_FILE_ATTRIBUTES)
-		label_font = io.Fonts->AddFontFromFileTTF(bold, 52.0f * scale, &big);
-	else if(GetFileAttributesA(font) != INVALID_FILE_ATTRIBUTES)
-		label_font = io.Fonts->AddFontFromFileTTF(font, 52.0f * scale, &big);
+	const char *icon_font = "C:\\Windows\\Fonts\\SegoeIcons.ttf";       // Windows 11
+	if(GetFileAttributesA(icon_font) == INVALID_FILE_ATTRIBUTES)
+		icon_font = "C:\\Windows\\Fonts\\segmdl2.ttf";                  // Windows 10
+	auto exists = [](const char *f) { return GetFileAttributesA(f) != INVALID_FILE_ATTRIBUTES; };
+	if(!exists(semibold))
+		semibold = regular;
+	if(!exists(bold))
+		bold = semibold;
+	g_icons = exists(icon_font);
+	static const ImWchar icon_ranges[] = { ICON_RANGE_MIN, ICON_RANGE_MAX, 0 };
 
-	ImGuiStyle &s = ImGui::GetStyle();
-	s = ImGuiStyle();
-	ImGui::StyleColorsDark(&s);
-	s.WindowRounding = 10.0f;
-	s.ChildRounding = 10.0f;
-	s.FrameRounding = 7.0f;
-	s.GrabRounding = 7.0f;
-	s.PopupRounding = 8.0f;
-	s.FramePadding = ImVec2(12, 8);
-	s.ItemSpacing = ImVec2(10, 9);
-	s.WindowPadding = ImVec2(18, 16);
-	s.ScrollbarSize = 12.0f;
-	ImVec4 *c = s.Colors;
-	ImVec4 accent(0.0f, 0.44f, 0.82f, 1.0f); // PlayStation blue
-	c[ImGuiCol_WindowBg] = ImVec4(0.055f, 0.06f, 0.075f, 1.0f);
-	c[ImGuiCol_ChildBg] = ImVec4(0.09f, 0.10f, 0.125f, 1.0f);
-	c[ImGuiCol_PopupBg] = ImVec4(0.08f, 0.09f, 0.11f, 0.98f);
-	c[ImGuiCol_Border] = ImVec4(1, 1, 1, 0.07f);
-	c[ImGuiCol_FrameBg] = ImVec4(0.14f, 0.15f, 0.19f, 1.0f);
-	c[ImGuiCol_FrameBgHovered] = ImVec4(0.18f, 0.20f, 0.25f, 1.0f);
-	c[ImGuiCol_FrameBgActive] = ImVec4(0.20f, 0.23f, 0.30f, 1.0f);
-	c[ImGuiCol_Button] = ImVec4(0.16f, 0.18f, 0.23f, 1.0f);
-	c[ImGuiCol_ButtonHovered] = accent;
-	c[ImGuiCol_ButtonActive] = ImVec4(0.0f, 0.36f, 0.70f, 1.0f);
-	c[ImGuiCol_CheckMark] = ImVec4(0.35f, 0.65f, 1.0f, 1.0f);
-	c[ImGuiCol_SliderGrab] = accent;
-	c[ImGuiCol_SliderGrabActive] = ImVec4(0.35f, 0.65f, 1.0f, 1.0f);
-	c[ImGuiCol_Header] = ImVec4(0.16f, 0.18f, 0.23f, 1.0f);
-	c[ImGuiCol_HeaderHovered] = ImVec4(0.0f, 0.44f, 0.82f, 0.6f);
-	c[ImGuiCol_HeaderActive] = accent;
-	c[ImGuiCol_NavCursor] = ImVec4(0.35f, 0.65f, 1.0f, 1.0f);
+	auto add = [&](const char *file, float px, bool icons) -> ImFont * {
+		ImFontConfig cfg;
+		cfg.OversampleH = 2;
+		ImFont *f = nullptr;
+		if(exists(file))
+			f = io.Fonts->AddFontFromFileTTF(file, px * scale, &cfg);
+		else
+		{
+			cfg.SizePixels = px * 0.8f * scale;
+			f = io.Fonts->AddFontDefault(&cfg);
+		}
+		if(icons && g_icons)
+		{
+			ImFontConfig ic;
+			ic.MergeMode = true;
+			ic.GlyphOffset = ImVec2(0, px * 0.12f * scale);
+			ic.GlyphMinAdvanceX = px * scale;
+			io.Fonts->AddFontFromFileTTF(icon_font, px * 0.92f * scale, &ic, icon_ranges);
+		}
+		return f;
+	};
+	add(regular, 19.0f, true);          // default UI font (first = default)
+	g_heading = add(semibold, 23.0f, true);
+	g_title = add(bold, 34.0f, true);
+	label_font = add(bold, 52.0f, false);
+
+	ImGuiStyle &st = ImGui::GetStyle();
+	st = ImGuiStyle();
+	ImGui::StyleColorsDark(&st);
+	st.WindowRounding = 16.0f;
+	st.ChildRounding = 14.0f;
+	st.FrameRounding = 9.0f;
+	st.GrabRounding = 9.0f;
+	st.PopupRounding = 12.0f;
+	st.TabRounding = 9.0f;
+	st.ScrollbarRounding = 9.0f;
+	st.FramePadding = ImVec2(14, 9);
+	st.ItemSpacing = ImVec2(12, 10);
+	st.ItemInnerSpacing = ImVec2(8, 6);
+	st.WindowPadding = ImVec2(22, 18);
+	st.ScrollbarSize = 10.0f;
+	st.GrabMinSize = 14.0f;
+	st.WindowBorderSize = 1.0f;
+	st.ChildBorderSize = 1.0f;
+	st.PopupBorderSize = 1.0f;
+	st.TabBarBorderSize = 0.0f;
+	ImVec4 *c = st.Colors;
+	c[ImGuiCol_Text] = ImVec4(0.94f, 0.95f, 0.98f, 1.0f);
+	c[ImGuiCol_TextDisabled] = kTextDim;
+	c[ImGuiCol_WindowBg] = ImVec4(0.045f, 0.055f, 0.085f, 0.97f);
+	c[ImGuiCol_ChildBg] = ImVec4(1, 1, 1, 0.035f);
+	c[ImGuiCol_PopupBg] = ImVec4(0.07f, 0.085f, 0.12f, 0.98f);
+	c[ImGuiCol_Border] = ImVec4(1, 1, 1, 0.08f);
+	c[ImGuiCol_FrameBg] = ImVec4(1, 1, 1, 0.06f);
+	c[ImGuiCol_FrameBgHovered] = ImVec4(1, 1, 1, 0.10f);
+	c[ImGuiCol_FrameBgActive] = ImVec4(1, 1, 1, 0.14f);
+	c[ImGuiCol_Button] = ImVec4(1, 1, 1, 0.07f);
+	c[ImGuiCol_ButtonHovered] = ImVec4(1, 1, 1, 0.13f);
+	c[ImGuiCol_ButtonActive] = ImVec4(1, 1, 1, 0.18f);
+	c[ImGuiCol_CheckMark] = kAccentHi;
+	c[ImGuiCol_SliderGrab] = kAccent;
+	c[ImGuiCol_SliderGrabActive] = kAccentHi;
+	c[ImGuiCol_Header] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.35f);
+	c[ImGuiCol_HeaderHovered] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.55f);
+	c[ImGuiCol_HeaderActive] = kAccent;
+	c[ImGuiCol_Tab] = ImVec4(1, 1, 1, 0.04f);
+	c[ImGuiCol_TabHovered] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.55f);
+	c[ImGuiCol_TabSelected] = kAccent;
+	c[ImGuiCol_TabSelectedOverline] = ImVec4(0, 0, 0, 0);
+	c[ImGuiCol_TabDimmed] = ImVec4(1, 1, 1, 0.04f);
+	c[ImGuiCol_TabDimmedSelected] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.7f);
+	c[ImGuiCol_NavCursor] = kAccentHi;
 	c[ImGuiCol_Separator] = ImVec4(1, 1, 1, 0.08f);
-	c[ImGuiCol_ModalWindowDimBg] = ImVec4(0, 0, 0, 0.6f);
-	s.ScaleAllSizes(scale);
+	c[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0);
+	c[ImGuiCol_ScrollbarGrab] = ImVec4(1, 1, 1, 0.12f);
+	c[ImGuiCol_ResizeGrip] = ImVec4(1, 1, 1, 0.06f);
+	c[ImGuiCol_ResizeGripHovered] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.6f);
+	c[ImGuiCol_ModalWindowDimBg] = ImVec4(0, 0, 0, 0.65f);
+	c[ImGuiCol_PlotLines] = kAccentHi;
+	st.ScaleAllSizes(scale);
 }
 
 void App::SetFullscreen(bool fullscreen)
@@ -874,27 +927,63 @@ void App::EndStream(const std::string &msg, bool is_error)
 
 static void SectionTitle(const char *text)
 {
-	ImGui::Spacing();
-	ImGui::TextColored(ImVec4(0.55f, 0.72f, 1.0f, 1.0f), "%s", text);
-	ImGui::Separator();
+	ImGui::Dummy(ImVec2(0, ImGui::GetStyle().ItemSpacing.y));
+	if(g_heading)
+		ImGui::PushFont(g_heading);
+	ImGui::TextUnformatted(text);
+	if(g_heading)
+		ImGui::PopFont();
+	ImVec2 p = ImGui::GetCursorScreenPos();
+	float w = ImGui::GetContentRegionAvail().x;
+	ImDrawList *dl = ImGui::GetWindowDrawList();
+	dl->AddRectFilled(p, ImVec2(p.x + 42.0f * ImGui::GetFontSize() / 19.0f, p.y + 3), kAccentU, 2.0f);
+	dl->AddRectFilled(ImVec2(p.x, p.y + 1), ImVec2(p.x + w, p.y + 2), IM_COL32(255, 255, 255, 18));
+	ImGui::Dummy(ImVec2(0, 8));
 }
 
 static bool PrimaryButton(const char *label, const ImVec2 &size = ImVec2(0, 0))
 {
-	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.44f, 0.82f, 1.0f));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.12f, 0.53f, 0.92f, 1.0f));
+	ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kAccentHi);
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.0f, 0.36f, 0.72f, 1.0f));
 	bool r = ImGui::Button(label, size);
-	ImGui::PopStyleColor(2);
+	ImGui::PopStyleColor(3);
 	return r;
 }
 
 static void HelpText(const char *text)
 {
-	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.65f, 0.72f, 1.0f));
+	ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
 	ImGui::PushTextWrapPos(0.0f);
 	ImGui::TextUnformatted(text);
 	ImGui::PopTextWrapPos();
 	ImGui::PopStyleColor();
+}
+
+// Small rounded status pill: colored dot + text
+static void StatusPill(const char *text, const ImVec4 &col)
+{
+	ImDrawList *dl = ImGui::GetWindowDrawList();
+	ImVec2 p = ImGui::GetCursorScreenPos();
+	ImVec2 ts = ImGui::CalcTextSize(text);
+	float h = ts.y + 8, r = 4.5f * ImGui::GetFontSize() / 19.0f;
+	float w = ts.x + r * 2 + 26;
+	dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(ImVec4(col.x, col.y, col.z, 0.14f)), h * 0.5f);
+	dl->AddCircleFilled(ImVec2(p.x + 11 + r, p.y + h * 0.5f), r, ImGui::GetColorU32(col));
+	dl->AddText(ImVec2(p.x + 17 + r * 2, p.y + 4), ImGui::GetColorU32(col), text);
+	ImGui::Dummy(ImVec2(w, h));
+}
+
+// The app background: deep navy gradient with a soft blue glow
+static void DrawBackground()
+{
+	ImDrawList *dl = ImGui::GetBackgroundDrawList();
+	ImGuiViewport *vp = ImGui::GetMainViewport();
+	ImVec2 a = vp->Pos, b(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y);
+	dl->AddRectFilledMultiColor(a, b, IM_COL32(9, 14, 30, 255), IM_COL32(6, 9, 20, 255), IM_COL32(3, 4, 9, 255), IM_COL32(5, 7, 16, 255));
+	ImVec2 c(a.x + vp->Size.x * 0.78f, a.y + vp->Size.y * 0.05f);
+	for(int i = 10; i >= 1; i--)
+		dl->AddCircleFilled(c, vp->Size.y * 0.07f * i, IM_COL32(0, 90, 220, 4), 64);
 }
 
 void App::BuildUi()
@@ -942,15 +1031,22 @@ void App::BuildUi()
 		return;
 	}
 
+	DrawBackground();
 	ImGuiViewport *vp = ImGui::GetMainViewport();
 	ImGui::SetNextWindowPos(vp->Pos);
 	ImGui::SetNextWindowSize(vp->Size);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
 	ImGui::Begin("##main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings
-		| ImGuiWindowFlags_NoBringToFrontOnFocus);
+		| ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoBackground);
+	ImGui::PopStyleVar();
 
 	UiSidebar();
-	ImGui::SameLine();
-	ImGui::BeginChild("##content", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_None);
+	ImGui::SameLine(0, 0);
+	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(40 * ui_scale, 30 * ui_scale));
+	ImGui::BeginChild("##content", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_None);
+	ImGui::PopStyleVar();
+	ImGui::PopStyleColor();
 	switch(screen)
 	{
 		case Screen::Consoles: UiConsoles(); break;
@@ -967,45 +1063,87 @@ void App::BuildUi()
 	UiMessage();
 }
 
+bool App::NavItem(const char *icon, const char *label, bool active)
+{
+	ImVec2 size(ImGui::GetContentRegionAvail().x, 46.0f * ui_scale);
+	ImVec2 p = ImGui::GetCursorScreenPos();
+	ImGui::PushID(label);
+	bool clicked = ImGui::InvisibleButton("##nav", size);
+	ImGui::PopID();
+	bool hov = ImGui::IsItemHovered();
+	ImDrawList *dl = ImGui::GetWindowDrawList();
+	float r = 11.0f * ui_scale;
+	if(active)
+		dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), IM_COL32(0, 112, 219, 55), r);
+	else if(hov)
+		dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), IM_COL32(255, 255, 255, 14), r);
+	if(active)
+		dl->AddRectFilled(ImVec2(p.x, p.y + 12 * ui_scale), ImVec2(p.x + 4 * ui_scale, p.y + size.y - 12 * ui_scale), kAccentU, 2.0f);
+	ImU32 col = active ? IM_COL32(255, 255, 255, 255) : (hov ? IM_COL32(225, 230, 240, 255) : IM_COL32(160, 168, 185, 255));
+	float ty = p.y + (size.y - ImGui::GetFontSize()) * 0.5f;
+	dl->AddText(ImVec2(p.x + 18 * ui_scale, ty), col, Ico(icon));
+	dl->AddText(ImVec2(p.x + (g_icons ? 52 : 18) * ui_scale, ty), col, label);
+	return clicked;
+}
+
 void App::UiSidebar()
 {
-	float w = 230.0f * ui_scale;
-	ImGui::BeginChild("##sidebar", ImVec2(w, 0), ImGuiChildFlags_Borders);
-	ImGui::Dummy(ImVec2(0, 6 * ui_scale));
-	ImGui::SetWindowFontScale(1.35f);
-	ImGui::TextColored(ImVec4(0.35f, 0.65f, 1.0f, 1.0f), "Orbit Play");
-	ImGui::SetWindowFontScale(1.0f);
-	HelpText("PS5 Remote Play");
-	ImGui::Dummy(ImVec2(0, 14 * ui_scale));
+	float w = 260.0f * ui_scale;
+	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1, 1, 1, 0.03f));
+	ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16 * ui_scale, 22 * ui_scale));
+	ImGui::BeginChild("##sidebar", ImVec2(w, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
+	ImGui::PopStyleVar(2);
+	ImGui::PopStyleColor();
 
-	auto nav = [&](const char *label, Screen s) {
-		bool sel = screen == s;
-		if(ImGui::Selectable(label, sel, 0, ImVec2(0, 34 * ui_scale)))
-			screen = s;
-	};
-	nav("  Consoles", Screen::Consoles);
-	nav("  Settings", Screen::Settings);
-	nav("  Log", Screen::Log);
+	// Logo: a ringed planet
+	ImDrawList *dl = ImGui::GetWindowDrawList();
+	ImVec2 p = ImGui::GetCursorScreenPos();
+	float R = 15.0f * ui_scale;
+	ImVec2 c(p.x + R + 6 * ui_scale, p.y + R + 2 * ui_scale);
+	dl->AddCircleFilled(c, R * 0.62f, kAccentU, 32);
+	dl->AddEllipse(c, ImVec2(R * 1.25f, R * 0.42f), IM_COL32(150, 200, 255, 230), -0.35f, 48, 2.0f * ui_scale);
+	ImGui::SetCursorScreenPos(ImVec2(p.x + R * 2 + 18 * ui_scale, p.y - 1));
+	if(g_heading)
+		ImGui::PushFont(g_heading);
+	ImGui::TextUnformatted("Orbit Play");
+	if(g_heading)
+		ImGui::PopFont();
+	ImGui::SetCursorScreenPos(ImVec2(p.x + R * 2 + 18 * ui_scale, ImGui::GetCursorScreenPos().y - 6 * ui_scale));
+	ImGui::TextDisabled("PS5 Remote Play");
+	ImGui::Dummy(ImVec2(0, 22 * ui_scale));
 
-	ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 150 * ui_scale);
-	ImGui::Separator();
-	HelpText("Controllers");
+	if(NavItem(ICON_GAME, "Consoles", screen == Screen::Consoles))
+		screen = Screen::Consoles;
+	if(NavItem(ICON_SETTINGS, "Settings", screen == Screen::Settings))
+		screen = Screen::Settings;
+	if(NavItem(ICON_LOG, "Log", screen == Screen::Log))
+		screen = Screen::Log;
+
+	// System status at the bottom
+	float line = ImGui::GetTextLineHeightWithSpacing();
+	ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), ImGui::GetWindowHeight() - line * 6.2f - 22 * ui_scale));
+	ImGui::TextDisabled("THIS PC");
 	auto names = gamepads.Names();
-	if(names.empty())
-		ImGui::TextDisabled("None connected");
-	for(auto &n : names)
-		ImGui::TextUnformatted(n.c_str());
-	ImGui::Text("Display: %d Hz %s", renderer.DisplayHz(), renderer.DisplayHdr() ? "HDR" : "SDR");
+	ImGui::Text("%s  %s", Ico(ICON_GAME), names.empty() ? "No controller" : names[0].c_str());
+	if(names.size() > 1)
+		ImGui::TextDisabled("      + %zu more", names.size() - 1);
+	ImGui::Text("%s  %s", Ico(ICON_KEYBOARD), settings.kbm_enabled ? "Keyboard & mouse on" : "Keyboard & mouse off");
+	ImGui::Text("%s  %d Hz  %s", Ico(ICON_DISPLAY), renderer.DisplayHz(), renderer.DisplayHdr() ? "HDR" : "SDR");
+	ImGui::Text("%s  %s%s", Ico(ICON_SPEED), renderer.GpuVendorName().c_str(),
+		renderer.AiSuperResolutionAvailable() ? "  AI upscaling" : "");
 	ImGui::EndChild();
 }
 
 void App::UiConsoles()
 {
-	ImGui::SetWindowFontScale(1.25f);
-	ImGui::TextUnformatted("Consoles");
-	ImGui::SetWindowFontScale(1.0f);
+	if(g_title)
+		ImGui::PushFont(g_title);
+	ImGui::TextUnformatted("Your consoles");
+	if(g_title)
+		ImGui::PopFont();
 	HelpText("Your PS5 must be on the same network with Remote Play enabled (Settings > System > Remote Play).");
-	ImGui::Spacing();
+	ImGui::Dummy(ImVec2(0, 14 * ui_scale));
 
 	std::vector<DiscoveredHost> found = discovery.Hosts();
 	auto discovered = [&](const std::string &mac) -> const DiscoveredHost * {
@@ -1015,48 +1153,94 @@ void App::UiConsoles()
 		return nullptr;
 	};
 
-	float card_h = 128.0f * ui_scale;
-	int idx = 0;
+	const float card_w = 400.0f * ui_scale, card_h = 236.0f * ui_scale;
+	float avail = ImGui::GetContentRegionAvail().x;
+	float gap = 20.0f * ui_scale;
+	int cols = std::max(1, (int)((avail + gap) / (card_w + gap)));
+	int col = 0, idx = 0;
 	std::string forget_mac;
+	auto next_cell = [&]() {
+		if(++col < cols)
+			ImGui::SameLine(0, gap);
+		else
+		{
+			col = 0;
+			ImGui::Dummy(ImVec2(0, gap * 0.5f));
+		}
+	};
+	// Card frame with a soft gradient and a big glyph
+	auto card_begin = [&](const char *id, bool highlight) {
+		ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(22 * ui_scale, 20 * ui_scale));
+		ImGui::BeginChild(id, ImVec2(card_w, card_h), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
+		ImGui::PopStyleVar();
+		ImGui::PopStyleColor();
+		ImDrawList *dl = ImGui::GetWindowDrawList();
+		ImVec2 p = ImGui::GetWindowPos(), q(p.x + card_w, p.y + card_h);
+		float r = 18.0f * ui_scale;
+		dl->AddRectFilled(p, q, IM_COL32(255, 255, 255, 9), r);
+		dl->AddRectFilledMultiColor(ImVec2(p.x, p.y + r), ImVec2(q.x, q.y - r),
+			IM_COL32(0, 90, 220, highlight ? 34 : 14), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(0, 90, 220, highlight ? 18 : 6));
+		dl->AddRect(p, q, highlight ? IM_COL32(60, 140, 255, 90) : IM_COL32(255, 255, 255, 22), r, 0, 1.2f);
+		// big console glyph in a glowing disc
+		float R = 34.0f * ui_scale;
+		ImVec2 c(q.x - R - 24 * ui_scale, p.y + R + 22 * ui_scale);
+		dl->AddCircleFilled(c, R, IM_COL32(0, 112, 219, highlight ? 70 : 40), 48);
+		if(g_icons && g_title)
+		{
+			ImVec2 ts = g_title->CalcTextSizeA(g_title->FontSize, FLT_MAX, 0, ICON_GAME);
+			dl->AddText(g_title, g_title->FontSize, ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f - 2 * ui_scale),
+				IM_COL32(220, 235, 255, 230), ICON_GAME);
+		}
+	};
+	auto heading = [&](const char *t) {
+		if(g_heading)
+			ImGui::PushFont(g_heading);
+		ImGui::PushTextWrapPos(card_w - 110 * ui_scale);
+		ImGui::TextUnformatted(t);
+		ImGui::PopTextWrapPos();
+		if(g_heading)
+			ImGui::PopFont();
+	};
 
-	// Paired consoles first
 	for(auto &h : settings.hosts)
 	{
 		const DiscoveredHost *d = discovered(h.mac);
 		ImGui::PushID(idx++);
-		ImGui::BeginChild("##card", ImVec2(0, card_h), ImGuiChildFlags_Borders);
-		ImGui::SetWindowFontScale(1.15f);
-		ImGui::TextUnformatted(h.nickname.empty() ? "PlayStation 5" : h.nickname.c_str());
-		ImGui::SetWindowFontScale(1.0f);
+		card_begin("##card", d && d->ready);
+		heading(h.nickname.empty() ? "PlayStation 5" : h.nickname.c_str());
 		if(d)
-		{
-			ImGui::TextColored(d->ready ? ImVec4(0.4f, 0.9f, 0.5f, 1) : ImVec4(1.0f, 0.75f, 0.3f, 1),
-				d->ready ? "Ready" : "Rest mode");
-			ImGui::SameLine();
-			ImGui::TextDisabled("%s  |  %s", d->address.c_str(), d->ps5 ? "PS5" : "PS4");
-			if(!d->running_app.empty())
-			{
-				ImGui::SameLine();
-				ImGui::TextDisabled("|  Playing %s", d->running_app.c_str());
-			}
-		}
+			StatusPill(d->ready ? "Ready" : "Rest mode", d->ready ? kGood : kWarn);
 		else
-			ImGui::TextDisabled("Not found right now  |  last seen at %s", h.last_address.empty() ? "?" : h.last_address.c_str());
+			StatusPill("Not found", kTextDim);
+		if(d && !d->running_app.empty())
+			ImGui::TextDisabled("Playing %s", d->running_app.c_str());
+		else
+			ImGui::TextDisabled("%s", d ? d->address.c_str() : (h.last_address.empty() ? "not seen yet" : h.last_address.c_str()));
 
-		ImGui::Spacing();
 		bool busy = phase != Phase::Idle;
+		float bh = 46.0f * ui_scale;
+		ImGui::SetCursorPosY(card_h - bh - 20 * ui_scale);
 		ImGui::BeginDisabled(busy);
-		if(PrimaryButton(d && !d->ready ? "Wake & Play" : "Play", ImVec2(150 * ui_scale, 0)))
+		char play[64];
+		snprintf(play, sizeof(play), "%s  %s", Ico(ICON_PLAY), d && !d->ready ? "Wake & play" : "Play");
+		float small = bh;
+		if(PrimaryButton(play, ImVec2(card_w - 44 * ui_scale - (small + 10 * ui_scale) * 2, bh)))
 			BeginConnect(h.mac);
-		ImGui::SameLine();
-		if(ImGui::Button("Wake"))
+		ImGui::SameLine(0, 10 * ui_scale);
+		if(ImGui::Button(g_icons ? ICON_POWER : "Wake", ImVec2(small, bh)))
 			Discovery::Wakeup(d ? d->address : h.last_address, h.regist_key, h.ps5);
-		ImGui::SameLine();
-		if(ImGui::Button("Forget"))
+		if(ImGui::IsItemHovered())
+			ImGui::SetTooltip("Wake from rest mode");
+		ImGui::SameLine(0, 10 * ui_scale);
+		if(ImGui::Button(g_icons ? ICON_DELETE : "X", ImVec2(small, bh)))
 			forget_mac = h.mac;
+		if(ImGui::IsItemHovered())
+			ImGui::SetTooltip("Forget this console");
 		ImGui::EndDisabled();
 		ImGui::EndChild();
 		ImGui::PopID();
+		next_cell();
 	}
 	if(!forget_mac.empty())
 	{
@@ -1064,20 +1248,21 @@ void App::UiConsoles()
 		MarkSettingsDirty();
 	}
 
-	// Discovered but not paired
 	for(auto &d : found)
 	{
 		if(settings.FindHost(d.mac))
 			continue;
 		ImGui::PushID(idx++);
-		ImGui::BeginChild("##card", ImVec2(0, card_h), ImGuiChildFlags_Borders);
-		ImGui::SetWindowFontScale(1.15f);
-		ImGui::TextUnformatted(d.name.empty() ? "PlayStation" : d.name.c_str());
-		ImGui::SetWindowFontScale(1.0f);
-		ImGui::TextDisabled("%s  |  %s  |  %s  |  not paired", d.address.c_str(), d.ps5 ? "PS5" : "PS4", d.ready ? "Ready" : "Rest mode");
-		ImGui::Spacing();
+		card_begin("##card", false);
+		heading(d.name.empty() ? "PlayStation" : d.name.c_str());
+		StatusPill(d.ready ? "Not paired" : "Rest mode - turn it on to pair", d.ready ? kAccentHi : kWarn);
+		ImGui::TextDisabled("%s  -  %s", d.address.c_str(), d.ps5 ? "PS5" : "PS4");
+		float bh = 46.0f * ui_scale;
+		ImGui::SetCursorPosY(card_h - bh - 20 * ui_scale);
 		ImGui::BeginDisabled(!d.ready || phase != Phase::Idle);
-		if(PrimaryButton("Pair", ImVec2(150 * ui_scale, 0)))
+		char pair[48];
+		snprintf(pair, sizeof(pair), "%s  Pair this console", Ico(ICON_LINK));
+		if(PrimaryButton(pair, ImVec2(-1, bh)))
 		{
 			pair_open = true;
 			pair_address = d.address;
@@ -1085,28 +1270,27 @@ void App::UiConsoles()
 			memset(pin_buf, 0, sizeof(pin_buf));
 		}
 		ImGui::EndDisabled();
-		if(!d.ready)
-		{
-			ImGui::SameLine();
-			HelpText("Turn the console fully on to pair it.");
-		}
 		ImGui::EndChild();
 		ImGui::PopID();
+		next_cell();
 	}
 
-	if(settings.hosts.empty() && found.empty())
-	{
-		ImGui::Spacing();
-		ImGui::TextDisabled("Searching for consoles on your network...");
-	}
-
-	SectionTitle("Add a console by IP address");
-	HelpText("Use this if your PS5 doesn't show up (e.g. it's on another subnet, or the PC has VPN adapters). "
-		"The PS5's IP is in Settings > Network > Connection Status.");
-	ImGui::SetNextItemWidth(260 * ui_scale);
-	ImGui::InputTextWithHint("##ip", "192.168.1.50", manual_ip_buf, sizeof(manual_ip_buf));
-	ImGui::SameLine();
-	if(ImGui::Button("Add") && manual_ip_buf[0])
+	// "Add by IP" card
+	ImGui::PushID(idx++);
+	card_begin("##addcard", false);
+	heading("Add by IP address");
+	HelpText(settings.hosts.empty() && found.empty() ? "Searching your network... If your PS5 doesn't appear, enter its IP "
+		"(PS5: Settings > Network > Connection Status)." : "For a PS5 on another subnet or behind a VPN adapter.");
+	float bh = 46.0f * ui_scale;
+	ImGui::SetCursorPosY(card_h - bh - 20 * ui_scale);
+	ImGui::SetNextItemWidth(card_w - 44 * ui_scale - 110 * ui_scale);
+	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14 * ui_scale, (bh - ImGui::GetFontSize()) * 0.5f));
+	bool enter = ImGui::InputTextWithHint("##ip", "192.168.1.50", manual_ip_buf, sizeof(manual_ip_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+	ImGui::PopStyleVar();
+	ImGui::SameLine(0, 10 * ui_scale);
+	char addl[32];
+	snprintf(addl, sizeof(addl), "%s  Add", Ico(ICON_ADD));
+	if((ImGui::Button(addl, ImVec2(100 * ui_scale, bh)) || enter) && manual_ip_buf[0])
 	{
 		std::string ip = manual_ip_buf;
 		bool exists = false;
@@ -1118,21 +1302,29 @@ void App::UiConsoles()
 		memset(manual_ip_buf, 0, sizeof(manual_ip_buf));
 		MarkSettingsDirty();
 	}
-	for(size_t i = 0; i < settings.manual_hosts.size(); i++)
-	{
-		ImGui::PushID((int)(1000 + i));
-		ImGui::BulletText("%s", settings.manual_hosts[i].address.c_str());
-		ImGui::SameLine();
-		if(ImGui::SmallButton("Remove"))
-		{
-			settings.manual_hosts.erase(settings.manual_hosts.begin() + i);
-			MarkSettingsDirty();
-			ImGui::PopID();
-			break;
-		}
-		ImGui::PopID();
-	}
+	ImGui::EndChild();
+	ImGui::PopID();
 
+	if(!settings.manual_hosts.empty())
+	{
+		ImGui::Dummy(ImVec2(0, 10 * ui_scale));
+		ImGui::TextDisabled("Probed by IP:");
+		for(size_t i = 0; i < settings.manual_hosts.size(); i++)
+		{
+			ImGui::PushID((int)(1000 + i));
+			ImGui::SameLine();
+			char lbl[96];
+			snprintf(lbl, sizeof(lbl), "%s  %s", settings.manual_hosts[i].address.c_str(), Ico(ICON_CANCEL));
+			if(ImGui::SmallButton(lbl))
+			{
+				settings.manual_hosts.erase(settings.manual_hosts.begin() + i);
+				MarkSettingsDirty();
+				ImGui::PopID();
+				break;
+			}
+			ImGui::PopID();
+		}
+	}
 }
 
 void App::UiPairDialog()
@@ -1251,9 +1443,11 @@ void App::SetRowLayout(bool compact)
 
 void App::UiSettings()
 {
-	ImGui::SetWindowFontScale(1.25f);
+	if(g_title)
+		ImGui::PushFont(g_title);
 	ImGui::TextUnformatted("Settings");
-	ImGui::SetWindowFontScale(1.0f);
+	if(g_title)
+		ImGui::PopFont();
 	HelpText("Everything here can also be changed while playing: open the stream menu with Create + PS, F1 or Esc.");
 	SetRowLayout(false);
 
@@ -1789,9 +1983,11 @@ void App::UiCaptureSection()
 
 void App::UiLog()
 {
-	ImGui::SetWindowFontScale(1.25f);
+	if(g_title)
+		ImGui::PushFont(g_title);
 	ImGui::TextUnformatted("Log");
-	ImGui::SetWindowFontScale(1.0f);
+	if(g_title)
+		ImGui::PopFont();
 	HelpText(("Saved to " + data_dir + "\\orbitplay.log").c_str());
 	ImGui::BeginChild("##logtext", ImVec2(0, 0), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
 	for(const auto &line : Log::Get().Recent())
@@ -1812,13 +2008,35 @@ void App::UiLog()
 
 void App::UiConnecting()
 {
-	ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-	ImGui::SetNextWindowSize(ImVec2(440 * ui_scale, 0));
-	ImGui::Begin("##connecting", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
-	const char *what = phase == Phase::Waking ? "Waking up" : "Connecting to";
-	ImGui::Text("%s %s...", what, active_host.nickname.empty() ? "your PS5" : active_host.nickname.c_str());
+	ImGuiViewport *vp = ImGui::GetMainViewport();
+	ImGui::GetBackgroundDrawList()->AddRectFilled(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y), IM_COL32(0, 0, 0, 90));
+	ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+	ImGui::SetNextWindowSize(ImVec2(460 * ui_scale, 0));
+	ImGui::Begin("##connecting", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings
+		| ImGuiWindowFlags_AlwaysAutoResize);
+	ImDrawList *dl = ImGui::GetWindowDrawList();
+	ImVec2 p = ImGui::GetCursorScreenPos();
+	float R = 26.0f * ui_scale, W = ImGui::GetContentRegionAvail().x;
+	ImVec2 c(p.x + W * 0.5f, p.y + R + 6 * ui_scale);
 	float t = (float)ImGui::GetTime();
-	ImGui::ProgressBar(-1.0f * t, ImVec2(-1, 6 * ui_scale), "");
+	dl->PathArcTo(c, R, 0, 6.2831853f, 48);
+	dl->PathStroke(IM_COL32(255, 255, 255, 25), 0, 4.0f * ui_scale);
+	dl->PathArcTo(c, R, t * 5.0f, t * 5.0f + 1.6f + 0.8f * sinf(t * 2.0f), 32);
+	dl->PathStroke(kAccentU, 0, 4.0f * ui_scale);
+	ImGui::Dummy(ImVec2(W, R * 2 + 20 * ui_scale));
+	const char *what = phase == Phase::Waking ? "Waking up" : "Connecting to";
+	char line[160];
+	snprintf(line, sizeof(line), "%s %s", what, active_host.nickname.empty() ? "your PS5" : active_host.nickname.c_str());
+	if(g_heading)
+		ImGui::PushFont(g_heading);
+	ImGui::SetCursorPosX((ImGui::GetWindowWidth() - ImGui::CalcTextSize(line).x) * 0.5f);
+	ImGui::TextUnformatted(line);
+	if(g_heading)
+		ImGui::PopFont();
+	const char *sub = phase == Phase::Waking ? "This can take up to a minute from rest mode." : "Starting Remote Play...";
+	ImGui::SetCursorPosX((ImGui::GetWindowWidth() - ImGui::CalcTextSize(sub).x) * 0.5f);
+	ImGui::TextDisabled("%s", sub);
+	ImGui::Dummy(ImVec2(0, 6 * ui_scale));
 	if(ImGui::Button("Cancel", ImVec2(-1, 0)))
 	{
 		if(phase == Phase::Waking)
@@ -1879,66 +2097,143 @@ void App::UiStats()
 void App::UiStreamOverlay()
 {
 	ImGuiViewport *vp = ImGui::GetMainViewport();
-	ImVec2 size(std::min(860.0f * ui_scale, vp->Size.x - 40.0f), std::min(vp->Size.y * 0.88f, 1000.0f * ui_scale));
-	ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-	ImGui::SetNextWindowSize(size, ImGuiCond_Always);
-	ImGui::SetNextWindowBgAlpha(0.94f);
+	ImVec2 size(std::min(880.0f * ui_scale, vp->Size.x - 40.0f), std::min(vp->Size.y * 0.86f, 980.0f * ui_scale));
+	// Opens centered; afterwards it stays where you drag it (grab the header or any empty area)
+	if(menu_reset_pos)
+	{
+		ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+		ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+		menu_reset_pos = false;
+	}
+	ImGui::SetNextWindowSizeConstraints(ImVec2(560 * ui_scale, 420 * ui_scale), ImVec2(vp->Size.x, vp->Size.y));
+	ImGui::SetNextWindowBgAlpha(0.93f);
 	// Focus only when the menu opens: focusing every frame would close dropdowns as soon as they open.
 	if(overlay_just_opened)
 	{
 		ImGui::SetNextWindowFocus();
 		overlay_just_opened = false;
 	}
-	ImGui::Begin("##streammenu", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+	ImGui::Begin("##streammenu", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings
+		| ImGuiWindowFlags_NoScrollbar);
 
 	// B on the pad closes the menu, unless it is closing a dropdown
 	bool popup_open = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
 	if(!popup_open && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) && kbm.CapturingAction() < 0)
 		ShowOverlay(false);
 
-	ImGui::SetWindowFontScale(1.2f);
-	ImGui::TextUnformatted(active_host.nickname.empty() ? "PlayStation 5" : active_host.nickname.c_str());
-	ImGui::SetWindowFontScale(1.0f);
-	ImGui::SameLine();
-	ImGui::TextDisabled("   %dx%d -> %dx%d   %s   %.0f fps%s", renderer.VideoWidth(), renderer.VideoHeight(),
-		renderer.OutputVideoWidth(), renderer.OutputVideoHeight(), renderer.VideoHdr() ? "HDR" : "SDR", present_fps,
-		FrameGenActive() ? " (frame gen)" : "");
-
-	float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 3) / 4.0f;
-	if(PrimaryButton("Resume", ImVec2(bw, 0)))
-		ShowOverlay(false);
-	ImGui::SameLine();
-	bool mic_ok = session && settings.microphone;
-	ImGui::BeginDisabled(!mic_ok);
-	bool muted = !session || session->MicMuted();
-	if(ImGui::Button(muted ? "Mic: off" : "Mic: on", ImVec2(bw, 0)) && session)
+	// ---- header: grip, console name, live info, center + close buttons
 	{
-		session->SetMicMuted(!muted);
-		gamepads.SetMicLed(muted);
+		ImDrawList *dl = ImGui::GetWindowDrawList();
+		ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+		dl->AddRectFilled(ImVec2(wp.x + ws.x * 0.5f - 28 * ui_scale, wp.y + 8 * ui_scale),
+			ImVec2(wp.x + ws.x * 0.5f + 28 * ui_scale, wp.y + 12 * ui_scale), IM_COL32(255, 255, 255, 50), 2.0f);
+		ImGui::Dummy(ImVec2(0, 2 * ui_scale));
+		if(g_heading)
+			ImGui::PushFont(g_heading);
+		ImGui::Text("%s%s%s", Ico(ICON_GAME), g_icons ? "  " : "", active_host.nickname.empty() ? "PlayStation 5" : active_host.nickname.c_str());
+		if(g_heading)
+			ImGui::PopFont();
+		ImGui::SameLine();
+		ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4 * ui_scale);
+		ImGui::TextDisabled("  %dx%d -> %dx%d   %s   %.0f fps%s", renderer.VideoWidth(), renderer.VideoHeight(),
+			renderer.OutputVideoWidth(), renderer.OutputVideoHeight(), renderer.VideoHdr() ? "HDR" : "SDR", present_fps,
+			FrameGenActive() ? (settings.frame_gen == 1 ? "  predictive" : "  interpolated") : "");
+		float bs = ImGui::GetFrameHeight();
+		ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - bs * 2 - 8 * ui_scale);
+		ImGui::SetCursorPosY(ImGui::GetStyle().WindowPadding.y);
+		if(ImGui::Button(g_icons ? ICON_HOME "##center" : "C##center", ImVec2(bs, bs)))
+			menu_reset_pos = true;
+		if(ImGui::IsItemHovered())
+			ImGui::SetTooltip("Move the menu back to the center");
+		ImGui::SameLine(0, 8 * ui_scale);
+		if(ImGui::Button(g_icons ? ICON_CLOSE "##close" : "X##close", ImVec2(bs, bs)))
+			ShowOverlay(false);
+		if(ImGui::IsItemHovered())
+			ImGui::SetTooltip("Back to the game (Esc)");
+		if(ImGui::IsWindowHovered() && !ImGui::IsAnyItemHovered() && ImGui::GetMousePos().y < wp.y + 60 * ui_scale)
+			ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
 	}
-	ImGui::EndDisabled();
-	ImGui::SameLine();
-	if(ImGui::Button("Screenshot", ImVec2(bw, 0)))
-		TakeScreenshot();
-	ImGui::SameLine();
-	if(ImGui::Button(showcase_on ? "Showcase: on" : (compare_on ? "Compare: on" : "Compare: off"), ImVec2(bw, 0)))
+	ImGui::Dummy(ImVec2(0, 4 * ui_scale));
+
+	// ---- quick actions
 	{
-		// cycle off -> compare -> showcase -> off
-		if(showcase_on)
-			showcase_on = false;
-		else if(compare_on)
+		struct QA { const char *icon; std::string label; bool on; int id; };
+		bool muted = !session || session->MicMuted();
+		std::vector<QA> qa = {
+			{ ICON_PLAY, "Resume", false, 0 },
+			{ ICON_MIC, muted ? "Mic off" : "Mic on", !muted, 1 },
+			{ ICON_CAMERA, "Screenshot", false, 2 },
+			{ ICON_RECORD, recorder.Recording() ? "Stop rec" : "Record", recorder.Recording(), 3 },
+			{ ICON_VIDEO, "Save replay", false, 4 },
+			{ ICON_SPLIT, showcase_on ? "Showcase" : "Compare", compare_on || showcase_on, 5 },
+		};
+		float n = (float)qa.size();
+		float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * (n - 1)) / n;
+		float bh = 64.0f * ui_scale;
+		for(size_t i = 0; i < qa.size(); i++)
 		{
-			compare_on = false;
-			showcase_on = true;
-			showcase_start_ms = NowMs();
+			if(i)
+				ImGui::SameLine();
+			ImGui::PushID(qa[i].id);
+			bool dis = (qa[i].id == 1 && !(session && settings.microphone)) || (qa[i].id == 4 && !recorder.ReplayEnabled());
+			ImGui::BeginDisabled(dis);
+			ImVec2 p = ImGui::GetCursorScreenPos();
+			bool primary = qa[i].id == 0, on = qa[i].on;
+			if(primary || on)
+			{
+				ImGui::PushStyleColor(ImGuiCol_Button, qa[i].id == 3 && on ? ImVec4(0.75f, 0.15f, 0.18f, 1) : kAccent);
+				ImGui::PushStyleColor(ImGuiCol_ButtonHovered, qa[i].id == 3 && on ? ImVec4(0.88f, 0.22f, 0.25f, 1) : kAccentHi);
+			}
+			bool clicked = ImGui::Button("##qa", ImVec2(bw, bh));
+			if(primary || on)
+				ImGui::PopStyleColor(2);
+			ImDrawList *dl = ImGui::GetWindowDrawList();
+			const char *ic = Ico(qa[i].icon);
+			ImVec2 isz = ImGui::CalcTextSize(ic), lsz = ImGui::CalcTextSize(qa[i].label.c_str());
+			float top = p.y + (bh - isz.y - lsz.y - 2 * ui_scale) * 0.5f;
+			ImU32 tc = ImGui::GetColorU32(ImGuiCol_Text, dis ? 0.4f : 1.0f);
+			if(*ic)
+				dl->AddText(ImVec2(p.x + (bw - isz.x) * 0.5f, top), tc, ic);
+			dl->AddText(ImVec2(p.x + (bw - lsz.x) * 0.5f, *ic ? top + isz.y + 2 * ui_scale : p.y + (bh - lsz.y) * 0.5f), tc,
+				qa[i].label.c_str());
+			ImGui::EndDisabled();
+			ImGui::PopID();
+			if(!clicked)
+				continue;
+			switch(qa[i].id)
+			{
+				case 0: ShowOverlay(false); break;
+				case 1:
+					session->SetMicMuted(!muted);
+					gamepads.SetMicLed(muted);
+					break;
+				case 2: TakeScreenshot(); break;
+				case 3: ToggleRecording(); break;
+				case 4: SaveReplay(); break;
+				case 5:
+					if(showcase_on)
+						showcase_on = false;
+					else if(compare_on)
+					{
+						compare_on = false;
+						showcase_on = true;
+						showcase_start_ms = NowMs();
+					}
+					else
+						compare_on = true;
+					break;
+			}
 		}
-		else
-			compare_on = true;
+	}
+	if(!overlay_open || !session)
+	{
+		ImGui::End();
+		return;
 	}
 
 	if(StreamSettingsChanged())
 	{
-		ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.20f, 0.35f, 1.0f));
+		ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.30f, 0.62f, 0.45f));
 		ImGui::BeginChild("##reconnect", ImVec2(0, ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().WindowPadding.y * 2),
 			ImGuiChildFlags_Borders);
 		ImGui::AlignTextToFramePadding();
@@ -1968,31 +2263,42 @@ void App::UiStreamOverlay()
 				ImGui::EndTabItem();
 			}
 		};
-		tab("Image", [&] { UiUpscaleSection(); });
-		tab("Motion", [&] { UiFrameGenSection(); });
-		tab("Picture", [&] { UiPictureSection(); });
-		tab("Controls", [&] { UiControlsSection(); });
-		tab("Capture", [&] { UiCaptureSection(); });
-		tab("Stream", [&] { UiStreamSection(); });
-		tab("System", [&] { UiSystemSection(); });
+		char tlabel[8][64];
+		int tk = 0;
+		auto tl = [&](const char *icon, const char *name) {
+			tk = (tk + 1) % 8;
+			snprintf(tlabel[tk], sizeof(tlabel[tk]), "%s%s%s###%s", Ico(icon), g_icons ? "  " : "", name, name);
+			return (const char *)tlabel[tk];
+		};
+		tab(tl(ICON_PHOTO, "Image"), [&] { UiUpscaleSection(); });
+		tab(tl(ICON_SPEED, "Motion"), [&] { UiFrameGenSection(); });
+		tab(tl(ICON_BRIGHTNESS, "Picture"), [&] { UiPictureSection(); });
+		tab(tl(ICON_VIDEO, "Capture"), [&] { UiCaptureSection(); });
+		tab(tl(ICON_KEYBOARD, "Controls"), [&] { UiControlsSection(); });
+		tab(tl(ICON_WIFI, "Stream"), [&] { UiStreamSection(); });
+		tab(tl(ICON_SETTINGS, "System"), [&] { UiSystemSection(); });
 		ImGui::EndTabBar();
 	}
 
 	ImGui::Separator();
 	float fw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2) / 3.0f;
-	if(ImGui::Button("PS Home screen", ImVec2(fw, 0)) && session)
+	char hb[48], rb[64], db[48];
+	snprintf(hb, sizeof(hb), "%s%sPS Home screen", Ico(ICON_HOME), g_icons ? "  " : "");
+	snprintf(rb, sizeof(rb), "%s%sPut console in rest mode", Ico(ICON_POWER), g_icons ? "  " : "");
+	snprintf(db, sizeof(db), "%s%sDisconnect", Ico(ICON_CANCEL), g_icons ? "  " : "");
+	if(ImGui::Button(hb, ImVec2(fw, 0)) && session)
 	{
 		session->GoHome();
 		ShowOverlay(false);
 	}
 	ImGui::SameLine();
-	if(ImGui::Button("Put console in rest mode", ImVec2(fw, 0)) && session)
+	if(ImGui::Button(rb, ImVec2(fw, 0)) && session)
 	{
 		session->GotoBed();
 		EndStream("", false);
 	}
 	ImGui::SameLine();
-	if(ImGui::Button("Disconnect", ImVec2(fw, 0)))
+	if(ImGui::Button(db, ImVec2(fw, 0)))
 		EndStream("", false);
 	ImGui::End();
 
@@ -2232,13 +2538,20 @@ void App::UiMessage()
 {
 	if(!toast.empty() && NowMs() < toast_until)
 	{
+		// pill at the top, slides in and fades out
+		uint64_t left = toast_until - NowMs();
+		float alpha = std::min(1.0f, left / 300.0f);
 		ImGuiViewport *tv = ImGui::GetMainViewport();
-		ImGui::SetNextWindowPos(ImVec2(tv->GetCenter().x, tv->Pos.y + 24 * ui_scale), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
-		ImGui::SetNextWindowBgAlpha(0.8f);
-		ImGui::Begin("##toast", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs
-			| ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
-		ImGui::TextUnformatted(toast.c_str());
-		ImGui::End();
+		ImDrawList *dl = ImGui::GetForegroundDrawList();
+		std::string text = std::string(Ico(ICON_INFO)) + (g_icons ? "   " : "") + toast;
+		ImVec2 ts = ImGui::CalcTextSize(text.c_str());
+		float padx = 22 * ui_scale, pady = 12 * ui_scale;
+		float y = tv->Pos.y + 26 * ui_scale - (1.0f - alpha) * 12 * ui_scale;
+		ImVec2 a(tv->GetCenter().x - ts.x * 0.5f - padx, y), b(tv->GetCenter().x + ts.x * 0.5f + padx, y + ts.y + pady * 2);
+		dl->AddRectFilled(ImVec2(a.x + 2, a.y + 4), ImVec2(b.x + 2, b.y + 4), IM_COL32(0, 0, 0, (int)(70 * alpha)), 40.0f);
+		dl->AddRectFilled(a, b, IM_COL32(16, 22, 38, (int)(235 * alpha)), 40.0f);
+		dl->AddRect(a, b, IM_COL32(70, 140, 255, (int)(110 * alpha)), 40.0f, 0, 1.2f);
+		dl->AddText(ImVec2(a.x + padx, a.y + pady), IM_COL32(240, 244, 255, (int)(255 * alpha)), text.c_str());
 	}
 	if(message.empty())
 		return;
