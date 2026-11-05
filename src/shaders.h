@@ -564,6 +564,9 @@ float4 main(VSOut i) : SV_Target
 		float2 uv = lerp(uv_rect.xy, uv_rect.zw, rel);
 		if(split >= 0.0)
 		{
+			// divider line (hidden when it sits at the edge, i.e. fully original / fully enhanced)
+			if(abs(p.x - split) < 1.5 && split > vid_rect.x + 2.0 && split < vid_rect.x + vid_rect.z - 2.0)
+				return float4(EncodeLinear(float3(1, 1, 1) * paper_white * 0.8), 1.0);
 			if(p.x < split)
 				return float4(EncodeVideo(Picture(orig.SampleLevel(samp, uv, 0).rgb), orig_mode), 1.0);
 		}

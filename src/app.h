@@ -89,6 +89,7 @@ private:
 	SDL_Window *window = nullptr;
 	HWND hwnd = nullptr;
 	float ui_scale = 1.0f;
+	struct ImFont *label_font = nullptr;   // large font for the compare / showcase labels
 	bool quit = false;
 
 	Renderer renderer;

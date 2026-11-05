@@ -125,6 +125,15 @@ void App::SetupStyle(float scale)
 		cfg.SizePixels = 15.0f * scale;
 		io.Fonts->AddFontDefault(&cfg);
 	}
+	// Large font rasterized at its real size, so the compare labels stay sharp
+	label_font = nullptr;
+	const char *bold = "C:\\Windows\\Fonts\\segoeuib.ttf";
+	ImFontConfig big;
+	big.OversampleH = 2;
+	if(GetFileAttributesA(bold) != INVALID_FILE_ATTRIBUTES)
+		label_font = io.Fonts->AddFontFromFileTTF(bold, 52.0f * scale, &big);
+	else if(GetFileAttributesA(font) != INVALID_FILE_ATTRIBUTES)
+		label_font = io.Fonts->AddFontFromFileTTF(font, 52.0f * scale, &big);
 
 	ImGuiStyle &s = ImGui::GetStyle();
 	s = ImGuiStyle();
@@ -816,8 +825,8 @@ void App::BuildUi()
 			float rect[4];
 			renderer.GetVideoRect((AspectMode)settings.aspect_mode, rect);
 			ImDrawList *dl = ImGui::GetForegroundDrawList();
-			ImFont *font = ImGui::GetFont();
-			float size = ImGui::GetFontSize() * 2.4f;
+			ImFont *font = label_font ? label_font : ImGui::GetFont();
+			float size = label_font ? label_font->FontSize : ImGui::GetFontSize() * 2.4f;
 			float margin = 36.0f * ui_scale;
 			float pad = 16.0f * ui_scale;
 			auto smooth = [](float e0, float e1, float x) { float t = std::clamp((x - e0) / (e1 - e0), 0.0f, 1.0f); return t * t * (3 - 2 * t); };
