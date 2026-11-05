@@ -440,6 +440,7 @@ void StreamSession::FrameAvailableCb(ChiakiFfmpegDecoder *, void *user)
 {
 	auto *self = static_cast<StreamSession *>(user);
 	self->decoded_frames++;
+	self->last_frame_us = chiaki_time_now_monotonic_us();
 	SetEvent(self->frame_event);
 }
 

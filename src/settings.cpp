@@ -254,6 +254,7 @@ void Settings::Load(const std::string &path)
 		detail_preset = 5; // settings from an older version: keep their values, show as custom
 	flt("deband", deband);
 	num("frame_gen_mode", frame_gen);
+	frame_gen = frame_gen ? 1 : 0; // 1.1-1.3 had 2x/3x/4x modes; it now always matches the display
 	flt("paper_white_nits", paper_white_nits);
 	bol("ai_hdr", ai_hdr);
 	flt("hdr_boost", hdr_boost);

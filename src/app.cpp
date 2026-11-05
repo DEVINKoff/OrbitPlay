@@ -167,22 +167,9 @@ void App::SetFullscreen(bool fullscreen)
 	SDL_SetWindowFullscreen(window, fullscreen);
 }
 
-int App::FrameGenMultiplier() const
+bool App::FrameGenActive() const
 {
-	if(settings.frame_gen == 0 || compare_on)
-		return 1;
-	int fps = session ? session->Config().fps : settings.fps;
-	int hz = renderer.DisplayHz();
-	int max_mult = 1;
-	for(int m = 4; m >= 2; m--)
-		if(fps * m <= hz + 5) // e.g. 60 fps x 4 = 240 Hz; tolerate 239.76 Hz modes
-		{
-			max_mult = m;
-			break;
-		}
-	if(settings.frame_gen == 1)
-		return max_mult;
-	return std::min(settings.frame_gen, max_mult);
+	return settings.frame_gen != 0 && !compare_on && !showcase_on;
 }
 
 ProcessOptions App::MakeProcessOptions() const
@@ -199,7 +186,7 @@ ProcessOptions App::MakeProcessOptions() const
 	o.deband = settings.deband;
 	o.paper_white = settings.paper_white_nits;
 	o.ai_hdr = settings.ai_hdr;
-	o.frame_gen = FrameGenMultiplier() > 1;
+	o.frame_gen = FrameGenActive();
 	o.ambient = settings.ambient && settings.aspect_mode == 0;
 	o.aspect = (AspectMode)std::clamp(settings.aspect_mode, 0, 2);
 	return o;
@@ -218,7 +205,7 @@ PresentOptions App::MakePresentOptions(int sync_interval) const
 	o.saturation = settings.saturation;
 	o.vibrance = settings.vibrance;
 	o.ambient_style = settings.ambient_style;
-	o.compare = compare_on && phase == Phase::Streaming;
+	o.compare = (compare_on || showcase_on) && phase == Phase::Streaming;
 	o.compare_split = compare_split;
 	return o;
 }
@@ -245,6 +232,31 @@ void App::TakeScreenshot()
 // ---------------------------------------------------------------------------
 // Main loop
 
+void App::PullAndSubmit(bool frame_gen)
+{
+	AVFrame *frame = session->PullFrame();
+	if(!frame)
+		return;
+	double arrival_ms = session->LastFrameTimeUs() / 1000.0;
+	// Repeated frames (30 fps games inside the 60 fps stream) are skipped so motion is
+	// interpolated across the real frames. Never skip more than 2 in a row: in a still scene
+	// the picture can still change a little.
+	bool skip = frame_gen && dup_streak < 2;
+	SubmitResult r = renderer.SubmitFrame(frame, MakeProcessOptions(), skip);
+	av_frame_free(&frame);
+	if(r.serial)
+	{
+		if(frame_gen)
+			timeline.Add(r.serial, arrival_ms, r.scene_cut, r.duplicate);
+		dup_streak = 0;
+	}
+	else if(r.duplicate)
+	{
+		dup_streak++;
+		dup_count++;
+	}
+}
+
 void App::Run()
 {
 	while(!quit)
@@ -256,19 +268,48 @@ void App::Run()
 		SendInput();
 
 		bool streaming = phase == Phase::Streaming && session;
+		bool fg = streaming && FrameGenActive();
+		if(fg != fg_active_last)
+		{
+			timeline.Reset();
+			dup_streak = 0;
+			fg_active_last = fg;
+		}
+
+		if(fg)
+		{
+			// Frame generation: one new picture per display refresh. Wait for either the next
+			// refresh slot or a newly decoded frame (store it right away so none are dropped).
+			if(HANDLE fw = renderer.FrameWaitHandle())
+			{
+				HANDLE handles[2] = { fw, session->FrameEvent() };
+				DWORD w = WaitForMultipleObjects(2, handles, FALSE, 20);
+				if(w == WAIT_OBJECT_0 + 1)
+				{
+					PullAndSubmit(true);
+					continue; // keep waiting for the refresh slot
+				}
+				if(w == WAIT_OBJECT_0)
+					renderer.MarkFrameWaited();
+			}
+			PullAndSubmit(true);
+			PresentFrame(true);
+			continue;
+		}
+
 		bool new_frame = false;
 		if(streaming)
 		{
 			AVFrame *frame = session->PullFrame();
 			if(frame)
 			{
-				new_frame = renderer.SubmitFrame(frame, MakeProcessOptions());
+				new_frame = renderer.SubmitFrame(frame, MakeProcessOptions()).serial != 0;
 				av_frame_free(&frame);
 			}
 		}
 
 		bool ui_needed = !streaming || overlay_open || settings.show_stats || login_pin_open || keyboard_open || !message.empty()
-			|| NowMs() < toast_until
+			|| NowMs() < toast_until || showcase_on
 			|| !renderer.HasVideo();
 		if(streaming && !new_frame && !ui_needed)
 		{
@@ -420,6 +461,23 @@ void App::Tick()
 
 	if(session)
 		session->SetHapticsGain(settings.haptics_gain);
+
+	// Showcase: the divider glides across the picture and back (12 s per round trip),
+	// easing in and out so it pauses briefly with the picture fully original / fully enhanced.
+	if(showcase_on)
+	{
+		double ph = (double)((now - showcase_start_ms) % 12000) / 12000.0;
+		double tri = ph < 0.5 ? ph * 2.0 : 2.0 - ph * 2.0;          // 0 -> 1 -> 0
+		double eased = tri * tri * (3.0 - 2.0 * tri);
+		compare_split = (float)(0.02 + 0.96 * (1.0 - eased));          // starts fully enhanced
+	}
+
+	if(now - dup_window_start >= 1000)
+	{
+		dup_rate = dup_count * 1000.0 / (double)std::max<uint64_t>(1, now - dup_window_start);
+		dup_count = 0;
+		dup_window_start = now;
+	}
 
 	if(reconnect_at && now >= reconnect_at && phase == Phase::Idle)
 	{
@@ -581,11 +639,11 @@ void App::PresentFrame(bool new_frame)
 	ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
 	bool streaming = phase == Phase::Streaming && session;
-	int mult = streaming ? FrameGenMultiplier() : 1;
-	PresentOptions opt = MakePresentOptions((settings.vsync || mult > 1 || !streaming) ? 1 : 0);
+	bool fg = streaming && FrameGenActive();
+	PresentOptions opt = MakePresentOptions((settings.vsync || fg || !streaming) ? 1 : 0);
 
-	auto present = [&](VideoView view) {
-		renderer.Present(view, opt);
+	auto present = [&](VideoView view, uint64_t serial) {
+		renderer.Present(view, opt, serial);
 		present_count++;
 		uint64_t now_us = chiaki_time_now_monotonic_us();
 		if(last_present_us)
@@ -596,22 +654,23 @@ void App::PresentFrame(bool new_frame)
 		last_present_us = now_us;
 	};
 
-	if(mult > 1 && new_frame && renderer.PrepareMotion())
+	if(fg)
 	{
-		// Show (mult - 1) generated frames on the next refreshes, then the real frame:
-		// 2x = 120 fps, 3x = 180 fps, 4x = 240 fps from a 60 fps stream.
-		for(int k = 1; k < mult; k++)
-		{
-			if(!renderer.BuildInterpolatedFrame((float)k / (float)mult))
-				break;
-			present(VideoView::Interpolated);
-			PumpEvents();
-			SendInput();
-		}
-		present(VideoView::Latest);
+		FrameTimeline::Pick p = timeline.Get(chiaki_time_now_monotonic_us() / 1000.0);
+		// Display not faster than the game: show real frames (still evenly paced), no in-betweens
+		if(p.valid && renderer.DisplayHz() < timeline.SourceFps() * 1.25)
+			p.t = p.t >= 0.5f ? 1.0f : 0.0f;
+		if(p.valid && p.a != p.b && p.t > 0.01f && p.t < 0.99f && renderer.BuildInterpolated(p.a, p.b, p.t))
+			present(VideoView::Interpolated, p.b);
+		else if(p.valid)
+			present(VideoView::Latest, p.t >= 0.5f ? p.b : p.a);
+		else
+			present(VideoView::Latest, 0);
+		(void)new_frame;
+		return;
 	}
-	else
-		present(streaming || phase == Phase::Connecting ? VideoView::Latest : VideoView::None);
+	(void)new_frame;
+	present(streaming || phase == Phase::Connecting ? VideoView::Latest : VideoView::None, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -740,6 +799,33 @@ void App::BuildUi()
 {
 	if(phase == Phase::Streaming && renderer.HasVideo())
 	{
+		if(compare_on || showcase_on)
+		{
+			// labels on both sides of the divider
+			float rect[4];
+			renderer.GetVideoRect((AspectMode)settings.aspect_mode, rect);
+			float x = rect[0] + rect[2] * compare_split;
+			float y = rect[1] + 24.0f * ui_scale;
+			ImDrawList *dl = ImGui::GetForegroundDrawList();
+			auto label = [&](const char *text, bool left) {
+				ImVec2 sz = ImGui::CalcTextSize(text);
+				float pad = 10.0f * ui_scale;
+				float lx = left ? x - sz.x - pad * 2.5f : x + pad * 1.5f;
+				if((left && lx < rect[0]) || (!left && lx + sz.x > rect[0] + rect[2]))
+					return; // no room next to the edge
+				dl->AddRectFilled(ImVec2(lx - pad, y - pad * 0.6f), ImVec2(lx + sz.x + pad, y + sz.y + pad * 0.6f),
+					IM_COL32(0, 0, 0, 150), 8.0f * ui_scale);
+				dl->AddText(ImVec2(lx, y), IM_COL32(255, 255, 255, 230), text);
+			};
+			label("Original", true);
+			std::string right = "Enhanced";
+			const std::string &st = renderer.UpscalerStatus();
+			if(st.rfind("NVIDIA RTX", 0) == 0)
+				right = "RTX enhanced";
+			else if(st.rfind("Intel", 0) == 0)
+				right = "AI enhanced";
+			label(right.c_str(), false);
+		}
 		if(settings.show_stats)
 			UiStats();
 		if(overlay_open)
@@ -1236,8 +1322,15 @@ void App::UiUpscaleSection()
 	RowHelp("Deband smooths the stair-step bands compression leaves in skies, fog and dark scenes.");
 
 	Row("Compare");
-	if(ImGui::Checkbox("Split screen: original | enhanced (F6)", &compare_on))
-		ShowToast(compare_on ? "Compare on: original left, enhanced right" : "Compare off");
+	int cmp = showcase_on ? 2 : (compare_on ? 1 : 0);
+	const char *cmp_modes[] = { "Off", "Split screen (drag the divider)", "Showcase (divider sweeps by itself)" };
+	if(ImGui::Combo("##compare", &cmp, cmp_modes, 3))
+	{
+		compare_on = cmp == 1;
+		showcase_on = cmp == 2;
+		if(showcase_on)
+			showcase_start_ms = NowMs();
+	}
 	RowHelp("With the menu open you can drag the divider with the mouse. F7 / F8 step the detail level live.");
 
 	Row("AI HDR for SDR games");
@@ -1258,20 +1351,24 @@ void App::UiFrameGenSection()
 {
 	bool changed = false;
 	Row("Frame generation");
-	const char *fg[] = { "Off", "Auto (best for this display)", "2x (120 fps)", "3x (180 fps)", "4x (240 fps)" };
-	changed |= ImGui::Combo("##fg", &settings.frame_gen, fg, 5);
-	int mult = FrameGenMultiplier();
-	int fps = session ? session->Config().fps : settings.fps;
-	char buf[320];
-	if(compare_on && settings.frame_gen != 0)
-		snprintf(buf, sizeof(buf), "Paused while split-screen compare is on.");
+	char on_label[64];
+	snprintf(on_label, sizeof(on_label), "On (every refresh of your %d Hz display)", renderer.DisplayHz());
+	const char *fg[] = { "Off", on_label };
+	settings.frame_gen = settings.frame_gen ? 1 : 0;
+	changed |= ImGui::Combo("##fg", &settings.frame_gen, fg, 2);
+	char buf[480];
+	if((compare_on || showcase_on) && settings.frame_gen != 0)
+		snprintf(buf, sizeof(buf), "Paused while split-screen compare / showcase is on.");
 	else if(settings.frame_gen == 0)
-		snprintf(buf, sizeof(buf), "Your display runs at %d Hz.", renderer.DisplayHz());
-	else if(mult <= 1)
-		snprintf(buf, sizeof(buf), "Needs a display at %d Hz or more (this one is %d Hz).", fps * 2, renderer.DisplayHz());
+		snprintf(buf, sizeof(buf), "Builds a new in-between picture for every refresh of your display, from the real frames' motion. "
+			"Works with 30 fps games too (repeated frames in the stream are detected and skipped).");
+	else if(phase == Phase::Streaming && session)
+		snprintf(buf, sizeof(buf), "Game runs at %.0f fps, shown at %.0f fps on your %d Hz display.%s Adds about %.0f ms of latency "
+			"(the next real frame is needed to build the ones before it).", timeline.SourceFps(), present_fps, renderer.DisplayHz(),
+			dup_rate > 5.0 ? " Repeated frames detected and skipped (30 fps game)." : "", timeline.BufferMs());
 	else
-		snprintf(buf, sizeof(buf), "Active: %d fps on your %d Hz display. Generated frames add about %.0f ms of latency "
-			"and can show artifacts on fast, complex motion.", fps * mult, renderer.DisplayHz(), 1000.0 / fps * (mult - 1) / mult);
+		snprintf(buf, sizeof(buf), "On. Adds about one game frame of latency (17 ms at 60 fps, 33 ms at 30 fps). "
+			"Gains are largest on 120 Hz+ displays and with 30 fps games.");
 	RowHelp(buf);
 	if(changed)
 		MarkSettingsDirty();
@@ -1483,11 +1580,10 @@ void App::UiStats()
 	ImGui::Text("Output   %dx%d  %s  %d Hz", renderer.OutputVideoWidth(), renderer.OutputVideoHeight(),
 		renderer.OutputHdr() ? "HDR10" : "SDR", renderer.DisplayHz());
 	ImGui::Text("Upscale  %s", renderer.UpscalerStatus().c_str());
-	int mult = FrameGenMultiplier();
-	char fg[48] = "";
-	if(mult > 1)
-		snprintf(fg, sizeof(fg), "  (frame gen %dx)", mult);
-	ImGui::Text("Decode   %.1f fps    Present %.1f fps%s", s.decode_fps, present_fps, fg);
+	ImGui::Text("Decode   %.1f fps    Present %.1f fps", s.decode_fps, present_fps);
+	if(FrameGenActive())
+		ImGui::Text("FrameGen game %.0f fps -> %.0f fps   buffer %.0f ms   repeats skipped %.0f/s", timeline.SourceFps(), present_fps,
+			timeline.BufferMs(), dup_rate);
 	ImGui::Text("Network  %.1f Mbps   RTT %.1f ms   lost frames %llu", s.mbps, s.rtt_ms, (unsigned long long)s.frames_lost);
 	ImGui::Text("Audio    %d ms queued   Haptics %s   Mic %s", audio.QueuedMs(),
 		audio.HapticsActive() ? "DualSense" : "rumble", session->MicMuted() ? "off" : "on");
@@ -1529,10 +1625,9 @@ void App::UiStreamOverlay()
 	ImGui::TextUnformatted(active_host.nickname.empty() ? "PlayStation 5" : active_host.nickname.c_str());
 	ImGui::SetWindowFontScale(1.0f);
 	ImGui::SameLine();
-	int mult = FrameGenMultiplier();
-	ImGui::TextDisabled("   %dx%d -> %dx%d   %s   %d fps", renderer.VideoWidth(), renderer.VideoHeight(),
-		renderer.OutputVideoWidth(), renderer.OutputVideoHeight(), renderer.VideoHdr() ? "HDR" : "SDR",
-		(session ? session->Config().fps : 60) * std::max(1, mult));
+	ImGui::TextDisabled("   %dx%d -> %dx%d   %s   %.0f fps%s", renderer.VideoWidth(), renderer.VideoHeight(),
+		renderer.OutputVideoWidth(), renderer.OutputVideoHeight(), renderer.VideoHdr() ? "HDR" : "SDR", present_fps,
+		FrameGenActive() ? " (frame gen)" : "");
 
 	float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 3) / 4.0f;
 	if(PrimaryButton("Resume", ImVec2(bw, 0)))
@@ -1551,8 +1646,20 @@ void App::UiStreamOverlay()
 	if(ImGui::Button("Screenshot", ImVec2(bw, 0)))
 		TakeScreenshot();
 	ImGui::SameLine();
-	if(ImGui::Button(compare_on ? "Compare: on" : "Compare: off", ImVec2(bw, 0)))
-		compare_on = !compare_on;
+	if(ImGui::Button(showcase_on ? "Showcase: on" : (compare_on ? "Compare: on" : "Compare: off"), ImVec2(bw, 0)))
+	{
+		// cycle off -> compare -> showcase -> off
+		if(showcase_on)
+			showcase_on = false;
+		else if(compare_on)
+		{
+			compare_on = false;
+			showcase_on = true;
+			showcase_start_ms = NowMs();
+		}
+		else
+			compare_on = true;
+	}
 
 	if(StreamSettingsChanged())
 	{
@@ -1614,7 +1721,7 @@ void App::UiStreamOverlay()
 	ImGui::End();
 
 	// Drag the compare divider with the mouse (outside the menu)
-	if(compare_on && ImGui::IsMouseDown(ImGuiMouseButton_Left) && !ImGui::GetIO().WantCaptureMouse)
+	if(compare_on && !showcase_on && ImGui::IsMouseDown(ImGuiMouseButton_Left) && !ImGui::GetIO().WantCaptureMouse)
 	{
 		float rect[4];
 		renderer.GetVideoRect((AspectMode)settings.aspect_mode, rect);
@@ -1665,14 +1772,12 @@ bool App::HandleHotkey(SDL_Keycode key)
 		}
 		case SDLK_F4:
 		{
-			settings.frame_gen = (settings.frame_gen + 1) % 5;
-			int mult = FrameGenMultiplier();
+			settings.frame_gen = settings.frame_gen ? 0 : 1;
 			if(settings.frame_gen == 0)
 				ShowToast("Frame generation: off");
 			else
 			{
-				snprintf(buf, sizeof(buf), "Frame generation: %s -> %d fps", settings.frame_gen == 1 ? "auto" : "manual",
-					session->Config().fps * std::max(1, mult));
+				snprintf(buf, sizeof(buf), "Frame generation: on (up to %d fps on this display)", renderer.DisplayHz());
 				ShowToast(buf);
 			}
 			break;
@@ -1682,8 +1787,23 @@ bool App::HandleHotkey(SDL_Keycode key)
 			ShowToast(settings.ambient ? "Ambient light on" : "Ambient light off");
 			break;
 		case SDLK_F6:
-			compare_on = !compare_on;
-			ShowToast(compare_on ? "Compare: original left | enhanced right (F7/F8 detail level)" : "Compare off");
+			if(!compare_on && !showcase_on)
+			{
+				compare_on = true;
+				ShowToast("Compare: original left | enhanced right (F6 again: showcase)");
+			}
+			else if(compare_on)
+			{
+				compare_on = false;
+				showcase_on = true;
+				showcase_start_ms = NowMs();
+				ShowToast("Showcase: the divider sweeps on its own (F6 again: off)");
+			}
+			else
+			{
+				showcase_on = false;
+				ShowToast("Compare off");
+			}
 			return true;
 		case SDLK_F7:
 		case SDLK_F8:

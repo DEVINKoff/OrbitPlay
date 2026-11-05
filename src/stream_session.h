@@ -73,6 +73,8 @@ public:
 
 	// Newest decoded frame since the last call, or nullptr. Free with av_frame_free.
 	AVFrame *PullFrame();
+	// When the newest frame finished decoding (microseconds, chiaki monotonic clock).
+	uint64_t LastFrameTimeUs() const { return last_frame_us; }
 	HANDLE FrameEvent() const { return frame_event; }
 
 	void SetControllerState(const ChiakiControllerState &state);
@@ -133,4 +135,5 @@ private:
 	uint64_t total_lost = 0;
 	double mbps = 0.0, decode_fps = 0.0;
 	std::atomic<uint64_t> decoded_frames{ 0 };
+	std::atomic<uint64_t> last_frame_us{ 0 };
 };

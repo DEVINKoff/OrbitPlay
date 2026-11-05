@@ -5,6 +5,7 @@
 #include "discovery.h"
 #include "gamepad.h"
 #include "kbm.h"
+#include "frametimeline.h"
 #include "registration.h"
 #include "renderer.h"
 #include "settings.h"
@@ -40,7 +41,8 @@ private:
 	void EndStream(const std::string &message, bool is_error);
 	void SetFullscreen(bool fullscreen);
 	void MarkSettingsDirty() { settings_dirty = true; }
-	int FrameGenMultiplier() const;      // 1 = off / not possible on this display
+	bool FrameGenActive() const;
+	void PullAndSubmit(bool frame_gen);
 	ProcessOptions MakeProcessOptions() const;
 	PresentOptions MakePresentOptions(int sync_interval) const;
 	void TakeScreenshot();
@@ -97,7 +99,17 @@ private:
 	bool window_focused = true;
 	bool overlay_just_opened = false;
 	bool compare_on = false;
+	bool showcase_on = false;            // compare divider sweeps by itself
+	uint64_t showcase_start_ms = 0;
 	float compare_split = 0.5f;
+
+	// frame generation
+	FrameTimeline timeline;
+	bool fg_active_last = false;
+	int dup_streak = 0;
+	uint64_t dup_count = 0, dup_window_start = 0;
+	double dup_rate = 0.0;               // repeated frames skipped per second
+	uint64_t last_shown_serial = 0;
 	Discovery discovery;
 	std::unique_ptr<StreamSession> session;
 	Registration registration;

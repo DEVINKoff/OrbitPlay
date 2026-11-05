@@ -69,6 +69,13 @@ struct PresentOptions
 
 enum class VideoView { None, Latest, Interpolated };
 
+struct SubmitResult
+{
+	uint64_t serial = 0;     // id of the stored frame, 0 = not stored
+	bool duplicate = false;  // identical to the previous frame (30 fps game in a 60 fps stream, static scene)
+	bool scene_cut = false;  // most of the picture changed: don't interpolate across it
+};
+
 // D3D11 renderer: hardware decoded frames in, HDR10 or SDR swap chain out.
 class Renderer
 {
@@ -90,7 +97,9 @@ public:
 	bool OutputHdr() const { return output_hdr; }
 
 	// Video ------------------------------------------------------------------
-	bool SubmitFrame(AVFrame *frame, const ProcessOptions &options);
+	// Converts and processes a decoded frame. With skip_duplicates (frame generation on), a frame
+	// identical to the previous one is detected on the GPU and not stored.
+	SubmitResult SubmitFrame(AVFrame *frame, const ProcessOptions &options, bool skip_duplicates = false);
 	void ResetVideo();
 	bool HasVideo() const { return frames_submitted > 0; }
 	bool VideoHdr() const { return video_hdr; }
@@ -103,14 +112,19 @@ public:
 	bool AiHdrAvailable() const;
 	std::string GpuVendorName() const;
 
-	// Frame generation: motion is estimated once per new frame, then any number of
-	// in-between frames can be built (t in 0..1, 0 = previous frame, 1 = current).
-	bool PrepareMotion();
-	bool BuildInterpolatedFrame(float t);
+	// Frame generation: builds the picture between two stored frames at time t (0 = a, 1 = b).
+	// Motion between a pair is estimated once and cached.
+	bool BuildInterpolated(uint64_t serial_a, uint64_t serial_b, float t);
+	bool HasFrame(uint64_t serial) const { return FindSlot(serial) >= 0; }
+
+	// Frame pacing: the swap chain's "ready for the next frame" handle (signals once per refresh).
+	HANDLE FrameWaitHandle() const { return frame_wait; }
+	void MarkFrameWaited() { frame_waited = true; }
 
 	// UI ---------------------------------------------------------------------
 	void BeginOverlay();
-	void Present(VideoView view, const PresentOptions &options);
+	// Shows the frame `serial` (0 = newest) or the interpolated frame.
+	void Present(VideoView view, const PresentOptions &options, uint64_t serial = 0);
 
 	// Where the video is drawn in the window: x, y, w, h in pixels.
 	void GetVideoRect(AspectMode aspect, float rect[4]) const { float uv[4]; VideoRect(aspect, width, height, rect, uv); }
@@ -146,6 +160,10 @@ private:
 			ID3D11UnorderedAccessView *uav, ID3D11Buffer *cb, int gx, int gy);
 	void UpdateCB(ID3D11Buffer *cb, const void *data, size_t size);
 	void ComputeLumaPyramid(int slot);
+	int FindSlot(uint64_t serial) const;
+	int PickWorkSlot() const;
+	int EnsureMotionField(int slot_a, int slot_b);   // returns cache index or -1
+	bool FrameDiff(int slot_a, int slot_b, bool *duplicate, bool *cut);
 	void UpdateAmbient(float paper_white);
 	void VideoRect(AspectMode aspect, int win_w, int win_h, float rect[4], float uv[4]) const;
 	void ProcessFrame(AVFrame *frame, const ProcessOptions &o);
@@ -168,6 +186,7 @@ private:
 	Com<IDXGISwapChain1> swapchain;
 	Com<IDXGISwapChain3> swapchain3;
 	HANDLE frame_wait = nullptr;
+	bool frame_waited = false;
 	bool tearing_supported = false;
 	UINT swap_flags = 0;
 	std::unique_ptr<VpScaler> vp;
@@ -184,7 +203,7 @@ private:
 	// Shaders and states
 	Com<ID3D11VertexShader> vs;
 	Com<ID3D11PixelShader> ps_nv12, ps_planar, ps_denoise, ps_edge, ps_sharpen, ps_deband, ps_out, ps_overlay, ps_interp;
-	Com<ID3D11ComputeShader> cs_luma_half, cs_down2, cs_search, cs_median, cs_box8, cs_amb_blend;
+	Com<ID3D11ComputeShader> cs_luma_half, cs_down2, cs_search, cs_median, cs_box8, cs_amb_blend, cs_frame_diff;
 	Com<ID3D11Buffer> cb_yuv, cb_denoise, cb_up, cb_sharp, cb_deband, cb_out, cb_ui, cb_me, cb_interp, cb_amb, cb_amb_down;
 	Com<ID3D11SamplerState> samp_linear;
 	Com<ID3D11BlendState> blend_premul;
@@ -202,13 +221,19 @@ private:
 	// Stream-resolution RGB history (RGBA16F, still gamma/PQ encoded)
 	int video_w = 0, video_h = 0;
 	bool video_hdr = false;
+	static const int kSlots = 4;      // 3 frames of history + 1 being decoded
 	uint64_t frames_submitted = 0;
-	int latest = 0;
-	Target rgb[2];
+	uint64_t next_serial = 0;
+	int latest = 0;                    // slot of the newest stored frame
+	int work = 0;                      // slot the current frame is processed into
+	int display_slot = 0;              // slot shown by the last Present
+	uint64_t slot_serial[kSlots] = {};
+	int hist[3] = { -1, -1, -1 };      // stored frames, newest first
+	Target rgb[kSlots];
 
 	// Processed (upscaled / AI) history
-	Target proc[2];
-	int slot_gen[2] = { -1, -1 };   // processing generation of each slot, -1 = not processed
+	Target proc[kSlots];
+	int slot_gen[kSlots] = { -1, -1, -1, -1 }; // processing generation of each slot, -1 = not processed
 	int proc_gen = 0;
 	bool proc_hdr = false;          // processed output is PQ/BT.2020
 	int last_tw = 0, last_th = 0, last_mode = -1;
@@ -226,13 +251,14 @@ private:
 
 	// Frame generation
 	bool frame_gen_enabled = false;
-	bool motion_ready = false;
 	int grid_w = 0, grid_h = 0, fine_w = 0, fine_h = 0;
-	Target luma_half[2], luma_quarter[2];
-	bool luma_valid[2] = {};
-	Target mv_coarse[2], mv_fine[2], mv_final[2];
-	int final_idx = 0;
-	bool final_valid = false;
+	Target luma_half[kSlots], luma_quarter[kSlots];
+	bool luma_valid[kSlots] = {};
+	Target mv_coarse[2], mv_fine;
+	struct MotionField { uint64_t a = 0, b = 0, used = 0; Target field; } mvc[2];
+	uint64_t mv_use_counter = 0;
+	Com<ID3D11Buffer> diff_buf, diff_staging;
+	Com<ID3D11UnorderedAccessView> diff_uav;
 	Target interp;
 	bool interp_ready = false;
 };

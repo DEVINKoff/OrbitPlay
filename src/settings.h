@@ -57,7 +57,7 @@ struct Settings
 	int detail_preset = 2;      // 0 off, 1 natural, 2 sharp, 3 ultra, 4 maximum, 5 custom
 	void ApplyDetailPreset(int preset);
 	float deband = 0.3f;        // 0..1, removes banding in gradients (skies, fog, dark scenes)
-	int frame_gen = 0;          // 0 off, 1 auto (highest your display allows), 2/3/4 = 2x/3x/4x (120/180/240 fps)
+	int frame_gen = 0;          // 0 off, 1 on: every display refresh gets its own frame (up to the display's Hz)
 	float paper_white_nits = 203.0f; // brightness of SDR content/UI on an HDR display
 	bool ai_hdr = false;        // NVIDIA RTX Video HDR: AI SDR->HDR for SDR games on an HDR display
 	float hdr_boost = 0.0f;     // shader SDR->HDR highlight expansion (any GPU), 0..1

@@ -694,12 +694,14 @@ float4 main(VSOut i) : SV_Target
 	float3 b = curF.SampleLevel(samp, uv + full * (1.0 - t), 0).rgb;
 	float3 blended = lerp(a, b, t);
 
-	// Confidence: block match error and how much the two warps disagree at this pixel.
-	float err = max(m.z * 1.5, abs(Luma(a) - Luma(b)));
-	float fallback = saturate((err - 0.035) / 0.09);
-	// Where matching failed (occlusions, particles), show the nearest real frame instead of a smear.
+	// Where the two motion-compensated frames disagree (something appears / disappears),
+	// use the one nearer in time: it is still moved along the motion, so it doesn't judder.
+	float disagree = saturate((abs(Luma(a) - Luma(b)) - 0.04) / 0.10);
+	float3 c = lerp(blended, t < 0.5 ? a : b, disagree);
+	// Only where block matching failed completely (particles, flashes) show the unmoved real frame.
+	float failed = saturate((m.z - 0.07) / 0.08);
 	float3 nearest = t < 0.5 ? prevF.SampleLevel(samp, uv, 0).rgb : curF.SampleLevel(samp, uv, 0).rgb;
-	return float4(lerp(blended, nearest, fallback), 1.0);
+	return float4(lerp(c, nearest, failed), 1.0);
 }
 )HLSL";
 
@@ -735,6 +737,33 @@ void main(uint3 id : SV_DispatchThreadID)
 	int2 m = int2(sw - 1, sh - 1);
 	dst[id.xy] = 0.25 * (src.Load(int3(min(p, m), 0)) + src.Load(int3(min(p + int2(1, 0), m), 0))
 	                   + src.Load(int3(min(p + int2(0, 1), m), 0)) + src.Load(int3(min(p + int2(1, 1), m), 0)));
+}
+)HLSL";
+
+// Repeated-frame / scene-cut detector: per 4x4 block of the quarter-res luma, counts blocks that
+// changed noticeably (0 changed = the same frame again) and blocks that changed a lot.
+static const char *kCsFrameDiff = R"HLSL(
+Texture2D<float> la : register(t0);
+Texture2D<float> lb : register(t1);
+RWByteAddressBuffer counts : register(u0);
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+	uint w, h; la.GetDimensions(w, h);
+	uint gw = (w + 3) / 4, gh = (h + 3) / 4;
+	if(id.x >= gw || id.y >= gh) return;
+	int2 m = int2(w - 1, h - 1);
+	float s = 0.0;
+	[unroll] for(int y = 0; y < 4; y++)
+		[unroll] for(int x = 0; x < 4; x++)
+		{
+			int2 p = min(int2(id.xy) * 4 + int2(x, y), m);
+			s += abs(la.Load(int3(p, 0)) - lb.Load(int3(p, 0)));
+		}
+	s /= 16.0;
+	uint dummy;
+	if(s > 0.012) counts.InterlockedAdd(0, 1, dummy);
+	if(s > 0.12) counts.InterlockedAdd(4, 1, dummy);
 }
 )HLSL";
 

@@ -12,7 +12,7 @@ hardware video decoding, an HDR10 swap chain and SDL3 for controllers.
 | HDR10 | Yes, HEVC Main10 straight to an HDR10 swap chain. On SDR displays it can tone-map locally. |
 | **AI upscaling** (optional) | NVIDIA RTX Video Super Resolution (RTX 20-series+) or Intel Video Super Resolution (Arc / Iris Xe), the same driver AI that Chrome and VLC use. Upscale to 1440p, 1800p, 2160p or your display's size. |
 | **Enhanced upscaling** (any GPU) | Compression-artifact reduction, then an edge-directed upscale and noise-gated sharpening, so the picture stays clean instead of grainy. |
-| **Frame generation** (optional) | 2x / 3x / 4x from a 60 fps stream gives 120 / 180 / 240 fps on a fast enough display. It uses hierarchical GPU motion estimation with temporal prediction and occlusion fallback. |
+| **Frame generation** (optional) | Builds a new in-between picture for every refresh of your display (120, 144, 165, 240 Hz...), on a jitter-smoothed timeline. Repeated frames from 30 fps games are detected on the GPU and skipped, so 30 fps games get smooth too. |
 | **AI HDR** | NVIDIA RTX Video HDR turns SDR games into HDR on an HDR display. A shader "HDR boost" works on any GPU. |
 | **Ambient lighting** | On ultrawide (or any non-16:9) windows, the bars glow with the picture's edge colors, smoothed over time. |
 | Aspect modes, picture modes | Fit, Fill (crop) and Stretch. Natural, Vivid and Cinema presets, plus brightness, contrast, saturation and vibrance. |
@@ -38,6 +38,9 @@ They stack edge sharpening (up to 2x, past the usual RCAS limit), fine **Texture
 **Clarity** and optional **Punch** (allowed halo) on top of RTX Video Super Resolution or the Enhanced
 upscaler. Ultra and Maximum make compression noise more visible. Use split-screen compare (F6) to
 pick a level.
+
+**Showcase mode** (F6 twice, or Image tab → Compare): the split-screen divider glides across the
+picture and back by itself, with "Original" and "Enhanced" labels, to show what the enhancements do.
 
 **Why there's no DLSS:** DLSS has to be built into the game engine. It needs the game's depth
 buffer, per-pixel motion vectors and sub-pixel camera jitter every frame, and a Remote Play stream
@@ -90,7 +93,7 @@ then press a key, mouse button or wheel direction.
 | Fullscreen | **F11** or **Alt+Enter** |
 | Statistics overlay | **F2** |
 | Cycle upscaling / frame generation | **F3** / **F4** |
-| Ambient light on/off, split-screen compare | **F5** / **F6** |
+| Ambient light on/off, compare -> showcase -> off | **F5** / **F6** |
 | Detail level - / + (Ctrl: fine sharpness) | **F7** / **F8** |
 | Picture mode, microphone | **F9** / **F10** |
 | Screenshot | **F12** |

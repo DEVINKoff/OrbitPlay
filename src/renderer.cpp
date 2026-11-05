@@ -129,6 +129,28 @@ bool Renderer::Init(HWND window)
 	rd.CullMode = D3D11_CULL_NONE;
 	device->CreateRasterizerState(&rd, raster.Put());
 
+	// repeated-frame detector counters (GPU) + readback buffer
+	{
+		D3D11_BUFFER_DESC bd2 = {};
+		bd2.ByteWidth = 16;
+		bd2.Usage = D3D11_USAGE_DEFAULT;
+		bd2.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+		bd2.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+		device->CreateBuffer(&bd2, nullptr, diff_buf.Put());
+		D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+		ud.Format = DXGI_FORMAT_R32_TYPELESS;
+		ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+		ud.Buffer.NumElements = 4;
+		ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+		if(diff_buf)
+			device->CreateUnorderedAccessView(diff_buf.Get(), &ud, diff_uav.Put());
+		bd2.Usage = D3D11_USAGE_STAGING;
+		bd2.BindFlags = 0;
+		bd2.MiscFlags = 0;
+		bd2.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		device->CreateBuffer(&bd2, nullptr, diff_staging.Put());
+	}
+
 	if(!CreateSwapChain())
 		return false;
 	RefreshDisplayInfo();
@@ -194,7 +216,8 @@ bool Renderer::CompileShaders()
 		&& cs(std::string(shaders::kMeCB) + shaders::kCsMotionSearch, cs_search)
 		&& cs(shaders::kCsMedian, cs_median)
 		&& cs(shaders::kCsBox8, cs_box8)
-		&& cs(shaders::kCsAmbientBlend, cs_amb_blend);
+		&& cs(shaders::kCsAmbientBlend, cs_amb_blend)
+		&& cs(shaders::kCsFrameDiff, cs_frame_diff);
 	if(!ok)
 		LOGE("Failed to build shaders");
 	return ok;
@@ -543,11 +566,17 @@ void Renderer::ResetVideo()
 {
 	frames_submitted = 0;
 	interp_ready = false;
-	motion_ready = false;
-	final_valid = false;
 	amb_valid = false;
-	luma_valid[0] = luma_valid[1] = false;
-	slot_gen[0] = slot_gen[1] = -1;
+	for(int i = 0; i < kSlots; i++)
+	{
+		luma_valid[i] = false;
+		slot_gen[i] = -1;
+		slot_serial[i] = 0;
+	}
+	hist[0] = hist[1] = hist[2] = -1;
+	latest = work = 0;
+	for(auto &f : mvc)
+		f.a = f.b = 0;
 	last_mode = -1;
 	upscaler_status = "Off";
 	vp->Reset(); // decoder textures are recreated per session
@@ -560,7 +589,7 @@ bool Renderer::EnsureVideoTargets(int w, int h)
 	video_w = w;
 	video_h = h;
 	ResetVideo();
-	for(int i = 0; i < 2; i++)
+	for(int i = 0; i < kSlots; i++)
 		if(!MakeTarget(rgb[i], w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false))
 			return false;
 	// Everything sized from the stream is rebuilt lazily
@@ -601,16 +630,58 @@ void Renderer::ConvertToRgb(ID3D11ShaderResourceView *const *planes, int plane_c
 	cb.uv_scale[0] = uv_sx;
 	cb.uv_scale[1] = uv_sy;
 	UpdateCB(cb_yuv.Get(), &cb, sizeof(cb));
-	DrawFullscreen(semi_planar ? ps_nv12.Get() : ps_planar.Get(), rgb[latest].rtv.Get(), video_w, video_h,
+	DrawFullscreen(semi_planar ? ps_nv12.Get() : ps_planar.Get(), rgb[work].rtv.Get(), video_w, video_h,
 			planes, plane_count, cb_yuv.Get());
 }
 
-bool Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o)
+int Renderer::FindSlot(uint64_t serial) const
 {
+	if(serial == 0)
+		return -1;
+	for(int i = 0; i < kSlots; i++)
+		if(slot_serial[i] == serial)
+			return i;
+	return -1;
+}
+
+int Renderer::PickWorkSlot() const
+{
+	for(int i = 0; i < kSlots; i++)
+		if(i != hist[0] && i != hist[1] && i != hist[2])
+			return i;
+	return 0;
+}
+
+bool Renderer::FrameDiff(int a, int b, bool *duplicate, bool *cut)
+{
+	if(!diff_uav || !diff_staging || !luma_valid[a] || !luma_valid[b])
+		return false;
+	const UINT zeros[4] = {};
+	context->ClearUnorderedAccessViewUint(diff_uav.Get(), zeros);
+	int qw = luma_quarter[a].w, qh = luma_quarter[a].h;
+	int gw = (qw + 3) / 4, gh = (qh + 3) / 4;
+	ID3D11ShaderResourceView *srvs[2] = { luma_quarter[a].srv.Get(), luma_quarter[b].srv.Get() };
+	Dispatch(cs_frame_diff.Get(), srvs, 2, diff_uav.Get(), nullptr, gw, gh);
+	context->CopyResource(diff_staging.Get(), diff_buf.Get());
+	D3D11_MAPPED_SUBRESOURCE m;
+	if(FAILED(context->Map(diff_staging.Get(), 0, D3D11_MAP_READ, 0, &m))) // waits for the GPU (~1 ms)
+		return false;
+	const UINT *c = (const UINT *)m.pData;
+	UINT changed = c[0], big = c[1];
+	context->Unmap(diff_staging.Get(), 0);
+	*duplicate = changed == 0;
+	*cut = big > (UINT)(gw * gh * 0.55);
+	return true;
+}
+
+SubmitResult Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o, bool skip_duplicates)
+{
+	SubmitResult result;
 	if(!frame || frame->width <= 0 || frame->height <= 0)
-		return false;
+		return result;
 	if(!EnsureVideoTargets(frame->width, frame->height))
-		return false;
+		return result;
+	work = PickWorkSlot();
 
 	bool hdr = frame->color_trc == AVCOL_TRC_SMPTE2084 || frame->color_trc == AVCOL_TRC_ARIB_STD_B67;
 	bool bt2020 = frame->colorspace == AVCOL_SPC_BT2020_NCL || frame->colorspace == AVCOL_SPC_BT2020_CL
@@ -620,7 +691,6 @@ bool Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o)
 		LOGI("Stream is %s", hdr ? "HDR10 (PQ, BT.2020)" : "SDR (BT.709)");
 	video_hdr = hdr;
 
-	latest = (int)(frames_submitted % 2);
 	float matrix[12];
 
 	if(frame->format == AV_PIX_FMT_D3D11)
@@ -645,7 +715,7 @@ bool Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o)
 			if(FAILED(device->CreateTexture2D(&td, nullptr, hw_copy.Put())))
 			{
 				LOGE("Could not create decoder copy texture (format %d)", (int)sd.Format);
-				return false;
+				return result;
 			}
 			bool p010 = sd.Format == DXGI_FORMAT_P010 || sd.Format == DXGI_FORMAT_P016;
 			D3D11_SHADER_RESOURCE_VIEW_DESC vd = {};
@@ -675,7 +745,7 @@ bool Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o)
 		if(!semi && !planar)
 		{
 			LOGE("Unsupported decoder output format %s", av_get_pix_fmt_name((AVPixelFormat)fmt));
-			return false;
+			return result;
 		}
 		if(fmt == AV_PIX_FMT_YUVJ420P)
 			full_range = true;
@@ -702,7 +772,7 @@ bool Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o)
 				{
 					LOGE("Could not create software frame textures");
 					sw_format = -1;
-					return false;
+					return result;
 				}
 			}
 			sw_format = fmt;
@@ -717,7 +787,7 @@ bool Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o)
 			int row_bytes = (p == 0 ? frame->width : (frame->width + 1) / 2) * bpp * ((semi && p == 1) ? 2 : 1);
 			D3D11_MAPPED_SUBRESOURCE m;
 			if(FAILED(context->Map(sw_planes[p].Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
-				return false;
+				return result;
 			for(int y = 0; y < rows; y++)
 				memcpy((uint8_t *)m.pData + (size_t)y * m.RowPitch, frame->data[p] + (size_t)y * frame->linesize[p], row_bytes);
 			context->Unmap(sw_planes[p].Get(), 0);
@@ -727,10 +797,16 @@ bool Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o)
 		ConvertToRgb(srvs, planes, semi, matrix, 1.0f, 1.0f);
 	}
 
-	frames_submitted++;
-	interp_ready = false;
-	motion_ready = false;
-	luma_valid[latest] = false;
+	luma_valid[work] = false;
+	slot_serial[work] = 0;
+	frame_gen_enabled = o.frame_gen;
+	if(frame_gen_enabled && EnsureMotionTargets())
+	{
+		ComputeLumaPyramid(work);
+		if(hist[0] >= 0 && luma_valid[hist[0]] && FrameDiff(work, hist[0], &result.duplicate, &result.scene_cut)
+			&& result.duplicate && skip_duplicates)
+			return result; // same picture as the last frame: not stored (no processing needed either)
+	}
 
 	ProcessFrame(frame, o);
 
@@ -739,13 +815,19 @@ bool Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o)
 	else
 		amb_valid = false;
 
-	frame_gen_enabled = o.frame_gen;
-	if(frame_gen_enabled && EnsureMotionTargets())
-		ComputeLumaPyramid(latest);
-	return true;
+	// store: the work slot becomes the newest frame
+	result.serial = ++next_serial;
+	slot_serial[work] = result.serial;
+	hist[2] = hist[1];
+	hist[1] = hist[0];
+	hist[0] = work;
+	latest = work;
+	frames_submitted++;
+	interp_ready = false;
+	return result;
 }
 
-// Upscaling / AI processing of the frame that was just converted into rgb[latest].
+// Upscaling / AI processing of the frame that was just converted into rgb[work].
 void Renderer::ProcessFrame(AVFrame *frame, const ProcessOptions &o)
 {
 	float rect[4], uvr[4];
@@ -781,7 +863,7 @@ void Renderer::ProcessFrame(AVFrame *frame, const ProcessOptions &o)
 
 	if(!upscaling && !want_ai_hdr)
 	{
-		slot_gen[latest] = -1;
+		slot_gen[work] = -1;
 		upscaler_status = o.upscale == UpscaleMode::Off ? "Off" : "Not needed (display is not larger than the stream)";
 		return;
 	}
@@ -795,19 +877,15 @@ void Renderer::ProcessFrame(AVFrame *frame, const ProcessOptions &o)
 		last_mode = mode_key;
 		last_ai_hdr = want_ai_hdr;
 	}
-	for(int i = 0; i < 2; i++)
-		if(proc[i].tex && (proc[i].w != tw || proc[i].h != th))
-		{
-			vp->Reset(); // output views reference the old textures
-			break;
-		}
-	if(!EnsureTarget(proc[latest], tw, th, kProcFormat, true, false))
+	if(proc[work].tex && (proc[work].w != tw || proc[work].h != th))
+		vp->Reset(); // its output views reference the texture about to be replaced
+	if(!EnsureTarget(proc[work], tw, th, kProcFormat, true, false))
 	{
-		slot_gen[latest] = -1;
+		slot_gen[work] = -1;
 		return;
 	}
 
-	// 1) Driver AI path: decoder texture -> video processor -> (deband, sharpen) -> proc[latest]
+	// 1) Driver AI path: decoder texture -> video processor -> (deband, sharpen) -> proc[work]
 	if(want_ai_sr || want_ai_hdr)
 	{
 		auto *tex = reinterpret_cast<ID3D11Texture2D *>(frame->data[0]);
@@ -828,7 +906,7 @@ void Renderer::ProcessFrame(AVFrame *frame, const ProcessOptions &o)
 		if(!direct && vp_out.tex && (vp_out.w != tw || vp_out.h != th || vp_out.format != vfmt))
 			vp->Reset();
 		bool targets_ok = direct || EnsureTarget(vp_out, tw, th, vfmt, true, false);
-		ID3D11Texture2D *vp_target = direct ? proc[latest].tex.Get() : vp_out.tex.Get();
+		ID3D11Texture2D *vp_target = direct ? proc[work].tex.Get() : vp_out.tex.Get();
 		if(format_ok && targets_ok
 			&& vp->Process(tex, index, video_w, video_h, video_hdr, vp_target, tw, th, out_hdr, want_ai_sr, want_ai_hdr))
 		{
@@ -841,11 +919,11 @@ void Renderer::ProcessFrame(AVFrame *frame, const ProcessOptions &o)
 				if(!PostProcess(srv, tw, th, upscaling ? o.deband : 0.0f, scale, upscaling ? o.ai_sharpness : 0.0f, 0.012f, po))
 				{
 					// nothing to do but format conversion
-					DrawFullscreen(ps_sharpen.Get(), proc[latest].rtv.Get(), tw, th, &srv, 1, nullptr);
+					DrawFullscreen(ps_sharpen.Get(), proc[work].rtv.Get(), tw, th, &srv, 1, nullptr);
 				}
 			}
 			proc_hdr = out_hdr;
-			slot_gen[latest] = proc_gen;
+			slot_gen[work] = proc_gen;
 			std::string st;
 			if(want_ai_sr)
 				st = vp->GetVendor() == VpScaler::Vendor::Nvidia ? "NVIDIA RTX Video Super Resolution" : "Intel Video Super Resolution";
@@ -866,7 +944,7 @@ void Renderer::ProcessFrame(AVFrame *frame, const ProcessOptions &o)
 	if(upscaling && ShaderUpscale(tw, th, o))
 	{
 		proc_hdr = video_hdr;
-		slot_gen[latest] = proc_gen;
+		slot_gen[work] = proc_gen;
 		char res[96];
 		snprintf(res, sizeof(res), "Enhanced (edge-directed + artifact reduction)  %dx%d", tw, th);
 		upscaler_status = res;
@@ -875,12 +953,12 @@ void Renderer::ProcessFrame(AVFrame *frame, const ProcessOptions &o)
 				: "  [no AI super resolution on this GPU]";
 		return;
 	}
-	slot_gen[latest] = -1;
+	slot_gen[work] = -1;
 }
 
 bool Renderer::ShaderUpscale(int tw, int th, const ProcessOptions &o)
 {
-	ID3D11ShaderResourceView *src = rgb[latest].srv.Get();
+	ID3D11ShaderResourceView *src = rgb[work].srv.Get();
 
 	// Artifact reduction at stream resolution
 	if(o.artifact_reduction > 0.01f)
@@ -917,10 +995,10 @@ bool Renderer::ShaderUpscale(int tw, int th, const ProcessOptions &o)
 		DrawFullscreen(ps_edge.Get(), up_tmp.rtv.Get(), tw, th, &src, 1, cb_up.Get());
 
 		// Noise-gated detail enhancement at output resolution
-		Sharpen(up_tmp.srv.Get(), proc[latest].rtv.Get(), tw, th, o.sharpness, 0.008f + 0.02f * o.artifact_reduction, o);
+		Sharpen(up_tmp.srv.Get(), proc[work].rtv.Get(), tw, th, o.sharpness, 0.008f + 0.02f * o.artifact_reduction, o);
 	}
 	else
-		DrawFullscreen(ps_edge.Get(), proc[latest].rtv.Get(), tw, th, &src, 1, cb_up.Get());
+		DrawFullscreen(ps_edge.Get(), proc[work].rtv.Get(), tw, th, &src, 1, cb_up.Get());
 	return true;
 }
 
@@ -992,11 +1070,11 @@ bool Renderer::PostProcess(ID3D11ShaderResourceView *src, int tw, int th, float 
 		}
 		else
 		{
-			Deband(src, proc[latest].rtv.Get(), tw, th, deband, deband_scale);
+			Deband(src, proc[work].rtv.Get(), tw, th, deband, deband_scale);
 			return true;
 		}
 	}
-	Sharpen(src, proc[latest].rtv.Get(), tw, th, sharpness, noise_floor, o);
+	Sharpen(src, proc[work].rtv.Get(), tw, th, sharpness, noise_floor, o);
 	return true;
 }
 
@@ -1014,7 +1092,7 @@ void Renderer::UpdateAmbient(float paper_white)
 	dcb.decode = video_hdr ? 2 : 1;
 	dcb.paper_white = paper_white;
 	UpdateCB(cb_amb_down.Get(), &dcb, sizeof(dcb));
-	ID3D11ShaderResourceView *s = rgb[latest].srv.Get();
+	ID3D11ShaderResourceView *s = rgb[work].srv.Get();
 	Dispatch(cs_box8.Get(), &s, 1, amb_small1.uav.Get(), cb_amb_down.Get(), w1, h1);
 	dcb.decode = 0;
 	UpdateCB(cb_amb_down.Get(), &dcb, sizeof(dcb));
@@ -1044,21 +1122,26 @@ bool Renderer::EnsureMotionTargets()
 	grid_h = (video_h + kCoarseBlockPx - 1) / kCoarseBlockPx;
 	fine_w = (video_w + kFineBlockPx - 1) / kFineBlockPx;
 	fine_h = (video_h + kFineBlockPx - 1) / kFineBlockPx;
-	for(int i = 0; i < 2; i++)
+	bool ok = true;
+	for(int i = 0; i < kSlots && ok; i++)
 	{
-		if(!MakeTarget(luma_half[i], hw, hh, DXGI_FORMAT_R16_FLOAT, false, true)
-			|| !MakeTarget(luma_quarter[i], qw, qh, DXGI_FORMAT_R16_FLOAT, false, true)
-			|| !MakeTarget(mv_coarse[i], grid_w, grid_h, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true)
-			|| !MakeTarget(mv_fine[i], fine_w, fine_h, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true)
-			|| !MakeTarget(mv_final[i], fine_w, fine_h, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true))
-		{
-			LOGE("Could not create frame generation textures");
-			mv_coarse[0].Reset();
-			return false;
-		}
+		ok = MakeTarget(luma_half[i], hw, hh, DXGI_FORMAT_R16_FLOAT, false, true)
+			&& MakeTarget(luma_quarter[i], qw, qh, DXGI_FORMAT_R16_FLOAT, false, true);
 		luma_valid[i] = false;
 	}
-	final_valid = false;
+	for(int i = 0; i < 2 && ok; i++)
+	{
+		ok = MakeTarget(mv_coarse[i], grid_w, grid_h, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true)
+			&& MakeTarget(mvc[i].field, fine_w, fine_h, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true);
+		mvc[i].a = mvc[i].b = 0;
+	}
+	ok = ok && MakeTarget(mv_fine, fine_w, fine_h, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true);
+	if(!ok)
+	{
+		LOGE("Could not create frame generation textures");
+		mv_coarse[0].Reset();
+		return false;
+	}
 	return true;
 }
 
@@ -1071,20 +1154,29 @@ void Renderer::ComputeLumaPyramid(int slot)
 	luma_valid[slot] = true;
 }
 
-bool Renderer::PrepareMotion()
+// Motion between two stored frames, computed once per pair and cached (two pairs are kept: the
+// display can be between frames 1-2 or 2-3 of the history).
+int Renderer::EnsureMotionField(int sa, int sb)
 {
-	if(motion_ready)
-		return true;
-	if(!frame_gen_enabled || frames_submitted < 2 || !EnsureMotionTargets())
-		return false;
-	int cur = latest, prev = 1 - latest;
-	if(!luma_valid[cur])
-		ComputeLumaPyramid(cur);
-	if(!luma_valid[prev])
-		ComputeLumaPyramid(prev);
+	uint64_t a = slot_serial[sa], b = slot_serial[sb];
+	for(int i = 0; i < 2; i++)
+		if(mvc[i].a == a && mvc[i].b == b && a)
+		{
+			mvc[i].used = ++mv_use_counter;
+			return i;
+		}
+	if(!EnsureMotionTargets())
+		return -1;
+	if(!luma_valid[sa])
+		ComputeLumaPyramid(sa);
+	if(!luma_valid[sb])
+		ComputeLumaPyramid(sb);
+	int dst = mvc[0].used <= mvc[1].used ? 0 : 1;
+	int other = 1 - dst;
+	bool temporal = mvc[other].a != 0;
 
 	// 1) Coarse search at quarter resolution: 4x4 blocks (= 16x16 px), +-8 (= +-32 px half-step,
-	//    i.e. up to 64 px of motion per frame), plus last frame's vectors for faster motion.
+	//    i.e. up to 64 px of motion per frame), plus the previous pair's vectors for faster motion.
 	MeCB me = {};
 	me.grid[0] = grid_w;
 	me.grid[1] = grid_h;
@@ -1093,14 +1185,13 @@ bool Renderer::PrepareMotion()
 	me.level_scale = 4;
 	me.lambda = 0.2f;
 	me.use_pred = 0;
-	me.use_temporal = final_valid ? 1 : 0;
+	me.use_temporal = temporal ? 1 : 0;
 	me.pred_scale[0] = me.pred_scale[1] = 1.0f;
 	me.temporal_scale[0] = (float)fine_w / grid_w;
 	me.temporal_scale[1] = (float)fine_h / grid_h;
 	UpdateCB(cb_me.Get(), &me, sizeof(me));
-	int prev_final = 1 - final_idx;
-	ID3D11ShaderResourceView *srvs[4] = { luma_quarter[prev].srv.Get(), luma_quarter[cur].srv.Get(), nullptr,
-		final_valid ? mv_final[prev_final].srv.Get() : nullptr };
+	ID3D11ShaderResourceView *srvs[4] = { luma_quarter[sa].srv.Get(), luma_quarter[sb].srv.Get(), nullptr,
+		temporal ? mvc[other].field.srv.Get() : nullptr };
 	Dispatch(cs_search.Get(), srvs, 4, mv_coarse[0].uav.Get(), cb_me.Get(), grid_w, grid_h);
 
 	ID3D11ShaderResourceView *m = mv_coarse[0].srv.Get();
@@ -1118,31 +1209,36 @@ bool Renderer::PrepareMotion()
 	me.pred_scale[0] = (float)grid_w / fine_w;
 	me.pred_scale[1] = (float)grid_h / fine_h;
 	UpdateCB(cb_me.Get(), &me, sizeof(me));
-	ID3D11ShaderResourceView *rsrvs[4] = { luma_half[prev].srv.Get(), luma_half[cur].srv.Get(), mv_coarse[1].srv.Get(), nullptr };
-	Dispatch(cs_search.Get(), rsrvs, 4, mv_fine[0].uav.Get(), cb_me.Get(), fine_w, fine_h);
+	ID3D11ShaderResourceView *rsrvs[4] = { luma_half[sa].srv.Get(), luma_half[sb].srv.Get(), mv_coarse[1].srv.Get(), nullptr };
+	Dispatch(cs_search.Get(), rsrvs, 4, mv_fine.uav.Get(), cb_me.Get(), fine_w, fine_h);
 
-	m = mv_fine[0].srv.Get();
-	Dispatch(cs_median.Get(), &m, 1, mv_final[final_idx].uav.Get(), nullptr, fine_w, fine_h);
-
-	motion_ready = true;
-	final_valid = true;
-	final_idx = 1 - final_idx; // next frame reads this field as its temporal predictor
-	return true;
+	m = mv_fine.srv.Get();
+	Dispatch(cs_median.Get(), &m, 1, mvc[dst].field.uav.Get(), nullptr, fine_w, fine_h);
+	mvc[dst].a = a;
+	mvc[dst].b = b;
+	mvc[dst].used = ++mv_use_counter;
+	return dst;
 }
 
-bool Renderer::BuildInterpolatedFrame(float t)
+bool Renderer::BuildInterpolated(uint64_t serial_a, uint64_t serial_b, float t)
 {
-	if(!PrepareMotion())
+	interp_ready = false;
+	if(!frame_gen_enabled)
 		return false;
-	int cur = latest, prev = 1 - latest;
-	if(slot_gen[cur] != slot_gen[prev])
-		return false; // processing changed between the two frames
+	int sa = FindSlot(serial_a), sb = FindSlot(serial_b);
+	if(sa < 0 || sb < 0 || sa == sb)
+		return false;
+	if(slot_gen[sa] != slot_gen[sb])
+		return false; // processing settings changed between the two frames
 	int w, h, pw, ph;
-	ID3D11ShaderResourceView *cur_srv = DisplaySrv(cur, &w, &h);
-	ID3D11ShaderResourceView *prev_srv = DisplaySrv(prev, &pw, &ph);
+	ID3D11ShaderResourceView *b_srv = DisplaySrv(sb, &w, &h);
+	ID3D11ShaderResourceView *a_srv = DisplaySrv(sa, &pw, &ph);
 	if(w != pw || h != ph)
 		return false;
-	DXGI_FORMAT fmt = slot_gen[cur] >= 0 ? kProcFormat : DXGI_FORMAT_R16G16B16A16_FLOAT;
+	int field = EnsureMotionField(sa, sb);
+	if(field < 0)
+		return false;
+	DXGI_FORMAT fmt = slot_gen[sb] >= 0 ? kProcFormat : DXGI_FORMAT_R16G16B16A16_FLOAT;
 	if(!EnsureTarget(interp, w, h, fmt, true, false))
 		return false;
 
@@ -1153,8 +1249,7 @@ bool Renderer::BuildInterpolatedFrame(float t)
 	ic.grid_scale[1] = (float)video_h / (float)(fine_h * kFineBlockPx);
 	ic.t = std::clamp(t, 0.0f, 1.0f);
 	UpdateCB(cb_interp.Get(), &ic, sizeof(ic));
-	int last_final = 1 - final_idx; // the field PrepareMotion just wrote
-	ID3D11ShaderResourceView *isrvs[3] = { prev_srv, cur_srv, mv_final[last_final].srv.Get() };
+	ID3D11ShaderResourceView *isrvs[3] = { a_srv, b_srv, mvc[field].field.srv.Get() };
 	DrawFullscreen(ps_interp.Get(), interp.rtv.Get(), w, h, isrvs, 3, cb_interp.Get());
 	interp_ready = true;
 	return true;
@@ -1207,21 +1302,26 @@ void Renderer::DrawVideoOut(ID3D11RenderTargetView *rtv, int w, int h, ID3D11Sha
 	c.split = (o.compare && frames_submitted > 0) ? rect[0] + rect[2] * std::clamp(o.compare_split, 0.0f, 1.0f) : -1.0f;
 	c.orig_mode = video_hdr ? (out_hdr ? 2 : 3) : (out_hdr ? 1 : 0);
 	UpdateCB(cb_out.Get(), &c, sizeof(c));
-	ID3D11ShaderResourceView *srvs[3] = { video, amb_valid ? amb[amb_index].srv.Get() : nullptr, rgb[latest].srv.Get() };
+	ID3D11ShaderResourceView *srvs[3] = { video, amb_valid ? amb[amb_index].srv.Get() : nullptr, rgb[display_slot].srv.Get() };
 	DrawFullscreen(ps_out.Get(), rtv, w, h, srvs, 3, cb_out.Get());
 }
 
-void Renderer::Present(VideoView view, const PresentOptions &opt)
+void Renderer::Present(VideoView view, const PresentOptions &opt, uint64_t serial)
 {
-	if(frame_wait)
+	if(frame_wait && !frame_waited)
 		WaitForSingleObjectEx(frame_wait, 100, TRUE);
+	frame_waited = false;
 
 	ID3D11ShaderResourceView *video = nullptr;
 	int vw = 0, vh = 0;
 	bool content_hdr = false;
+	int slot = FindSlot(serial);
+	if(slot < 0)
+		slot = latest;
+	display_slot = slot;
 	if(view != VideoView::None && frames_submitted > 0)
 	{
-		bool processed = slot_gen[latest] >= 0;
+		bool processed = slot_gen[slot] >= 0;
 		content_hdr = processed ? proc_hdr : video_hdr;
 		if(view == VideoView::Interpolated && interp_ready)
 		{
@@ -1230,7 +1330,7 @@ void Renderer::Present(VideoView view, const PresentOptions &opt)
 			vh = interp.h;
 		}
 		else
-			video = DisplaySrv(latest, &vw, &vh);
+			video = DisplaySrv(slot, &vw, &vh);
 	}
 
 	const float black[4] = { 0, 0, 0, 1 };
