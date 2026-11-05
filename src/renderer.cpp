@@ -1288,7 +1288,7 @@ bool Renderer::BuildInterpolated(uint64_t serial_a, uint64_t serial_b, float t)
 	ic.src_size[1] = (float)video_h;
 	ic.grid_scale[0] = (float)video_w / (float)(fine_w * kFineBlockPx);
 	ic.grid_scale[1] = (float)video_h / (float)(fine_h * kFineBlockPx);
-	ic.t = std::clamp(t, 0.0f, 1.0f);
+	ic.t = std::clamp(t, 0.0f, 2.0f);
 	UpdateCB(cb_interp.Get(), &ic, sizeof(ic));
 	ID3D11ShaderResourceView *isrvs[3] = { a_srv, b_srv, mvc[field].field.srv.Get() };
 	DrawFullscreen(ps_interp.Get(), interp.rtv.Get(), w, h, isrvs, 3, cb_interp.Get());

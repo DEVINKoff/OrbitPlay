@@ -35,8 +35,9 @@ public:
 	struct Tuning
 	{
 		float sensitivity = 1.0f;     // mouse -> stick gain
-		float anti_deadzone = 0.15f;  // games ignore small stick input; start right above that
-		float smoothing = 0.5f;       // 0 = raw, 1 = very smooth
+		float anti_deadzone = 0.18f;  // games ignore small stick input; start right above that
+		float smoothing = 0.5f;       // averaging window 1.5 .. 26.5 ms (0.5 = 8 ms = one console input packet)
+		float curve = 1.6f;           // undo the game's stick response curve (1 = off, 2 = squared)
 		bool invert_y = false;
 	};
 
@@ -76,7 +77,10 @@ private:
 	bool mouse_buttons[8] = {};
 	uint64_t wheel_up_until = 0, wheel_down_until = 0;
 	float pending_dx = 0, pending_dy = 0;   // mouse motion since the last update
-	float vel_x = 0, vel_y = 0;            // smoothed mouse velocity (px/s)
+	float vel_x = 0, vel_y = 0;            // mouse velocity over the averaging window (px/s)
+	struct Sample { uint64_t t_us; float dx, dy; };
+	Sample hist[128] = {};                 // recent motion, for the sliding-window velocity
+	int hist_head = 0, hist_count = 0;
 	uint64_t last_update_us = 0;
 	int capture_action = -1;
 };

@@ -256,30 +256,47 @@ ChiakiControllerState KeyboardMouse::Update()
 	dt = std::clamp(dt, 0.0005f, 0.05f);
 	last_update_us = now;
 
-	// Mouse -> right stick. Velocity is smoothed with a short time constant so the
-	// stick doesn't flicker between mouse reports; faster mouse = more deflection.
-	float inst_x = pending_dx / dt, inst_y = pending_dy / dt;
+	// Mouse -> right stick. Velocity = motion over a short sliding window (not an exponential
+	// filter, which trails behind your hand). At the default it's ~2 ms: as direct as a stick
+	// can be, while still averaging over a few mouse reports so the stick doesn't flicker.
+	if(pending_dx != 0.0f || pending_dy != 0.0f)
+	{
+		hist[hist_head] = { now, pending_dx, pending_dy };
+		hist_head = (hist_head + 1) % 128;
+		hist_count = std::min(hist_count + 1, 128);
+	}
 	pending_dx = pending_dy = 0;
-	float tau = 0.004f + 0.030f * std::clamp(options.smoothing, 0.0f, 1.0f);
-	float k = 1.0f - std::exp(-dt / tau);
-	vel_x += (inst_x - vel_x) * k;
-	vel_y += (inst_y - vel_y) * k;
+	float smooth = std::clamp(options.smoothing, 0.0f, 1.0f);
+	uint64_t window_us = (uint64_t)((0.0015 + 0.025 * smooth * smooth) * 1e6);
+	float sx = 0, sy = 0;
+	for(int i = 0; i < hist_count; i++)
+	{
+		const Sample &h = hist[(hist_head - 1 - i + 128) % 128];
+		if(now - h.t_us > window_us)
+			break;
+		sx += h.dx;
+		sy += h.dy;
+	}
+	float win_s = std::max((float)window_us / 1e6f, dt);
+	vel_x = sx / win_s;
+	vel_y = sy / win_s;
 	// 1.0 sensitivity: ~1500 px/s of mouse movement = full stick
 	float gain = std::max(0.05f, options.sensitivity) / 1500.0f;
 	float rx = vel_x * gain, ry = vel_y * gain * (options.invert_y ? -1.0f : 1.0f);
 	float mag = std::sqrt(rx * rx + ry * ry);
 	if(mag > 0.002f)
 	{
-		// anti-deadzone: map (0, 1] onto (dz, 1] so even slow mouse moves turn the camera
+		// Games turn stick deflection into camera speed through a curve (often ~squared) and a
+		// deadzone. Pre-distort so mouse speed maps to camera speed about linearly, like on PC.
+		float m = std::min(mag, 1.0f);
+		m = std::pow(m, 1.0f / std::clamp(options.curve, 1.0f, 3.0f));
 		float dz = std::clamp(options.anti_deadzone, 0.0f, 0.6f);
-		float out = std::min(1.0f, dz + (1.0f - dz) * std::min(mag, 1.0f));
+		float out = std::min(1.0f, dz + (1.0f - dz) * m);
 		rx *= out / mag;
 		ry *= out / mag;
 		s.right_x = ToAxis(rx);
 		s.right_y = ToAxis(ry);
 	}
-	else
-		vel_x = vel_y = 0.0f;
 
 	// Movement keys -> left stick (diagonals normalized)
 	float lx = (Pressed(MoveRight) ? 1.0f : 0.0f) - (Pressed(MoveLeft) ? 1.0f : 0.0f);

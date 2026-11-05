@@ -693,6 +693,13 @@ float4 main(VSOut i) : SV_Target
 
 	float3 a = prevF.SampleLevel(samp, uv - full * t, 0).rgb;
 	float3 b = curF.SampleLevel(samp, uv + full * (1.0 - t), 0).rgb;
+	float failed = saturate((m.z - 0.07) / 0.08);
+	if(t > 1.0)
+	{
+		// Predictive: the newest frame moved forward along its motion
+		float3 now = curF.SampleLevel(samp, uv, 0).rgb;
+		return float4(lerp(b, now, failed), 1.0);
+	}
 	float3 blended = lerp(a, b, t);
 
 	// Where the two motion-compensated frames disagree (something appears / disappears),
@@ -700,7 +707,6 @@ float4 main(VSOut i) : SV_Target
 	float disagree = saturate((abs(Luma(a) - Luma(b)) - 0.04) / 0.10);
 	float3 c = lerp(blended, t < 0.5 ? a : b, disagree);
 	// Only where block matching failed completely (particles, flashes) show the unmoved real frame.
-	float failed = saturate((m.z - 0.07) / 0.08);
 	float3 nearest = t < 0.5 ? prevF.SampleLevel(samp, uv, 0).rgb : curF.SampleLevel(samp, uv, 0).rgb;
 	return float4(lerp(c, nearest, failed), 1.0);
 }

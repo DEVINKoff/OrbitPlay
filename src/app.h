@@ -112,6 +112,7 @@ private:
 	uint64_t dup_count = 0, dup_window_start = 0;
 	double dup_rate = 0.0;               // repeated frames skipped per second
 	uint64_t last_shown_serial = 0;
+	uint64_t last_fg_present_ms = 0;
 	struct PendingFrame { uint64_t serial; double arrival_ms; uint64_t submitted_ms; };
 	std::vector<PendingFrame> pending_frames;  // waiting for the GPU's repeated-frame check
 	int slow_seconds = 0;                     // frame generation below the display rate

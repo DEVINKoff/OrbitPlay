@@ -125,6 +125,20 @@ Settings::Settings()
 // ---------------------------------------------------------------------------
 // Picture presets
 
+void Settings::ApplyMousePreset(int preset)
+{
+	//                          direct  pc-like smooth  raw
+	static const float sm[] = { 0.30f,  0.50f,  0.80f,  0.50f };
+	static const float cv[] = { 1.60f,  1.60f,  1.40f,  1.00f };
+	static const float dz[] = { 0.18f,  0.18f,  0.15f,  0.00f };
+	mouse_preset = preset;
+	if(preset < 0 || preset > 3)
+		return;
+	kbm.smoothing = sm[preset];
+	kbm.curve = cv[preset];
+	kbm.anti_deadzone = dz[preset];
+}
+
 void Settings::ApplyDetailPreset(int preset)
 {
 	//                         off   natural sharp ultra maximum
@@ -254,7 +268,9 @@ void Settings::Load(const std::string &path)
 		detail_preset = 5; // settings from an older version: keep their values, show as custom
 	flt("deband", deband);
 	num("frame_gen_mode", frame_gen);
-	frame_gen = frame_gen ? 1 : 0; // 1.1-1.3 had 2x/3x/4x modes; it now always matches the display
+	frame_gen = frame_gen ? 1 : 0; // older versions: any "on" value becomes predictive
+	if(g.count("frame_gen_v2"))
+		frame_gen = std::clamp(atoi(g["frame_gen_v2"].c_str()), 0, 2);
 	flt("paper_white_nits", paper_white_nits);
 	bol("ai_hdr", ai_hdr);
 	flt("hdr_boost", hdr_boost);
@@ -266,6 +282,10 @@ void Settings::Load(const std::string &path)
 	flt("mouse_sensitivity", kbm.sensitivity);
 	flt("mouse_anti_deadzone", kbm.anti_deadzone);
 	flt("mouse_smoothing", kbm.smoothing);
+	flt("mouse_curve", kbm.curve);
+	num("mouse_preset", mouse_preset);
+	if(!g.count("mouse_preset"))
+		ApplyMousePreset(1); // 1.5 retuned mouse-look: older files get the new defaults
 	bol("mouse_invert_y", kbm.invert_y);
 	for(int i = 0; i < KeyboardMouse::ActionCount; i++)
 	{
@@ -343,7 +363,8 @@ void Settings::Save(const std::string &path) const
 	o << "overshoot=" << overshoot << "\n";
 	o << "detail_preset=" << detail_preset << "\n";
 	o << "deband=" << deband << "\n";
-	o << "frame_gen_mode=" << frame_gen << "\n";
+	o << "frame_gen_mode=" << (frame_gen ? 1 : 0) << "\n";
+	o << "frame_gen_v2=" << frame_gen << "\n";
 	o << "paper_white_nits=" << paper_white_nits << "\n";
 	o << "ai_hdr=" << ai_hdr << "\n";
 	o << "hdr_boost=" << hdr_boost << "\n";
@@ -355,6 +376,8 @@ void Settings::Save(const std::string &path) const
 	o << "mouse_sensitivity=" << kbm.sensitivity << "\n";
 	o << "mouse_anti_deadzone=" << kbm.anti_deadzone << "\n";
 	o << "mouse_smoothing=" << kbm.smoothing << "\n";
+	o << "mouse_curve=" << kbm.curve << "\n";
+	o << "mouse_preset=" << mouse_preset << "\n";
 	o << "mouse_invert_y=" << kbm.invert_y << "\n";
 	for(int i = 0; i < KeyboardMouse::ActionCount; i++)
 		o << "bind." << i << "=" << KeyboardMouse::Serialize(bindings[i]) << "\n";

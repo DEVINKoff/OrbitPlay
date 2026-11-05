@@ -312,21 +312,26 @@ void App::Run()
 		{
 			// Frame generation: one new picture per display refresh. Wait for either the next
 			// refresh slot or a newly decoded frame (store it right away so none are dropped).
+			// Wake at least every 2 ms meanwhile so mouse / keyboard input reaches the console
+			// without waiting for the next refresh.
 			if(HANDLE fw = renderer.FrameWaitHandle())
 			{
 				HANDLE handles[2] = { fw, session->FrameEvent() };
-				DWORD w = WaitForMultipleObjects(2, handles, FALSE, 20);
+				DWORD w = WaitForMultipleObjects(2, handles, FALSE, 2);
 				if(w == WAIT_OBJECT_0 + 1)
 				{
 					PullAndSubmit(true);
 					continue; // keep waiting for the refresh slot
 				}
+				if(w == WAIT_TIMEOUT && NowMs() - last_fg_present_ms < 50)
+					continue; // input tick
 				if(w == WAIT_OBJECT_0)
 					renderer.MarkFrameWaited();
 			}
 			PullAndSubmit(true);
 			ProcessPendingFrames();
 			PresentFrame(true);
+			last_fg_present_ms = NowMs();
 			continue;
 		}
 
@@ -713,11 +718,14 @@ void App::PresentFrame(bool new_frame)
 
 	if(fg)
 	{
-		FrameTimeline::Pick p = timeline.Get(chiaki_time_now_monotonic_us() / 1000.0);
-		// Display not faster than the game: show real frames (still evenly paced), no in-betweens
-		if(p.valid && renderer.DisplayHz() < timeline.SourceFps() * 1.25)
+		bool predictive = settings.frame_gen == 1;
+		FrameTimeline::Pick p = timeline.Get(chiaki_time_now_monotonic_us() / 1000.0, predictive);
+		// Interpolated on a display that isn't faster than the game: show the real frames
+		// (still evenly paced), no in-betweens
+		if(p.valid && !predictive && renderer.DisplayHz() < timeline.SourceFps() * 1.25)
 			p.t = p.t >= 0.5f ? 1.0f : 0.0f;
-		if(p.valid && p.a != p.b && p.t > 0.01f && p.t < 0.99f && renderer.BuildInterpolated(p.a, p.b, p.t))
+		bool generate = p.valid && p.a != p.b && ((p.t > 0.01f && p.t < 0.99f) || p.t > 1.01f);
+		if(generate && renderer.BuildInterpolated(p.a, p.b, p.t))
 			present(VideoView::Interpolated, p.b);
 		else if(p.valid)
 			present(VideoView::Latest, p.t >= 0.5f ? p.b : p.a);
@@ -1412,24 +1420,31 @@ void App::UiFrameGenSection()
 {
 	bool changed = false;
 	Row("Frame generation");
-	char on_label[64];
-	snprintf(on_label, sizeof(on_label), "On (every refresh of your %d Hz display)", renderer.DisplayHz());
-	const char *fg[] = { "Off", on_label };
-	settings.frame_gen = settings.frame_gen ? 1 : 0;
-	changed |= ImGui::Combo("##fg", &settings.frame_gen, fg, 2);
-	char buf[480];
+	const char *fg[] = { "Off", "Predictive (no added latency)", "Interpolated (smoothest)" };
+	settings.frame_gen = std::clamp(settings.frame_gen, 0, 2);
+	changed |= ImGui::Combo("##fg", &settings.frame_gen, fg, 3);
+	char buf[560];
+	bool live = phase == Phase::Streaming && session && FrameGenActive();
 	if((compare_on || showcase_on) && settings.frame_gen != 0)
 		snprintf(buf, sizeof(buf), "Paused while split-screen compare / showcase is on.");
 	else if(settings.frame_gen == 0)
-		snprintf(buf, sizeof(buf), "Builds a new in-between picture for every refresh of your display, from the real frames' motion. "
-			"Works with 30 fps games too (repeated frames in the stream are detected and skipped).");
-	else if(phase == Phase::Streaming && session)
-		snprintf(buf, sizeof(buf), "Game runs at %.0f fps, shown at %.0f fps on your %d Hz display.%s Adds about %.0f ms of latency "
-			"(the next real frame is needed to build the ones before it).", timeline.SourceFps(), present_fps, renderer.DisplayHz(),
-			dup_rate > 5.0 ? " Repeated frames detected and skipped (30 fps game)." : "", timeline.BufferMs());
+		snprintf(buf, sizeof(buf), "Builds a new picture for every refresh of your %d Hz display from the real frames' motion. "
+			"Works with 30 fps games too (repeated frames in the stream are detected and skipped).", renderer.DisplayHz());
+	else if(settings.frame_gen == 1)
+		snprintf(buf, sizeof(buf), "Predicts each refresh by moving the newest frame forward along its motion: smooth like "
+			"interpolation but without waiting for the next frame, so it adds no delay (it even shows motion a little sooner). "
+			"Edges can stretch briefly when something stops or appears suddenly.%s", live ? "" : "");
 	else
-		snprintf(buf, sizeof(buf), "On. Adds about one game frame of latency (17 ms at 60 fps, 33 ms at 30 fps). "
-			"Gains are largest on 120 Hz+ displays and with 30 fps games.");
+		snprintf(buf, sizeof(buf), "Builds the in-between pictures from two real frames: the cleanest motion, but it has to wait "
+			"for the next frame, about %.0f ms of extra delay.", live ? timeline.BufferMs(false) : 1000.0 / std::max(30, settings.fps) + 2.0);
+	RowHelp(buf);
+	if(live)
+	{
+		char st[200];
+		snprintf(st, sizeof(st), "Now: game %.0f fps -> %.0f fps on your %d Hz display%s.", timeline.SourceFps(), present_fps,
+			renderer.DisplayHz(), dup_rate > 5.0 ? ", repeated frames skipped (30 fps game)" : "");
+		RowHelp(st);
+	}
 	RowHelp(buf);
 	if(changed)
 		MarkSettingsDirty();
@@ -1489,13 +1504,36 @@ void App::UiControlsSection()
 	RowHelp("While playing, the mouse is captured and moves the right stick. Esc or F1 frees the mouse and opens this menu. "
 		"A gamepad keeps working alongside.");
 	ImGui::BeginDisabled(!settings.kbm_enabled);
+	Row("Mouse feel");
+	const char *feels[] = { "Direct (lowest delay)", "PC-like (recommended)", "Smooth (cinematic)", "Raw stick (no curve)", "Custom" };
+	int feel = std::clamp(settings.mouse_preset, 0, 4);
+	if(ImGui::Combo("##mfeel", &feel, feels, 5))
+	{
+		settings.ApplyMousePreset(feel);
+		changed = true;
+	}
+	RowHelp("PC-like averages mouse movement over exactly one console input packet (8 ms), so the camera turns by as much as "
+		"you moved, and undoes the game's stick curve so slow and fast flicks both feel 1:1.");
 	Row("Mouse sensitivity");
 	changed |= ImGui::SliderFloat("##msens", &settings.kbm.sensitivity, 0.1f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+	bool custom = false;
+	Row("Aim curve");
+	custom |= ImGui::SliderFloat("##mcurve", &settings.kbm.curve, 1.0f, 3.0f, settings.kbm.curve < 1.01f ? "Off (linear stick)" : "%.2f");
+	RowHelp("Most console games turn stick deflection into camera speed through a curve. Raise this if small mouse movements "
+		"feel sluggish compared to big ones.");
 	Row("Anti-deadzone");
-	changed |= ImGui::SliderFloat("##madz", &settings.kbm.anti_deadzone, 0.0f, 0.5f, "%.2f");
+	custom |= ImGui::SliderFloat("##madz", &settings.kbm.anti_deadzone, 0.0f, 0.5f, "%.2f");
 	RowHelp("Games ignore small stick movements. Raise this if slow mouse movements don't turn the camera, lower it if aiming feels jumpy.");
-	Row("Mouse smoothing");
-	changed |= ImGui::SliderFloat("##msmooth", &settings.kbm.smoothing, 0.0f, 1.0f, "%.2f");
+	Row("Mouse averaging");
+	float win_ms = 1.5f + 25.0f * settings.kbm.smoothing * settings.kbm.smoothing;
+	char fmt[48];
+	snprintf(fmt, sizeof(fmt), "%.1f ms", win_ms);
+	custom |= ImGui::SliderFloat("##msmooth", &settings.kbm.smoothing, 0.0f, 1.0f, fmt);
+	if(custom)
+	{
+		settings.mouse_preset = 4;
+		changed = true;
+	}
 	Row("Invert Y");
 	changed |= ImGui::Checkbox("##minv", &settings.kbm.invert_y);
 
@@ -1643,8 +1681,20 @@ void App::UiStats()
 	ImGui::Text("Upscale  %s", renderer.UpscalerStatus().c_str());
 	ImGui::Text("Decode   %.1f fps    Present %.1f fps", s.decode_fps, present_fps);
 	if(FrameGenActive())
-		ImGui::Text("FrameGen game %.0f fps -> %.0f fps   buffer %.0f ms   repeats skipped %.0f/s", timeline.SourceFps(), present_fps,
-			timeline.BufferMs(), dup_rate);
+		ImGui::Text("FrameGen %s  game %.0f fps -> %.0f fps   buffer %.0f ms   repeats skipped %.0f/s",
+			settings.frame_gen == 1 ? "predictive" : "interpolated", timeline.SourceFps(), present_fps,
+			timeline.BufferMs(settings.frame_gen == 1), dup_rate);
+	{
+		// Rough end-to-end picture of where the delay comes from (the PS5's own capture/encode
+		// time isn't visible to the PC and comes on top).
+		double net = s.rtt_ms * 0.5;
+		double fgb = FrameGenActive() ? (settings.frame_gen == 1 ? timeline.BufferMs(true) - 1000.0 / std::max(1.0, present_fps) * 0.5
+			: timeline.BufferMs(false)) : 0.0;
+		double disp = 1000.0 / std::max(1, renderer.DisplayHz()) * ((settings.vsync || FrameGenActive()) ? 1.5 : 0.5);
+		double total = net + 2.0 + std::max(0.0, fgb) + disp + 4.0;
+		ImGui::Text("Latency  ~%.0f ms on the PC side: network %.0f + decode ~2 + frame gen %.0f + display %.0f + input ~4",
+			total, net, std::max(0.0, fgb), disp);
+	}
 	ImGui::Text("Network  %.1f Mbps   RTT %.1f ms   lost frames %llu", s.mbps, s.rtt_ms, (unsigned long long)s.frames_lost);
 	ImGui::Text("Audio    %d ms queued   Haptics %s   Mic %s", audio.QueuedMs(),
 		audio.HapticsActive() ? "DualSense" : "rumble", session->MicMuted() ? "off" : "on");
@@ -1833,12 +1883,13 @@ bool App::HandleHotkey(SDL_Keycode key)
 		}
 		case SDLK_F4:
 		{
-			settings.frame_gen = settings.frame_gen ? 0 : 1;
+			settings.frame_gen = (settings.frame_gen + 1) % 3;
 			if(settings.frame_gen == 0)
 				ShowToast("Frame generation: off");
 			else
 			{
-				snprintf(buf, sizeof(buf), "Frame generation: on (up to %d fps on this display)", renderer.DisplayHz());
+				snprintf(buf, sizeof(buf), "Frame generation: %s (up to %d fps)", settings.frame_gen == 1 ? "predictive, no added delay"
+					: "interpolated, smoothest", renderer.DisplayHz());
 				ShowToast(buf);
 			}
 			break;
