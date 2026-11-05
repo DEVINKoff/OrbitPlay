@@ -41,7 +41,10 @@ struct ProcessOptions
 	int target_height = 0;          // 0 = match the video area on screen
 	float artifact_reduction = 0.4f;
 	float sharpness = 0.5f;         // enhanced upscaler
-	float ai_sharpness = 0.35f;     // extra sharpening after AI super resolution
+	float ai_sharpness = 0.35f;     // extra sharpening after AI super resolution (0..2)
+	float texture_boost = 0.0f;     // fine texture enhancement, 0..1
+	float clarity = 0.0f;           // large-radius local contrast, 0..1
+	float overshoot = 0.0f;         // allow sharpening past local min/max (0 = no halos), 0..1
 	float deband = 0.3f;            // gradient banding removal, 0 = off
 	float paper_white = 203.0f;     // used to put SDR and HDR on one scale for ambient light
 	bool ai_hdr = false;            // NVIDIA RTX Video HDR for SDR streams on an HDR display
@@ -148,7 +151,10 @@ private:
 	void ProcessFrame(AVFrame *frame, const ProcessOptions &o);
 	bool ShaderUpscale(int tw, int th, const ProcessOptions &o);
 	// deband + sharpen from `src` (tw x th) into proc[latest]; false if nothing to do
-	bool PostProcess(ID3D11ShaderResourceView *src, int tw, int th, float deband, float deband_scale, float sharpness, float noise_floor);
+	bool PostProcess(ID3D11ShaderResourceView *src, int tw, int th, float deband, float deband_scale, float sharpness,
+			float noise_floor, const ProcessOptions &o);
+	void Sharpen(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst, int w, int h, float sharpness,
+			float noise_floor, const ProcessOptions &o);
 	void Deband(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst, int w, int h, float strength, float scale);
 	void DrawVideoOut(ID3D11RenderTargetView *rtv, int w, int h, ID3D11ShaderResourceView *video, int vw, int vh,
 			bool content_hdr, bool out_hdr, const PresentOptions &o, bool with_ambient, bool full_rect);
@@ -208,6 +214,7 @@ private:
 	int last_tw = 0, last_th = 0, last_mode = -1;
 	bool last_ai_hdr = false;
 	Target clean, clean2, up_tmp, vp_out, post_tmp;
+	Target clar1, clar2, clar3;
 	DXGI_FORMAT vp_format = DXGI_FORMAT_R10G10B10A2_UNORM;
 	float paper_white_proc = 203.0f;
 	std::string upscaler_status = "Off";

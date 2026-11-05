@@ -49,8 +49,13 @@ struct Settings
 	int upscale_mode = 0;       // 0 off, 1 enhanced (shader), 2 AI super resolution (NVIDIA RTX / Intel, falls back to enhanced)
 	int upscale_target = 0;     // output height: 0 = match the display, or 1440 / 1800 / 2160
 	float artifact_reduction = 0.4f; // removes compression blocking/noise before upscaling (enhanced mode)
-	float sharpness = 0.6f;     // 0..1, enhanced mode
-	float ai_sharpness = 0.5f;  // 0..1, extra RCAS sharpening on top of RTX / Intel super resolution
+	float sharpness = 0.7f;     // 0..2, enhanced mode
+	float ai_sharpness = 0.7f;  // 0..2, sharpening on top of RTX / Intel super resolution
+	float texture_boost = 0.25f; // 0..1, fine texture
+	float clarity = 0.15f;      // 0..1, large-radius local contrast
+	float overshoot = 0.0f;     // 0..1, allow some halo for extra punch
+	int detail_preset = 2;      // 0 off, 1 natural, 2 sharp, 3 ultra, 4 maximum, 5 custom
+	void ApplyDetailPreset(int preset);
 	float deband = 0.3f;        // 0..1, removes banding in gradients (skies, fog, dark scenes)
 	int frame_gen = 0;          // 0 off, 1 auto (highest your display allows), 2/3/4 = 2x/3x/4x (120/180/240 fps)
 	float paper_white_nits = 203.0f; // brightness of SDR content/UI on an HDR display

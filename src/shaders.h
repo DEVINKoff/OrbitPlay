@@ -220,7 +220,17 @@ float4 main(VSOut i) : SV_Target
 // crispness to the AI/upscaled image without halos or grain.
 static const char *kPsSharpen = R"HLSL(
 Texture2D<float4> src : register(t0);
-cbuffer SharpCB : register(b0) { float sharpness; float noise_floor; float2 pads; };
+Texture2D<float4> clarityBlur : register(t1);   // large-radius blur of the image (low res)
+SamplerState samp : register(s0);
+cbuffer SharpCB : register(b0)
+{
+	float sharpness;      // 0..2  edges (RCAS + 5x5 detail)
+	float noise_floor;
+	float texture_boost;  // 0..1  fine texture (1 px scale)
+	float clarity;        // 0..1  local contrast (large radius)
+	float overshoot;      // 0..1  how far past the local min/max sharpening may go (0 = no halos)
+	float3 pads;
+};
 float Max3(float3 v) { return max(v.x, max(v.y, v.z)); }
 float4 main(VSOut i) : SV_Target
 {
@@ -233,38 +243,34 @@ float4 main(VSOut i) : SV_Target
 	float3 f = src.Load(int3(clamp(p + int2(1, 0), 0, m), 0)).rgb;
 	float3 hh = src.Load(int3(clamp(p + int2(0, 1), 0, m), 0)).rgb;
 
+	// 1) RCAS: largest negative lobe that keeps the result inside [0, 1]
 	float3 mn4 = min(min(b, d), min(f, hh));
 	float3 mx4 = max(max(b, d), max(f, hh));
-	// largest negative lobe that keeps the result inside [0, 1]
 	float3 hitMin = min(mn4, e) / max(4.0 * mx4, 1e-5);
 	float3 hitMax = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, -1e-5);
 	float3 lobeRGB = max(-hitMin, hitMax);
-	float lobe = max(-0.1875, min(Max3(lobeRGB), 0.0)) * sharpness;
+	// above 1.0 the strength keeps rising, but the lobe stays within RCAS's stable limit
+	float lobe = max(-0.1875, min(Max3(lobeRGB), 0.0) * sharpness);
 
-	// noise detection: a lone pixel that differs from all its neighbours is noise, not detail
 	float bL = Luma(b), dL = Luma(d), eL = Luma(e), fL = Luma(f), hL = Luma(hh);
 	float range = max(max(max(bL, dL), max(fL, hL)), eL) - min(min(min(bL, dL), min(fL, hL)), eL);
 	float nz = 0.25 * (bL + dL + fL + hL) - eL;
 	nz = saturate(abs(nz) / max(range, 1e-5));
 	nz = 1.0 - 0.5 * nz;
-	// and very low-contrast areas (compression noise, film grain) are left alone
 	nz *= smoothstep(noise_floor * 0.5, noise_floor * 1.5 + 0.004, range);
 	lobe *= nz;
-
 	float3 outc = (lobe * (b + d + f + hh) + e) / (4.0 * lobe + 1.0);
 
-	// Second, wider scale: upscaled (and AI) edges are several pixels wide, more than a 3x3
-	// kernel can tighten. Add back detail against a 5x5 Gaussian, gated on real contrast, and
-	// clamp to the 3x3 range so it can never create halos.
+	// 2) wider edge detail (5x5 Gaussian unsharp) and 3) fine texture (3x3)
 	static const float g[5] = { 0.1201, 0.2339, 0.2920, 0.2339, 0.1201 }; // sigma 1.4
-	float3 blur = 0.0;
+	float3 blur5 = 0.0, box3 = 0.0;
 	float l5min = 1e9, l5max = -1e9;
 	float3 mn3 = e, mx3 = e;
 	[unroll] for(int y = -2; y <= 2; y++)
 		[unroll] for(int x = -2; x <= 2; x++)
 		{
 			float3 t = src.Load(int3(clamp(p + int2(x, y), 0, m), 0)).rgb;
-			blur += t * (g[y + 2] * g[x + 2]);
+			blur5 += t * (g[y + 2] * g[x + 2]);
 			float lt = Luma(t);
 			l5min = min(l5min, lt);
 			l5max = max(l5max, lt);
@@ -272,11 +278,30 @@ float4 main(VSOut i) : SV_Target
 			{
 				mn3 = min(mn3, t);
 				mx3 = max(mx3, t);
+				box3 += t;
 			}
 		}
+	box3 /= 9.0;
 	float gate = smoothstep(noise_floor, 3.0 * noise_floor + 0.01, l5max - l5min);
-	outc += (e - blur) * (2.2 * sharpness) * gate;
-	return float4(clamp(outc, mn3, mx3), 1.0);
+	outc += (e - blur5) * (2.2 * sharpness) * gate;
+	// texture works on luma only, so it adds detail without color noise
+	float texDetail = eL - Luma(box3);
+	float texGate = smoothstep(noise_floor * 0.7, noise_floor * 2.0 + 0.006, l5max - l5min);
+	outc += texDetail * (2.5 * texture_boost) * texGate;
+
+	// Anti-halo clamp, optionally relaxed for a punchier look
+	float3 spread = (mx3 - mn3) * (0.35 * overshoot);
+	outc = clamp(outc, mn3 - spread, mx3 + spread);
+
+	// 4) clarity: local contrast against a large-radius blur, strongest in the midtones
+	if(clarity > 0.0)
+	{
+		float lb = Luma(clarityBlur.SampleLevel(samp, i.uv, 0).rgb);
+		float lc = Luma(outc);
+		float mid = saturate(4.0 * lc * (1.0 - lc));
+		outc += (lc - lb) * (0.9 * clarity) * mid;
+	}
+	return float4(saturate(outc), 1.0);
 }
 )HLSL";
 

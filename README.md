@@ -33,6 +33,18 @@ compression discarded. Generated frames look like real 120/240 fps motion, but t
 (about 8 ms at 2x and 12 ms at 4x) and can show artifacts on very fast or chaotic motion. For
 competitive games, leave frame generation off.
 
+**Detail levels** (Image tab, or **F7/F8** while playing): Off, Natural, Sharp, Ultra and Maximum.
+They stack edge sharpening (up to 2x, past the usual RCAS limit), fine **Texture**, large-radius
+**Clarity** and optional **Punch** (allowed halo) on top of RTX Video Super Resolution or the Enhanced
+upscaler. Ultra and Maximum make compression noise more visible. Use split-screen compare (F6) to
+pick a level.
+
+**Why there's no DLSS:** DLSS has to be built into the game engine. It needs the game's depth
+buffer, per-pixel motion vectors and sub-pixel camera jitter every frame, and a Remote Play stream
+only carries compressed video, so none of those exist. RTX Video Super Resolution is NVIDIA's AI
+model for upscaling video. The DLSS SDK's license also doesn't allow combining it with open-source
+(AGPL) software like this app.
+
 **NVIDIA tip:** if AI upscaling seems to do nothing, open the NVIDIA App (or NVIDIA Control Panel) →
 *RTX Video Enhancement*, turn on **Super Resolution** and pick quality **4**. For AI HDR, turn on
 **RTX Video HDR** there and enable Windows HDR.
@@ -79,7 +91,7 @@ then press a key, mouse button or wheel direction.
 | Statistics overlay | **F2** |
 | Cycle upscaling / frame generation | **F3** / **F4** |
 | Ambient light on/off, split-screen compare | **F5** / **F6** |
-| Sharpness - / + | **F7** / **F8** |
+| Detail level - / + (Ctrl: fine sharpness) | **F7** / **F8** |
 | Picture mode, microphone | **F9** / **F10** |
 | Screenshot | **F12** |
 

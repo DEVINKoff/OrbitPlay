@@ -125,6 +125,23 @@ Settings::Settings()
 // ---------------------------------------------------------------------------
 // Picture presets
 
+void Settings::ApplyDetailPreset(int preset)
+{
+	//                         off   natural sharp ultra maximum
+	static const float sh[] = { 0.0f, 0.35f, 0.70f, 1.10f, 1.60f };
+	static const float tx[] = { 0.0f, 0.00f, 0.25f, 0.50f, 0.85f };
+	static const float cl[] = { 0.0f, 0.00f, 0.15f, 0.30f, 0.50f };
+	static const float ov[] = { 0.0f, 0.00f, 0.00f, 0.20f, 0.45f };
+	detail_preset = preset;
+	if(preset < 0 || preset > 4)
+		return; // custom keeps the current values
+	ai_sharpness = sh[preset];
+	sharpness = sh[preset];
+	texture_boost = tx[preset];
+	clarity = cl[preset];
+	overshoot = ov[preset];
+}
+
 void Settings::ApplyPicturePreset(int preset)
 {
 	picture_preset = preset;
@@ -228,6 +245,13 @@ void Settings::Load(const std::string &path)
 	flt("artifact_reduction", artifact_reduction);
 	flt("sharpness", sharpness);
 	flt("ai_sharpness", ai_sharpness);
+	flt("texture_boost", texture_boost);
+	flt("clarity", clarity);
+	flt("overshoot", overshoot);
+	if(g.count("detail_preset"))
+		num("detail_preset", detail_preset);
+	else
+		detail_preset = 5; // settings from an older version: keep their values, show as custom
 	flt("deband", deband);
 	num("frame_gen_mode", frame_gen);
 	flt("paper_white_nits", paper_white_nits);
@@ -313,6 +337,10 @@ void Settings::Save(const std::string &path) const
 	o << "artifact_reduction=" << artifact_reduction << "\n";
 	o << "sharpness=" << sharpness << "\n";
 	o << "ai_sharpness=" << ai_sharpness << "\n";
+	o << "texture_boost=" << texture_boost << "\n";
+	o << "clarity=" << clarity << "\n";
+	o << "overshoot=" << overshoot << "\n";
+	o << "detail_preset=" << detail_preset << "\n";
 	o << "deband=" << deband << "\n";
 	o << "frame_gen_mode=" << frame_gen << "\n";
 	o << "paper_white_nits=" << paper_white_nits << "\n";

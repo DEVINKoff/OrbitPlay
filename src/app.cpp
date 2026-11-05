@@ -193,6 +193,9 @@ ProcessOptions App::MakeProcessOptions() const
 	o.artifact_reduction = settings.artifact_reduction;
 	o.sharpness = settings.sharpness;
 	o.ai_sharpness = settings.ai_sharpness;
+	o.texture_boost = settings.texture_boost;
+	o.clarity = settings.clarity;
+	o.overshoot = settings.overshoot;
 	o.deband = settings.deband;
 	o.paper_white = settings.paper_white_nits;
 	o.ai_hdr = settings.ai_hdr;
@@ -1188,11 +1191,31 @@ void App::UiUpscaleSection()
 	}
 
 	bool ai = settings.upscale_mode == 2 && ai_available;
+	Row("Detail level");
+	const char *levels[] = { "Off", "Natural", "Sharp", "Ultra", "Maximum", "Custom" };
+	int level = std::clamp(settings.detail_preset, 0, 5);
+	if(ImGui::Combo("##detail", &level, levels, 6))
+	{
+		settings.ApplyDetailPreset(level);
+		changed = true;
+	}
+	bool custom = false;
 	Row("Sharpness");
-	if(ai)
-		changed |= ImGui::SliderFloat("##aisharp", &settings.ai_sharpness, 0.0f, 1.0f, settings.ai_sharpness < 0.01f ? "Off (AI only)" : "%.2f");
-	else
-		changed |= ImGui::SliderFloat("##sharp", &settings.sharpness, 0.0f, 1.0f, settings.sharpness < 0.01f ? "Off" : "%.2f");
+	float &sh = ai ? settings.ai_sharpness : settings.sharpness;
+	custom |= ImGui::SliderFloat("##sharp", &sh, 0.0f, 2.0f, sh < 0.01f ? "Off" : (sh > 1.0f ? "%.2f (extreme)" : "%.2f"));
+	Row("Texture");
+	custom |= ImGui::SliderFloat("##texture", &settings.texture_boost, 0.0f, 1.0f, settings.texture_boost < 0.01f ? "Off" : "%.2f");
+	Row("Clarity");
+	custom |= ImGui::SliderFloat("##clarity", &settings.clarity, 0.0f, 1.0f, settings.clarity < 0.01f ? "Off" : "%.2f");
+	Row("Punch (allow halo)");
+	custom |= ImGui::SliderFloat("##overshoot", &settings.overshoot, 0.0f, 1.0f, settings.overshoot < 0.01f ? "Off (no halos)" : "%.2f");
+	if(custom)
+	{
+		settings.detail_preset = 5;
+		changed = true;
+	}
+	RowHelp("Sharpness tightens edges, Texture brings out fine surface detail, Clarity adds depth with local contrast. "
+		"Ultra and Maximum push far past what RTX does alone; they also show more compression noise.");
 	Row("Deband");
 	changed |= ImGui::SliderFloat("##deband", &settings.deband, 0.0f, 1.0f, settings.deband < 0.01f ? "Off" : "%.2f");
 	ImGui::BeginDisabled(ai);
@@ -1215,7 +1238,7 @@ void App::UiUpscaleSection()
 	Row("Compare");
 	if(ImGui::Checkbox("Split screen: original | enhanced (F6)", &compare_on))
 		ShowToast(compare_on ? "Compare on: original left, enhanced right" : "Compare off");
-	RowHelp("With the menu open you can drag the divider with the mouse. F7 / F8 change sharpness live.");
+	RowHelp("With the menu open you can drag the divider with the mouse. F7 / F8 step the detail level live.");
 
 	Row("AI HDR for SDR games");
 	ImGui::BeginDisabled(!renderer.AiHdrAvailable());
@@ -1392,7 +1415,7 @@ void App::UiSystemSection()
 	static const char *keys[][2] = {
 		{ "Esc / F1", "Stream menu (frees the mouse)" }, { "F2", "Statistics" }, { "F3", "Cycle upscaling" },
 		{ "F4", "Cycle frame generation" }, { "F5", "Ambient light on/off" }, { "F6", "Split-screen compare" },
-		{ "F7 / F8", "Sharpness - / +" }, { "F9", "Cycle picture mode" }, { "F10", "Microphone on/off" },
+		{ "F7 / F8", "Detail level - / +   (Ctrl: fine sharpness)" }, { "F9", "Cycle picture mode" }, { "F10", "Microphone on/off" },
 		{ "F11", "Fullscreen" }, { "F12", "Screenshot" },
 	};
 	for(auto &k : keys)
@@ -1660,16 +1683,33 @@ bool App::HandleHotkey(SDL_Keycode key)
 			break;
 		case SDLK_F6:
 			compare_on = !compare_on;
-			ShowToast(compare_on ? "Compare: original left | enhanced right (F7/F8 sharpness)" : "Compare off");
+			ShowToast(compare_on ? "Compare: original left | enhanced right (F7/F8 detail level)" : "Compare off");
 			return true;
 		case SDLK_F7:
 		case SDLK_F8:
 		{
+			if(settings.upscale_mode == 0)
+			{
+				ShowToast("Turn on upscaling (F3) to use detail enhancement");
+				return true;
+			}
 			bool ai = settings.upscale_mode == 2 && renderer.AiSuperResolutionAvailable();
-			float &v = ai ? settings.ai_sharpness : settings.sharpness;
-			v = std::clamp(v + (key == SDLK_F8 ? 0.05f : -0.05f), 0.0f, 1.0f);
-			snprintf(buf, sizeof(buf), "Sharpness %.2f%s", v, ai ? " (on top of AI)" : "");
-			ShowToast(settings.upscale_mode == 0 ? std::string("Turn on upscaling (F3) to use sharpening") : std::string(buf));
+			const char *levels[] = { "Off", "Natural", "Sharp", "Ultra", "Maximum", "Custom" };
+			if(SDL_GetModState() & SDL_KMOD_CTRL)
+			{
+				// fine tune sharpness
+				float &v = ai ? settings.ai_sharpness : settings.sharpness;
+				v = std::clamp(v + (key == SDLK_F8 ? 0.05f : -0.05f), 0.0f, 2.0f);
+				settings.detail_preset = 5;
+				snprintf(buf, sizeof(buf), "Sharpness %.2f%s", v, ai ? " (on top of RTX)" : "");
+			}
+			else
+			{
+				int cur = settings.detail_preset > 4 ? 2 : settings.detail_preset;
+				settings.ApplyDetailPreset(std::clamp(cur + (key == SDLK_F8 ? 1 : -1), 0, 4));
+				snprintf(buf, sizeof(buf), "Detail: %s%s", levels[settings.detail_preset], ai ? " (on top of RTX)" : "");
+			}
+			ShowToast(buf);
 			break;
 		}
 		case SDLK_F9:

@@ -26,7 +26,7 @@ extern "C" {
 struct YuvCB { float rows[12]; float uv_scale[2]; float pad[2]; };
 struct DenoiseCB { float strength; float pad[3]; };
 struct UpCB { float src_size[2]; float edge_strength; float pad; };
-struct SharpCB { float sharpness; float noise_floor; float pad[2]; };
+struct SharpCB { float sharpness; float noise_floor; float texture_boost; float clarity; float overshoot; float pad[3]; };
 struct DebandCB { float threshold; float radius; float seed; float grain; };
 struct AmbDownCB { int decode; float paper_white; float pad[2]; };
 struct OutCB
@@ -814,7 +814,7 @@ void Renderer::ProcessFrame(AVFrame *frame, const ProcessOptions &o)
 		UINT index = (UINT)(intptr_t)frame->data[1];
 		bool out_hdr = video_hdr || want_ai_hdr;
 		float scale = (float)th / (float)video_h;
-		bool post = (upscaling && (o.ai_sharpness > 0.01f || o.deband > 0.01f));
+		bool post = upscaling && (o.ai_sharpness > 0.01f || o.deband > 0.01f || o.texture_boost > 0.01f || o.clarity > 0.01f);
 		// The video processor writes 10-bit RGB where supported (needed for HDR)
 		DXGI_FORMAT vfmt = vp->OutputFormatSupported(DXGI_FORMAT_R10G10B10A2_UNORM) ? DXGI_FORMAT_R10G10B10A2_UNORM
 			: DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -835,7 +835,10 @@ void Renderer::ProcessFrame(AVFrame *frame, const ProcessOptions &o)
 			if(!direct)
 			{
 				ID3D11ShaderResourceView *srv = vp_out.srv.Get();
-				if(!PostProcess(srv, tw, th, upscaling ? o.deband : 0.0f, scale, upscaling ? o.ai_sharpness : 0.0f, 0.012f))
+				ProcessOptions po = o;
+				if(!upscaling)
+					po.texture_boost = po.clarity = 0.0f;
+				if(!PostProcess(srv, tw, th, upscaling ? o.deband : 0.0f, scale, upscaling ? o.ai_sharpness : 0.0f, 0.012f, po))
 				{
 					// nothing to do but format conversion
 					DrawFullscreen(ps_sharpen.Get(), proc[latest].rtv.Get(), tw, th, &srv, 1, nullptr);
@@ -851,8 +854,8 @@ void Renderer::ProcessFrame(AVFrame *frame, const ProcessOptions &o)
 			if(!vp->SuperResolutionActive() && want_ai_sr)
 				st += " (driver declined - check driver settings)";
 			char res[96];
-			snprintf(res, sizeof(res), "  %dx%d  sharpen %.2f  deband %.2f", tw, th, upscaling ? o.ai_sharpness : 0.0f,
-				upscaling ? o.deband : 0.0f);
+			snprintf(res, sizeof(res), "  %dx%d  sharpen %.2f  texture %.2f  clarity %.2f", tw, th,
+				upscaling ? o.ai_sharpness : 0.0f, upscaling ? o.texture_boost : 0.0f, upscaling ? o.clarity : 0.0f);
 			upscaler_status = st + res;
 			return;
 		}
@@ -906,20 +909,15 @@ bool Renderer::ShaderUpscale(int tw, int th, const ProcessOptions &o)
 	u.src_size[1] = (float)video_h;
 	u.edge_strength = 1.0f;
 	UpdateCB(cb_up.Get(), &u, sizeof(u));
-	bool sharpen = o.sharpness > 0.01f;
+	bool sharpen = o.sharpness > 0.01f || o.texture_boost > 0.01f || o.clarity > 0.01f;
 	if(sharpen)
 	{
 		if(!EnsureTarget(up_tmp, tw, th, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false))
 			return false;
 		DrawFullscreen(ps_edge.Get(), up_tmp.rtv.Get(), tw, th, &src, 1, cb_up.Get());
 
-		// Noise-gated sharpening at output resolution
-		SharpCB s = {};
-		s.sharpness = o.sharpness;
-		s.noise_floor = 0.008f + 0.02f * o.artifact_reduction;
-		UpdateCB(cb_sharp.Get(), &s, sizeof(s));
-		ID3D11ShaderResourceView *up = up_tmp.srv.Get();
-		DrawFullscreen(ps_sharpen.Get(), proc[latest].rtv.Get(), tw, th, &up, 1, cb_sharp.Get());
+		// Noise-gated detail enhancement at output resolution
+		Sharpen(up_tmp.srv.Get(), proc[latest].rtv.Get(), tw, th, o.sharpness, 0.008f + 0.02f * o.artifact_reduction, o);
 	}
 	else
 		DrawFullscreen(ps_edge.Get(), proc[latest].rtv.Get(), tw, th, &src, 1, cb_up.Get());
@@ -937,10 +935,50 @@ void Renderer::Deband(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst
 	DrawFullscreen(ps_deband.Get(), dst, w, h, &src, 1, cb_deband.Get());
 }
 
-bool Renderer::PostProcess(ID3D11ShaderResourceView *src, int tw, int th, float deband, float deband_scale,
-		float sharpness, float noise_floor)
+void Renderer::Sharpen(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst, int w, int h, float sharpness,
+		float noise_floor, const ProcessOptions &o)
 {
-	bool do_deband = deband > 0.01f, do_sharpen = sharpness > 0.01f;
+	// Clarity needs a large-radius blur: build it at 1/16 resolution (two box passes + a soft blur)
+	ID3D11ShaderResourceView *clar = nullptr;
+	if(o.clarity > 0.01f)
+	{
+		int w1 = std::max(1, w / 8), h1 = std::max(1, h / 8);
+		int w2 = std::max(1, w1 / 2), h2 = std::max(1, h1 / 2);
+		if(EnsureTarget(clar1, w1, h1, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true)
+			&& EnsureTarget(clar2, w2, h2, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true)
+			&& EnsureTarget(clar3, w2, h2, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true))
+		{
+			AmbDownCB dcb = {};
+			dcb.decode = 0;
+			UpdateCB(cb_amb_down.Get(), &dcb, sizeof(dcb));
+			ID3D11ShaderResourceView *s0 = src;
+			Dispatch(cs_box8.Get(), &s0, 1, clar1.uav.Get(), cb_amb_down.Get(), w1, h1);
+			s0 = clar1.srv.Get();
+			Dispatch(cs_box8.Get(), &s0, 1, clar2.uav.Get(), cb_amb_down.Get(), w2, h2);
+			AmbCB a = {};
+			a.alpha = 1.0f;
+			UpdateCB(cb_amb.Get(), &a, sizeof(a));
+			ID3D11ShaderResourceView *bs[2] = { clar2.srv.Get(), clar2.srv.Get() };
+			Dispatch(cs_amb_blend.Get(), bs, 2, clar3.uav.Get(), cb_amb.Get(), w2, h2);
+			clar = clar3.srv.Get();
+		}
+	}
+	SharpCB c = {};
+	c.sharpness = std::clamp(sharpness, 0.0f, 2.0f);
+	c.noise_floor = noise_floor;
+	c.texture_boost = std::clamp(o.texture_boost, 0.0f, 1.0f);
+	c.clarity = clar ? std::clamp(o.clarity, 0.0f, 1.0f) : 0.0f;
+	c.overshoot = std::clamp(o.overshoot, 0.0f, 1.0f);
+	UpdateCB(cb_sharp.Get(), &c, sizeof(c));
+	ID3D11ShaderResourceView *srvs[2] = { src, clar };
+	DrawFullscreen(ps_sharpen.Get(), dst, w, h, srvs, 2, cb_sharp.Get());
+}
+
+bool Renderer::PostProcess(ID3D11ShaderResourceView *src, int tw, int th, float deband, float deband_scale,
+		float sharpness, float noise_floor, const ProcessOptions &o)
+{
+	bool do_deband = deband > 0.01f;
+	bool do_sharpen = sharpness > 0.01f || o.texture_boost > 0.01f || o.clarity > 0.01f;
 	if(!do_deband && !do_sharpen)
 		return false;
 	if(do_deband)
@@ -958,11 +996,7 @@ bool Renderer::PostProcess(ID3D11ShaderResourceView *src, int tw, int th, float 
 			return true;
 		}
 	}
-	SharpCB s = {};
-	s.sharpness = sharpness;
-	s.noise_floor = noise_floor;
-	UpdateCB(cb_sharp.Get(), &s, sizeof(s));
-	DrawFullscreen(ps_sharpen.Get(), proc[latest].rtv.Get(), tw, th, &src, 1, cb_sharp.Get());
+	Sharpen(src, proc[latest].rtv.Get(), tw, th, sharpness, noise_floor, o);
 	return true;
 }
 
