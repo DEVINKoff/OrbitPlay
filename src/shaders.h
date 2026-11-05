@@ -154,6 +154,10 @@ cbuffer UpCB : register(b0) { float2 src_size; float edge_strength; float padu; 
 float SincU(float x) { x *= 3.14159265; return abs(x) < 1e-4 ? 1.0 : sin(x) / x; }
 float Lanczos2R(float r) { return r < 2.0 ? SincU(r) * SincU(r * 0.5) : 0.0; }
 
+// Edge-directed upscale. Edge orientation comes from the local structure tensor (gradients
+// summed over the 2x2 texels around the sample, bilinearly weighted). Its coherence says how
+// "line-like" the area is: the kernel gets narrower across lines and longer along them, so
+// diagonal edges come out smooth and crisp while textures and flat areas get a plain Lanczos.
 float4 main(VSOut i) : SV_Target
 {
 	float2 pos = i.uv * src_size - 0.5;
@@ -170,21 +174,27 @@ float4 main(VSOut i) : SV_Target
 			L[y][x] = Luma(c[y][x]);
 		}
 
-	// Gradient around the sample point (central differences on the inner 2x2, bilinear weighted)
-	float2 g = 0.0;
 	float wts[2][2] = { { (1 - f.x) * (1 - f.y), f.x * (1 - f.y) }, { (1 - f.x) * f.y, f.x * f.y } };
+	float jxx = 0, jxy = 0, jyy = 0;
 	[unroll] for(int yy = 1; yy <= 2; yy++)
 		[unroll] for(int xx = 1; xx <= 2; xx++)
 		{
-			float2 d = float2(L[yy][xx + 1] - L[yy][xx - 1], L[yy + 1][xx] - L[yy - 1][xx]);
-			g += d * wts[yy - 1][xx - 1];
+			float gx = (L[yy][xx + 1] - L[yy][xx - 1]) * 0.5;
+			float gy = (L[yy + 1][xx] - L[yy - 1][xx]) * 0.5;
+			float w = wts[yy - 1][xx - 1];
+			jxx += gx * gx * w; jxy += gx * gy * w; jyy += gy * gy * w;
 		}
-	float len = length(g);
-	float s = saturate(len * 6.0) * edge_strength;
-	float2 n = len > 1e-5 ? g / len : float2(1, 0);
+	// eigen decomposition of [[jxx, jxy], [jxy, jyy]]
+	float tr = jxx + jyy;
+	float dt = sqrt(max((jxx - jyy) * (jxx - jyy) + 4.0 * jxy * jxy, 0.0));
+	float l1 = 0.5 * (tr + dt), l2 = 0.5 * (tr - dt);
+	float coherence = tr > 1e-7 ? (l1 - l2) / (l1 + l2 + 1e-7) : 0.0;
+	float2 n = abs(jxy) > 1e-7 ? normalize(float2(l1 - jyy, jxy)) : (jxx >= jyy ? float2(1, 0) : float2(0, 1));
 	float2 t = float2(-n.y, n.x);
-	float across = 1.0 + 0.7 * s; // narrower across the edge -> crisp edges
-	float along = 1.0 - 0.5 * s;  // wider along the edge -> smooth, unjagged lines
+	// only real edges (enough contrast) get the directional kernel
+	float s = coherence * coherence * saturate(sqrt(l1) * 24.0) * edge_strength;
+	float across = 1.0 + 0.6 * s;
+	float along = 1.0 - 0.55 * s;
 
 	float3 acc = 0.0;
 	float wsum = 0.0;
@@ -205,27 +215,108 @@ float4 main(VSOut i) : SV_Target
 }
 )HLSL";
 
+// Robust contrast-adaptive sharpening (algorithm after AMD FidelityFX RCAS, MIT license).
+// Sharpens only as far as it can without clipping, and backs off on noise, so it adds
+// crispness to the AI/upscaled image without halos or grain.
 static const char *kPsSharpen = R"HLSL(
 Texture2D<float4> src : register(t0);
 cbuffer SharpCB : register(b0) { float sharpness; float noise_floor; float2 pads; };
+float Max3(float3 v) { return max(v.x, max(v.y, v.z)); }
+float4 main(VSOut i) : SV_Target
+{
+	int2 p = int2(i.pos.xy);
+	int w, h; src.GetDimensions(w, h);
+	int2 m = int2(w - 1, h - 1);
+	float3 b = src.Load(int3(clamp(p + int2(0, -1), 0, m), 0)).rgb;
+	float3 d = src.Load(int3(clamp(p + int2(-1, 0), 0, m), 0)).rgb;
+	float3 e = src.Load(int3(p, 0)).rgb;
+	float3 f = src.Load(int3(clamp(p + int2(1, 0), 0, m), 0)).rgb;
+	float3 hh = src.Load(int3(clamp(p + int2(0, 1), 0, m), 0)).rgb;
+
+	float3 mn4 = min(min(b, d), min(f, hh));
+	float3 mx4 = max(max(b, d), max(f, hh));
+	// largest negative lobe that keeps the result inside [0, 1]
+	float3 hitMin = min(mn4, e) / max(4.0 * mx4, 1e-5);
+	float3 hitMax = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, -1e-5);
+	float3 lobeRGB = max(-hitMin, hitMax);
+	float lobe = max(-0.1875, min(Max3(lobeRGB), 0.0)) * sharpness;
+
+	// noise detection: a lone pixel that differs from all its neighbours is noise, not detail
+	float bL = Luma(b), dL = Luma(d), eL = Luma(e), fL = Luma(f), hL = Luma(hh);
+	float range = max(max(max(bL, dL), max(fL, hL)), eL) - min(min(min(bL, dL), min(fL, hL)), eL);
+	float nz = 0.25 * (bL + dL + fL + hL) - eL;
+	nz = saturate(abs(nz) / max(range, 1e-5));
+	nz = 1.0 - 0.5 * nz;
+	// and very low-contrast areas (compression noise, film grain) are left alone
+	nz *= smoothstep(noise_floor * 0.5, noise_floor * 1.5 + 0.004, range);
+	lobe *= nz;
+
+	float3 outc = (lobe * (b + d + f + hh) + e) / (4.0 * lobe + 1.0);
+
+	// Second, wider scale: upscaled (and AI) edges are several pixels wide, more than a 3x3
+	// kernel can tighten. Add back detail against a 5x5 Gaussian, gated on real contrast, and
+	// clamp to the 3x3 range so it can never create halos.
+	static const float g[5] = { 0.1201, 0.2339, 0.2920, 0.2339, 0.1201 }; // sigma 1.4
+	float3 blur = 0.0;
+	float l5min = 1e9, l5max = -1e9;
+	float3 mn3 = e, mx3 = e;
+	[unroll] for(int y = -2; y <= 2; y++)
+		[unroll] for(int x = -2; x <= 2; x++)
+		{
+			float3 t = src.Load(int3(clamp(p + int2(x, y), 0, m), 0)).rgb;
+			blur += t * (g[y + 2] * g[x + 2]);
+			float lt = Luma(t);
+			l5min = min(l5min, lt);
+			l5max = max(l5max, lt);
+			if(abs(x) <= 1 && abs(y) <= 1)
+			{
+				mn3 = min(mn3, t);
+				mx3 = max(mx3, t);
+			}
+		}
+	float gate = smoothstep(noise_floor, 3.0 * noise_floor + 0.01, l5max - l5min);
+	outc += (e - blur) * (2.2 * sharpness) * gate;
+	return float4(clamp(outc, mn3, mx3), 1.0);
+}
+)HLSL";
+
+// Debanding: removes the stair-step bands compression leaves in skies, fog and dark
+// gradients. Compares the pixel with 4 points on a random ring; if they're all close it's a
+// smooth gradient, so it takes the average and adds a tiny dither to keep it smooth on screen.
+static const char *kPsDeband = R"HLSL(
+Texture2D<float4> src : register(t0);
+cbuffer DebandCB : register(b0) { float threshold; float radius; float seed; float grain; };
+float Hash(float2 p) { p = frac(p * float2(443.897, 441.423)); p += dot(p, p.yx + 19.19); return frac((p.x + p.y) * p.x); }
 float4 main(VSOut i) : SV_Target
 {
 	int2 p = int2(i.pos.xy);
 	int w, h; src.GetDimensions(w, h);
 	int2 m = int2(w - 1, h - 1);
 	float3 c = src.Load(int3(p, 0)).rgb;
-	float3 n = src.Load(int3(clamp(p + int2(0, -1), 0, m), 0)).rgb;
-	float3 s = src.Load(int3(clamp(p + int2(0, 1), 0, m), 0)).rgb;
-	float3 e = src.Load(int3(clamp(p + int2(1, 0), 0, m), 0)).rgb;
-	float3 wv = src.Load(int3(clamp(p + int2(-1, 0), 0, m), 0)).rgb;
-	float lc = Luma(c), ln = Luma(n), ls = Luma(s), le = Luma(e), lw = Luma(wv);
-	float lmin = min(lc, min(min(ln, ls), min(le, lw)));
-	float lmax = max(lc, max(max(ln, ls), max(le, lw)));
-	// Only sharpen real detail: flat/noisy areas (small local range) are left alone.
-	float gate = smoothstep(noise_floor, noise_floor * 3.0 + 0.02, lmax - lmin);
-	float lap = 4.0 * lc - (ln + ls + le + lw);
-	float target = clamp(lc + lap * 0.35 * sharpness * gate, lmin, lmax);
-	float3 outc = c + (target - lc); // luma only: no color fringes
+	float3 acc = c;
+	float3 wsum = 1.0;
+	[unroll] for(int k = 0; k < 2; k++)
+	{
+		float r = radius * (0.5 + 0.5 * Hash(i.pos.xy + seed + k * 7.31));
+		float a = Hash(i.pos.xy * 1.37 + seed * 3.1 + k * 3.7) * 6.2831853;
+		int2 o = int2(round(float2(cos(a), sin(a)) * r));
+		float3 s0 = src.Load(int3(clamp(p + o, 0, m), 0)).rgb;
+		float3 s1 = src.Load(int3(clamp(p - o, 0, m), 0)).rgb;
+		int2 o2 = int2(-o.y, o.x);
+		float3 s2 = src.Load(int3(clamp(p + o2, 0, m), 0)).rgb;
+		float3 s3 = src.Load(int3(clamp(p - o2, 0, m), 0)).rgb;
+		float3 avg = 0.25 * (s0 + s1 + s2 + s3);
+		float3 diff = max(max(abs(s0 - c), abs(s1 - c)), max(abs(s2 - c), abs(s3 - c)));
+		float3 wgt = saturate(1.0 - diff / threshold);
+		wgt *= wgt;
+		acc += avg * wgt;
+		wsum += wgt;
+	}
+	float3 outc = acc / wsum;
+	// triangular dither, about one 10-bit step, only where we smoothed
+	float n = Hash(i.pos.xy + seed * 11.0) + Hash(i.pos.yx * 1.7 + seed) - 1.0;
+	float smoothed = saturate((wsum.g - 1.0) * 0.5);
+	outc += n * grain * smoothed;
 	return float4(saturate(outc), 1.0);
 }
 )HLSL";
@@ -233,9 +324,18 @@ float4 main(VSOut i) : SV_Target
 // ---------------------------------------------------------------------------
 // Ambient lighting: tiny, temporally smoothed copy of the picture
 
+// Ambient light, level 1: averages blocks of the frame in LINEAR light (nits, BT.709),
+// decoding PQ or gamma first, so HDR and SDR streams produce the same, correct glow.
 static const char *kCsBox8 = R"HLSL(
 Texture2D<float4> src : register(t0);
 RWTexture2D<float4> dst : register(u0);
+cbuffer AmbDownCB : register(b0) { int decode; float paper_white_d; float2 padd; }; // decode: 0 none, 1 gamma, 2 PQ
+float3 Decode(float3 c)
+{
+	if(decode == 2) return max(mul(BT2020_TO_BT709, PqToLinear(c) * 10000.0), 0.0);
+	if(decode == 1) return pow(saturate(c), 2.2) * paper_white_d;
+	return c;
+}
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
@@ -243,13 +343,13 @@ void main(uint3 id : SV_DispatchThreadID)
 	if(id.x >= w || id.y >= h) return;
 	uint sw, sh; src.GetDimensions(sw, sh);
 	float2 scale = float2(sw, sh) / float2(w, h);
-	int2 o = int2(float2(id.xy) * scale);
+	float2 o = float2(id.xy) * scale;
 	int2 m = int2(sw - 1, sh - 1);
 	float3 acc = 0.0;
-	[unroll] for(int y = 0; y < 8; y++)
-		[unroll] for(int x = 0; x < 8; x++)
-			acc += src.Load(int3(min(o + int2(float2(x, y) * scale / 8.0), m), 0)).rgb;
-	dst[id.xy] = float4(acc / 64.0, 1.0);
+	[unroll] for(int y = 0; y < 4; y++)
+		[unroll] for(int x = 0; x < 4; x++)
+			acc += Decode(src.Load(int3(min(int2(o + (float2(x, y) + 0.5) * scale / 4.0), m), 0)).rgb);
+	dst[id.xy] = float4(acc / 16.0, 1.0);
 }
 )HLSL";
 
@@ -265,22 +365,27 @@ void main(uint3 id : SV_DispatchThreadID)
 	if(id.x >= w || id.y >= h) return;
 	int2 m = int2(w - 1, h - 1);
 	int2 p = int2(id.xy);
-	// small blur so the glow has no hard cells
 	float3 c = cur.Load(int3(p, 0)).rgb * 0.4
 		+ (cur.Load(int3(clamp(p + int2(1, 0), 0, m), 0)).rgb + cur.Load(int3(clamp(p - int2(1, 0), 0, m), 0)).rgb
 		 + cur.Load(int3(clamp(p + int2(0, 1), 0, m), 0)).rgb + cur.Load(int3(clamp(p - int2(0, 1), 0, m), 0)).rgb) * 0.15;
-	dst[id.xy] = float4(lerp(prev.Load(int3(p, 0)).rgb, c, alpha), 1.0);
+	float3 pr = prev.Load(int3(p, 0)).rgb;
+	// smooth steady scenes, but follow scene cuts / flashes quickly
+	float change = abs(Luma(c) - Luma(pr)) / (Luma(c) + Luma(pr) + 5.0);
+	float a = alpha >= 1.0 ? 1.0 : lerp(alpha, 0.75, saturate(change * 4.0));
+	dst[id.xy] = float4(lerp(pr, c, a), 1.0);
 }
 )HLSL";
 
 // ---------------------------------------------------------------------------
 // Final output: places the video (fit/fill/stretch), draws ambient light in the bars,
-// applies picture settings and converts to the swap chain's color space.
+// applies picture settings, optional split-screen comparison, and converts to the swap
+// chain's color space.
 //   mode 0: SDR video -> SDR output      mode 1: SDR video -> HDR10 output (optional HDR boost)
 //   mode 2: HDR video -> HDR10 output    mode 3: HDR video -> SDR output (tone mapped)
 static const char *kPsVideoOut = R"HLSL(
 Texture2D<float4> src : register(t0);
 Texture2D<float4> amb : register(t1);
+Texture2D<float4> orig : register(t2);
 SamplerState samp : register(s0);
 cbuffer OutCB : register(b0)
 {
@@ -298,7 +403,10 @@ cbuffer OutCB : register(b0)
 	float saturation;
 	float vibrance;
 	float2 win_size;
-	float2 padw;
+	float split;          // compare: x position of the divider in pixels, < 0 = off
+	int orig_mode;        // mode for the original (left) side
+	int ambient_style;    // 0 glow, 1 extend
+	float3 pado;
 };
 
 float3 Bicubic(float2 uv)
@@ -306,7 +414,6 @@ float3 Bicubic(float2 uv)
 	float2 pos = uv * src_size - 0.5;
 	float2 base = floor(pos);
 	float2 f = pos - base;
-	// Catmull-Rom weights
 	float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
 	float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
 	float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
@@ -345,68 +452,104 @@ float3 ToneMap(float3 nits709)
 	return x * (mt / m);
 }
 
+// Video signal (gamma or PQ) -> swap chain signal
+float3 EncodeVideo(float3 c, int m)
+{
+	if(m == 1)
+	{
+		float3 lin = pow(c, 2.2);
+		if(hdr_boost > 0.0)
+		{
+			float y = Luma(lin);
+			float knee = 0.55;
+			if(y > knee)
+			{
+				float gain = 1.0 + hdr_boost * (max(peak / paper_white, 1.0) - 1.0);
+				lin *= (knee + (y - knee) * gain) / y;
+			}
+		}
+		return LinearToPq(mul(BT709_TO_BT2020, lin) * (paper_white / 10000.0));
+	}
+	if(m == 3)
+	{
+		float3 nits = mul(BT2020_TO_BT709, PqToLinear(c) * 10000.0);
+		return pow(saturate(ToneMap(nits)), 1.0 / 2.2);
+	}
+	return c;
+}
+
+// Linear light (nits, BT.709) -> swap chain signal
+float3 EncodeLinear(float3 nits)
+{
+	bool hdr_out = mode == 1 || mode == 2;
+	if(hdr_out)
+		return LinearToPq(max(mul(BT709_TO_BT2020, nits), 0.0) / 10000.0);
+	return pow(saturate(nits / paper_white), 1.0 / 2.2);
+}
+
+// Ambient light, computed in linear light so it looks the same in SDR and HDR, and capped so
+// that bright HDR highlights at the picture's edge never turn the bars into floodlights.
 float3 Ambient(float2 p)
 {
 	float2 lo = vid_rect.xy, hi = vid_rect.xy + vid_rect.zw;
 	float2 q = clamp(p, lo, hi);
 	float2 d = p - q;
 	bool side = abs(d.x) > abs(d.y);
-	// distance into the bar, normalized by the size of the bar on that side
 	float barSize = side ? (p.x < lo.x ? lo.x : win_size.x - hi.x) : (p.y < lo.y ? lo.y : win_size.y - hi.y);
 	barSize = max(barSize, 1.0);
 	float dn = saturate(length(d) / barSize);
 	float2 quv = (q - lo) / max(vid_rect.zw, 1.0);
-	quv = lerp(quv, 0.5, 0.05);
 	float2 along = side ? float2(0, 1) : float2(1, 0);
-	float spread = 0.05 + 0.15 * dn;
-	float3 c = amb.SampleLevel(samp, quv, 0).rgb * 0.36
-		+ (amb.SampleLevel(samp, quv + along * spread, 0).rgb + amb.SampleLevel(samp, quv - along * spread, 0).rgb) * 0.22
-		+ (amb.SampleLevel(samp, quv + along * spread * 2.0, 0).rgb + amb.SampleLevel(samp, quv - along * spread * 2.0, 0).rgb) * 0.10;
+	float2 inward = side ? float2(p.x < lo.x ? 1 : -1, 0) : float2(0, p.y < lo.y ? 1 : -1);
+
+	float3 c;
+	if(ambient_style == 1)
+	{
+		// "Extend": a blurred mirror of the picture continues into the bar, getting softer with distance
+		float2 muv = quv + inward * dn * 0.18;
+		float spread = 0.015 + 0.06 * dn;
+		c = amb.SampleLevel(samp, muv, 0).rgb * 0.4
+			+ (amb.SampleLevel(samp, muv + along * spread, 0).rgb + amb.SampleLevel(samp, muv - along * spread, 0).rgb) * 0.3;
+	}
+	else
+	{
+		// "Glow": soft colored light from the nearest part of the picture
+		quv = lerp(quv, 0.5, 0.04) + inward * 0.03;
+		float spread = 0.05 + 0.15 * dn;
+		c = amb.SampleLevel(samp, quv, 0).rgb * 0.36
+			+ (amb.SampleLevel(samp, quv + along * spread, 0).rgb + amb.SampleLevel(samp, quv - along * spread, 0).rgb) * 0.22
+			+ (amb.SampleLevel(samp, quv + along * spread * 2.0, 0).rgb + amb.SampleLevel(samp, quv - along * spread * 2.0, 0).rgb) * 0.10;
+		float l = Luma(c);
+		c = max(l + (c - l) * 1.3, 0.0);
+	}
+	// brightness cap: soft-knee at ~45% of SDR white, scaled by intensity
+	float cap = paper_white * 0.45 * ambient;
 	float l = Luma(c);
-	c = saturate(l + (c - l) * 1.35); // a bit more color, like a bias light
+	c *= (l > 1e-4) ? (cap * l / (l + cap)) / l : 0.0;
 	float fall = 1.0 - smoothstep(0.0, 1.0, dn);
-	return c * ambient * fall * fall;
+	return c * fall * fall * (ambient_style == 1 ? 1.4 : 1.0);
 }
 
 float4 main(VSOut i) : SV_Target
 {
 	float2 p = i.pos.xy;
 	float2 rel = (p - vid_rect.xy) / vid_rect.zw;
-	float3 c;
 	if(all(rel >= 0.0) && all(rel <= 1.0))
 	{
 		float2 uv = lerp(uv_rect.xy, uv_rect.zw, rel);
-		c = scaler == 1 ? Bicubic(uv) : src.SampleLevel(samp, uv, 0).rgb;
-		c = Picture(c);
-	}
-	else if(ambient > 0.0)
-		c = Ambient(p);
-	else
-		return float4(0, 0, 0, 1);
-
-	if(mode == 1)
-	{
-		float3 lin = pow(c, 2.2);
-		if(hdr_boost > 0.0)
+		if(split >= 0.0)
 		{
-			// Expand highlights above the knee toward the display's peak brightness
-			float y = Luma(lin);
-			float knee = 0.55;
-			if(y > knee)
-			{
-				float gain = 1.0 + hdr_boost * (max(peak / paper_white, 1.0) - 1.0);
-				float yb = knee + (y - knee) * gain;
-				lin *= yb / y;
-			}
+			if(abs(p.x - split) < 1.5)
+				return float4(EncodeLinear(float3(1, 1, 1) * paper_white * 0.8), 1.0);
+			if(p.x < split)
+				return float4(EncodeVideo(Picture(orig.SampleLevel(samp, uv, 0).rgb), orig_mode), 1.0);
 		}
-		c = LinearToPq(mul(BT709_TO_BT2020, lin) * (paper_white / 10000.0));
+		float3 c = scaler == 1 ? Bicubic(uv) : src.SampleLevel(samp, uv, 0).rgb;
+		return float4(EncodeVideo(Picture(c), mode), 1.0);
 	}
-	else if(mode == 3)
-	{
-		float3 nits = mul(BT2020_TO_BT709, PqToLinear(c) * 10000.0);
-		c = pow(saturate(ToneMap(nits)), 1.0 / 2.2);
-	}
-	return float4(c, 1.0);
+	if(ambient > 0.0)
+		return float4(EncodeLinear(Ambient(p)), 1.0);
+	return float4(0, 0, 0, 1);
 }
 )HLSL";
 

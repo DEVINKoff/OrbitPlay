@@ -43,6 +43,8 @@ bool App::Init()
 	}
 
 	settings.Load(settings_path);
+	for(int i = 0; i < KeyboardMouse::ActionCount; i++)
+		kbm.bindings[i] = settings.bindings[i];
 	strncpy(account_buf, settings.psn_account_id.c_str(), sizeof(account_buf) - 1);
 
 	// DualSense: enhanced reports are needed for gyro/touchpad/effects over Bluetooth.
@@ -167,7 +169,7 @@ void App::SetFullscreen(bool fullscreen)
 
 int App::FrameGenMultiplier() const
 {
-	if(settings.frame_gen == 0)
+	if(settings.frame_gen == 0 || compare_on)
 		return 1;
 	int fps = session ? session->Config().fps : settings.fps;
 	int hz = renderer.DisplayHz();
@@ -190,6 +192,9 @@ ProcessOptions App::MakeProcessOptions() const
 	o.target_height = settings.upscale_target;
 	o.artifact_reduction = settings.artifact_reduction;
 	o.sharpness = settings.sharpness;
+	o.ai_sharpness = settings.ai_sharpness;
+	o.deband = settings.deband;
+	o.paper_white = settings.paper_white_nits;
 	o.ai_hdr = settings.ai_hdr;
 	o.frame_gen = FrameGenMultiplier() > 1;
 	o.ambient = settings.ambient && settings.aspect_mode == 0;
@@ -209,6 +214,9 @@ PresentOptions App::MakePresentOptions(int sync_interval) const
 	o.contrast = settings.contrast;
 	o.saturation = settings.saturation;
 	o.vibrance = settings.vibrance;
+	o.ambient_style = settings.ambient_style;
+	o.compare = compare_on && phase == Phase::Streaming;
+	o.compare_split = compare_split;
 	return o;
 }
 
@@ -238,6 +246,7 @@ void App::Run()
 {
 	while(!quit)
 	{
+		UpdateMouseCapture();
 		PumpEvents();
 		Tick();
 		HandleSessionEvents();
@@ -273,10 +282,30 @@ void App::PumpEvents()
 	SDL_Event e;
 	while(SDL_PollEvent(&e))
 	{
-		ImGui_ImplSDL3_ProcessEvent(&e);
+		bool kbm_event = e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP || e.type == SDL_EVENT_MOUSE_MOTION
+			|| e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_UP || e.type == SDL_EVENT_MOUSE_WHEEL;
+		// Rebinding a key: the next key / button goes to the binding, not the UI or the game
+		if(kbm_event && kbm.CapturingAction() >= 0 && kbm.HandleCapture(e))
+		{
+			if(kbm.CapturingAction() < 0)
+				SyncBindingsToSettings();
+			continue;
+		}
+		// While the mouse is captured, keyboard and mouse play the game
+		if(kbm_event && mouse_captured)
+			kbm.HandleEvent(e);
+		else
+			ImGui_ImplSDL3_ProcessEvent(&e);
 		gamepads.HandleEvent(e);
 		switch(e.type)
 		{
+			case SDL_EVENT_WINDOW_FOCUS_GAINED:
+				window_focused = true;
+				break;
+			case SDL_EVENT_WINDOW_FOCUS_LOST:
+				window_focused = false;
+				kbm.Release();
+				break;
 			case SDL_EVENT_QUIT:
 			case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
 				quit = true;
@@ -306,19 +335,15 @@ void App::PumpEvents()
 					SetFullscreen(settings.fullscreen);
 					MarkSettingsDirty();
 				}
-				else if(phase == Phase::Streaming && (e.key.key == SDLK_F1 || e.key.key == SDLK_ESCAPE) && !keyboard_open && !login_pin_open)
+				else if(phase == Phase::Streaming && (e.key.key == SDLK_F1 || e.key.key == SDLK_ESCAPE) && !keyboard_open && !login_pin_open
+					&& !e.key.repeat)
 				{
-					overlay_open = !overlay_open;
-					if(!overlay_open)
-						input_guard = true;
+					// Esc inside an open dropdown just closes the dropdown
+					if(!(overlay_open && e.key.key == SDLK_ESCAPE && ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)))
+						ShowOverlay(!overlay_open);
 				}
-				else if(phase == Phase::Streaming && e.key.key == SDLK_F12)
-					TakeScreenshot();
-				else if(phase == Phase::Streaming && e.key.key == SDLK_F2)
-				{
-					settings.show_stats = !settings.show_stats;
-					MarkSettingsDirty();
-				}
+				else if(!e.key.repeat && !keyboard_open && !login_pin_open)
+					HandleHotkey(e.key.key);
 				break;
 			default:
 				break;
@@ -419,6 +444,8 @@ void App::HandleSessionEvents()
 				phase = Phase::Streaming;
 				reconnect_attempts = 0;
 				overlay_open = false;
+				if(settings.kbm_enabled)
+					ShowToast("Keyboard & mouse ready - Esc or F1 for the menu");
 				input_guard = true;
 				gamepads.SetMicLed(false);
 				if(settings.dualsense_features && gamepads.AnyWiredDualSense())
@@ -488,11 +515,7 @@ void App::SendInput()
 		return;
 
 	if(gamepads.TakeMenuCombo())
-	{
-		overlay_open = !overlay_open;
-		if(!overlay_open)
-			input_guard = true;
-	}
+		ShowOverlay(!overlay_open);
 	if(gamepads.TakeMicButton())
 	{
 		bool muted = !session->MicMuted();
@@ -504,11 +527,19 @@ void App::SendInput()
 	ImGuiIO &io = ImGui::GetIO();
 	bool ui_focus = overlay_open || keyboard_open || login_pin_open;
 	if(ui_focus)
-		io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+		io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard;
 	else
-		io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+		io.ConfigFlags &= ~(ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard);
 
 	ChiakiControllerState state = gamepads.State();
+	if(mouse_captured)
+	{
+		kbm.SetTuning(settings.kbm);
+		ChiakiControllerState k = kbm.Update();
+		ChiakiControllerState merged;
+		chiaki_controller_state_or(&merged, &state, &k);
+		state = merged;
+	}
 	if(input_guard)
 	{
 		if(state.buttons == 0 && state.l2_state < 16 && state.r2_state < 16)
@@ -666,7 +697,10 @@ void App::EndStream(const std::string &msg, bool is_error)
 	renderer.ResetVideo();
 	phase = Phase::Idle;
 	overlay_open = keyboard_open = login_pin_open = false;
-	ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+	ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard;
+	kbm.Release();
+	kbm.BeginCapture(-1);
+	UpdateMouseCapture();
 	message = msg;
 	message_is_error = is_error;
 }
@@ -999,175 +1033,148 @@ void App::UiPairDialog()
 	ImGui::EndPopup();
 }
 
+void App::Row(const char *label)
+{
+	ImGui::AlignTextToFramePadding();
+	ImGui::TextUnformatted(label);
+	ImGui::SameLine(row_label_w);
+	ImGui::SetNextItemWidth(row_item_w);
+}
+
+void App::RowHelp(const char *text)
+{
+	ImGui::SetCursorPosX(row_label_w);
+	HelpText(text);
+}
+
+void App::SetRowLayout(bool compact)
+{
+	row_label_w = (compact ? 210.0f : 270.0f) * ui_scale;
+	row_item_w = compact ? -FLT_MIN : 380.0f * ui_scale;
+}
+
 void App::UiSettings()
 {
-	bool changed = false;
 	ImGui::SetWindowFontScale(1.25f);
 	ImGui::TextUnformatted("Settings");
 	ImGui::SetWindowFontScale(1.0f);
-
-	float label_w = 260.0f * ui_scale;
-	auto label = [&](const char *t) {
-		ImGui::AlignTextToFramePadding();
-		ImGui::TextUnformatted(t);
-		ImGui::SameLine(label_w);
-		ImGui::SetNextItemWidth(320 * ui_scale);
-	};
+	HelpText("Everything here can also be changed while playing: open the stream menu with Create + PS, F1 or Esc.");
+	SetRowLayout(false);
 
 	SectionTitle("Stream");
-	{
-		label("Resolution");
-		const char *res_names[] = { "720p", "1080p (max for PS5 Remote Play)" };
-		int res_idx = settings.resolution >= 1080 ? 1 : 0;
-		if(ImGui::Combo("##res", &res_idx, res_names, 2))
-		{
-			settings.resolution = res_idx == 1 ? 1080 : 720;
-			changed = true;
-		}
-		label("Frame rate");
-		const char *fps_names[] = { "30 fps", "60 fps" };
-		int fps_idx = settings.fps >= 60 ? 1 : 0;
-		if(ImGui::Combo("##fps", &fps_idx, fps_names, 2))
-		{
-			settings.fps = fps_idx == 1 ? 60 : 30;
-			changed = true;
-		}
-		label("Codec");
-		const char *codec_names[] = { "H.264", "H.265 / HEVC (better quality, needed for HDR)" };
-		int codec_idx = (int)settings.codec;
-		if(ImGui::Combo("##codec", &codec_idx, codec_names, 2))
-		{
-			settings.codec = (VideoCodec)codec_idx;
-			changed = true;
-		}
-		label("Bitrate");
-		int mbps = settings.bitrate_kbps / 1000;
-		if(ImGui::SliderInt("##bitrate", &mbps, 0, 50, mbps == 0 ? "Auto (preset)" : "%d Mbps"))
-		{
-			settings.bitrate_kbps = mbps * 1000;
-			changed = true;
-		}
-		label("HDR");
-		changed |= ImGui::Checkbox("Stream in HDR10 when the display is in HDR mode", &settings.hdr);
-		ImGui::SameLine(label_w);
-		ImGui::Dummy(ImVec2(0, 0));
-		ImGui::SetCursorPosX(label_w);
-		changed |= ImGui::Checkbox("Also on SDR displays (tone-mapped on the PC)", &settings.hdr_force);
-		ImGui::SetCursorPosX(label_w);
-		HelpText(renderer.DisplayHdr() ? "This display is in HDR mode." :
-			"This display is in SDR mode. Turn on \"Use HDR\" in Windows Settings > Display to get real HDR.");
-		label("SDR / UI brightness in HDR");
-		changed |= ImGui::SliderFloat("##pw", &settings.paper_white_nits, 80.0f, 400.0f, "%.0f nits");
-	}
-
-	SectionTitle("Upscaling & frame generation (optional)");
-	UiEnhancementControls(false);
-
-	SectionTitle("Picture");
-	UiPictureControls(false);
-
-	SectionTitle("Display");
-	{
-		label("Fullscreen");
-		bool fs = settings.fullscreen;
-		if(ImGui::Checkbox("Borderless fullscreen (F11)", &fs))
-		{
-			settings.fullscreen = fs;
-			SetFullscreen(fs);
-			changed = true;
-		}
-		label("V-Sync");
-		changed |= ImGui::Checkbox("Sync to the display (off = lowest latency, may tear)", &settings.vsync);
-		label("Statistics");
-		changed |= ImGui::Checkbox("Show stream statistics while playing (F2)", &settings.show_stats);
-		label("Reconnect");
-		changed |= ImGui::Checkbox("Reconnect automatically if the stream drops", &settings.auto_reconnect);
-		ImGui::SetCursorPosX(label_w);
-		HelpText("F12 saves a screenshot to Pictures\\Orbit Play.");
-	}
-
-	SectionTitle("Controller");
-	{
-		label("DualSense features");
-		changed |= ImGui::Checkbox("Haptic feedback and adaptive triggers", &settings.dualsense_features);
-		ImGui::SetCursorPosX(label_w);
-		HelpText("Full haptics need the DualSense connected by USB cable (Windows doesn't expose its haptics over Bluetooth); "
-			"over Bluetooth it falls back to rumble. Adaptive triggers work either way.");
-		label("Haptics intensity");
-		changed |= ImGui::SliderFloat("##hg", &settings.haptics_gain, 0.0f, 2.0f, "%.2fx");
-		label("Adaptive triggers");
-		changed |= ImGui::Checkbox("Enabled##trig", &settings.adaptive_triggers);
-		label("Motion controls");
-		changed |= ImGui::Checkbox("Gyro / accelerometer", &settings.motion_controls);
-		label("Rumble strength");
-		changed |= ImGui::SliderFloat("##rg", &settings.rumble_gain, 0.0f, 2.0f, "%.2fx");
-		label("Xbox-style controllers");
-		changed |= ImGui::Checkbox("View button acts as touchpad press", &settings.view_is_touchpad);
-		ImGui::SetCursorPosX(label_w);
-		HelpText("Open the stream menu with Create + PS (View + Guide on Xbox pads), or F1/Esc on the keyboard.");
-	}
-
-	SectionTitle("Audio");
-	{
-		label("Volume");
-		if(ImGui::SliderFloat("##vol", &settings.volume, 0.0f, 1.5f, "%.2f"))
-		{
-			audio.SetVolume(settings.volume);
-			changed = true;
-		}
-		label("Microphone");
-		changed |= ImGui::Checkbox("Allow voice chat (toggle with the DualSense mute button)", &settings.microphone);
-	}
+	UiStreamSection();
+	SectionTitle("Upscaling");
+	UiUpscaleSection();
+	SectionTitle("Frame generation");
+	UiFrameGenSection();
+	SectionTitle("Picture & ambient light");
+	UiPictureSection();
+	SectionTitle("Keyboard, mouse & controller");
+	UiControlsSection();
+	SectionTitle("Display & audio");
+	UiSystemSection();
 
 	SectionTitle("Account");
+	Row("PSN Account ID");
+	if(ImGui::InputText("##acc2", account_buf, sizeof(account_buf)))
 	{
-		label("PSN Account ID");
-		if(ImGui::InputText("##acc2", account_buf, sizeof(account_buf)))
-		{
-			settings.psn_account_id = account_buf;
-			changed = true;
-		}
+		settings.psn_account_id = account_buf;
+		MarkSettingsDirty();
 	}
 	ImGui::Dummy(ImVec2(0, 30 * ui_scale));
+}
 
+bool App::StreamSettingsChanged() const
+{
+	if(!session)
+		return false;
+	const StreamConfig &c = session->Config();
+	bool want_hdr = settings.hdr && (renderer.DisplayHdr() || settings.hdr_force);
+	return c.resolution != settings.resolution || c.fps != settings.fps || c.bitrate_kbps != settings.bitrate_kbps
+		|| c.codec != settings.codec || c.hdr != want_hdr || c.dualsense != settings.dualsense_features;
+}
+
+void App::ReconnectNow()
+{
+	EndStream("", false);
+	reconnect_attempts = 0;
+	reconnect_at = NowMs() + 300;
+	ShowToast("Reconnecting with the new settings...");
+}
+
+void App::UiStreamSection()
+{
+	bool changed = false;
+	Row("Resolution");
+	const char *res_names[] = { "720p", "1080p (max for PS5 Remote Play)" };
+	int res_idx = settings.resolution >= 1080 ? 1 : 0;
+	if(ImGui::Combo("##res", &res_idx, res_names, 2))
+	{
+		settings.resolution = res_idx == 1 ? 1080 : 720;
+		changed = true;
+	}
+	Row("Frame rate");
+	const char *fps_names[] = { "30 fps", "60 fps" };
+	int fps_idx = settings.fps >= 60 ? 1 : 0;
+	if(ImGui::Combo("##fps", &fps_idx, fps_names, 2))
+	{
+		settings.fps = fps_idx == 1 ? 60 : 30;
+		changed = true;
+	}
+	Row("Codec");
+	const char *codec_names[] = { "H.264", "H.265 / HEVC (better quality, needed for HDR)" };
+	int codec_idx = (int)settings.codec;
+	if(ImGui::Combo("##codec", &codec_idx, codec_names, 2))
+	{
+		settings.codec = (VideoCodec)codec_idx;
+		changed = true;
+	}
+	Row("Bitrate");
+	int mbps = settings.bitrate_kbps / 1000;
+	if(ImGui::SliderInt("##bitrate", &mbps, 0, 50, mbps == 0 ? "Auto (preset)" : "%d Mbps"))
+	{
+		settings.bitrate_kbps = mbps * 1000;
+		changed = true;
+	}
+	Row("HDR");
+	changed |= ImGui::Checkbox("Stream in HDR10 when the display is in HDR mode", &settings.hdr);
+	ImGui::SetCursorPosX(row_label_w);
+	changed |= ImGui::Checkbox("Also on SDR displays (tone-mapped on the PC)", &settings.hdr_force);
+	RowHelp(renderer.DisplayHdr() ? "This display is in HDR mode." :
+		"This display is in SDR mode. Turn on \"Use HDR\" in Windows Settings > Display to get real HDR.");
+	Row("SDR / UI brightness in HDR");
+	changed |= ImGui::SliderFloat("##pw", &settings.paper_white_nits, 80.0f, 400.0f, "%.0f nits");
+	if(session)
+	{
+		if(StreamSettingsChanged())
+		{
+			ImGui::SetCursorPosX(row_label_w);
+			if(PrimaryButton("Reconnect now to apply"))
+				ReconnectNow();
+			RowHelp("Resolution, frame rate, codec, bitrate and HDR are agreed with the PS5 when connecting. "
+				"Reconnecting takes a few seconds and keeps your game running.");
+		}
+		else
+			RowHelp("These are the settings of the current stream.");
+	}
 	if(changed)
 		MarkSettingsDirty();
 }
 
-// Shared between the Settings page (labelled rows) and the in-stream menu (compact).
-void App::UiEnhancementControls(bool compact)
+void App::UiUpscaleSection()
 {
 	bool changed = false;
-	float label_w = 260.0f * ui_scale;
-	auto row = [&](const char *t) {
-		if(compact)
-		{
-			ImGui::TextDisabled("%s", t);
-			ImGui::SetNextItemWidth(-1);
-			return;
-		}
-		ImGui::AlignTextToFramePadding();
-		ImGui::TextUnformatted(t);
-		ImGui::SameLine(label_w);
-		ImGui::SetNextItemWidth(360 * ui_scale);
-	};
-	auto help = [&](const char *t) {
-		if(compact)
-			return;
-		ImGui::SetCursorPosX(label_w);
-		HelpText(t);
-	};
+	bool ai_available = renderer.AiSuperResolutionAvailable();
+	bool nvidia = renderer.GpuVendorName() == "NVIDIA";
 
-	// Upscaling
-	row("Upscaling");
-	std::string ai_name = renderer.AiSuperResolutionAvailable()
-		? "AI super resolution (" + renderer.GpuVendorName() + ")"
+	Row("Upscaling");
+	std::string ai_name = ai_available ? "AI super resolution (" + std::string(nvidia ? "NVIDIA RTX" : "Intel") + ")"
 		: std::string("AI super resolution (needs NVIDIA RTX / Intel)");
 	const char *modes[] = { "Off", "Enhanced (any GPU)", ai_name.c_str() };
 	changed |= ImGui::Combo("##upmode", &settings.upscale_mode, modes, 3);
 
 	ImGui::BeginDisabled(settings.upscale_mode == 0);
-	row("Upscale to");
+	Row("Upscale to");
 	const char *targets[] = { "Match display", "1440p (2K)", "1800p", "2160p (4K)" };
 	const int target_values[] = { 0, 1440, 1800, 2160 };
 	int ti = 0;
@@ -1179,103 +1186,94 @@ void App::UiEnhancementControls(bool compact)
 		settings.upscale_target = target_values[ti];
 		changed = true;
 	}
-	bool ai = settings.upscale_mode == 2 && renderer.AiSuperResolutionAvailable();
-	ImGui::BeginDisabled(ai);
-	row("Artifact reduction");
-	changed |= ImGui::SliderFloat("##artifact", &settings.artifact_reduction, 0.0f, 1.0f, "%.2f");
-	row("Sharpness");
-	changed |= ImGui::SliderFloat("##sharp", &settings.sharpness, 0.0f, 1.0f, "%.2f");
-	ImGui::EndDisabled();
-	ImGui::EndDisabled();
-	if(settings.upscale_mode == 2)
-	{
-		if(renderer.AiSuperResolutionAvailable() && renderer.GpuVendorName() == "NVIDIA")
-			help("Uses NVIDIA RTX Video Super Resolution (RTX 20-series or newer). If the stats show no change, turn on "
-				"\"RTX Video Enhancement > Super Resolution\" in the NVIDIA App / Control Panel and pick quality 4 for the best result.");
-		else if(renderer.AiSuperResolutionAvailable())
-			help("Uses Intel Video Super Resolution (Arc or Iris Xe graphics with a current driver).");
-		else
-			help("This GPU has no driver AI upscaler, so the Enhanced upscaler is used. On AMD you can also turn on "
-				"\"Video Upscale\" in AMD Software.");
-	}
-	else if(settings.upscale_mode == 1)
-		help("Removes compression blocking first, then upscales along edges and only sharpens real detail, so it stays clean instead of grainy.");
-	if(!compact)
-	{
-		ImGui::SetCursorPosX(label_w);
-		HelpText(("Now: " + renderer.UpscalerStatus()).c_str());
-	}
 
-	// AI HDR
-	row("AI HDR for SDR games");
+	bool ai = settings.upscale_mode == 2 && ai_available;
+	Row("Sharpness");
+	if(ai)
+		changed |= ImGui::SliderFloat("##aisharp", &settings.ai_sharpness, 0.0f, 1.0f, settings.ai_sharpness < 0.01f ? "Off (AI only)" : "%.2f");
+	else
+		changed |= ImGui::SliderFloat("##sharp", &settings.sharpness, 0.0f, 1.0f, settings.sharpness < 0.01f ? "Off" : "%.2f");
+	Row("Deband");
+	changed |= ImGui::SliderFloat("##deband", &settings.deband, 0.0f, 1.0f, settings.deband < 0.01f ? "Off" : "%.2f");
+	ImGui::BeginDisabled(ai);
+	Row("Artifact reduction");
+	changed |= ImGui::SliderFloat("##artifact", &settings.artifact_reduction, 0.0f, 1.0f, "%.2f");
+	ImGui::EndDisabled();
+	ImGui::EndDisabled();
+
+	if(settings.upscale_mode == 2 && ai_available && nvidia)
+		RowHelp("RTX Video Super Resolution rebuilds detail, then sharpening (contrast-adaptive, ignores noise) adds bite on top. "
+			"In the NVIDIA App > Graphics > RTX Video Enhancement, set Super Resolution to quality 4 for the cleanest result.");
+	else if(settings.upscale_mode == 2 && ai_available)
+		RowHelp("Uses Intel Video Super Resolution (Arc or Iris Xe with a current driver), plus contrast-adaptive sharpening.");
+	else if(settings.upscale_mode == 2)
+		RowHelp("This GPU has no driver AI upscaler, so the Enhanced upscaler is used.");
+	else if(settings.upscale_mode == 1)
+		RowHelp("Cleans compression artifacts and banding, upscales along edges, then sharpens only real detail.");
+	RowHelp("Deband smooths the stair-step bands compression leaves in skies, fog and dark scenes.");
+
+	Row("Compare");
+	if(ImGui::Checkbox("Split screen: original | enhanced (F6)", &compare_on))
+		ShowToast(compare_on ? "Compare on: original left, enhanced right" : "Compare off");
+	RowHelp("With the menu open you can drag the divider with the mouse. F7 / F8 change sharpness live.");
+
+	Row("AI HDR for SDR games");
 	ImGui::BeginDisabled(!renderer.AiHdrAvailable());
 	changed |= ImGui::Checkbox(renderer.AiHdrAvailable() ? "NVIDIA RTX Video HDR##aihdr" : "Needs an NVIDIA RTX GPU##aihdr", &settings.ai_hdr);
 	ImGui::EndDisabled();
-	row("HDR boost (any GPU)");
+	Row("HDR boost (any GPU)");
 	changed |= ImGui::SliderFloat("##hdrboost", &settings.hdr_boost, 0.0f, 1.0f, settings.hdr_boost < 0.01f ? "Off" : "%.2f");
-	help("For SDR games on an HDR display: expands highlights toward your display's peak brightness. AI HDR (if available) takes priority.");
+	RowHelp("For SDR games on an HDR display: expands highlights toward your display's peak brightness.");
 
-	// Frame generation
-	row("Frame generation");
-	const char *fg[] = { "Off", "Auto (best for this display)", "2x (120 fps)", "3x (180 fps)", "4x (240 fps)" };
-	changed |= ImGui::Combo("##fg", &settings.frame_gen, fg, 5);
-	if(!compact)
-	{
-		int mult = FrameGenMultiplier();
-		int fps = session ? session->Config().fps : settings.fps;
-		char buf[320];
-		if(settings.frame_gen == 0)
-			snprintf(buf, sizeof(buf), "Your display runs at %d Hz.", renderer.DisplayHz());
-		else if(mult <= 1)
-			snprintf(buf, sizeof(buf), "Needs a display at %d Hz or more (this one is %d Hz).", fps * 2, renderer.DisplayHz());
-		else
-			snprintf(buf, sizeof(buf), "Active: %d fps on your %d Hz display. Generated frames add about %.0f ms of latency "
-				"and can show artifacts on fast, complex motion.", fps * mult, renderer.DisplayHz(),
-				1000.0 / fps * (mult - 1) / mult);
-		ImGui::SetCursorPosX(label_w);
-		HelpText(buf);
-	}
-
+	ImGui::Spacing();
+	RowHelp(("Now: " + renderer.UpscalerStatus()).c_str());
 	if(changed)
 		MarkSettingsDirty();
 }
 
-void App::UiPictureControls(bool compact)
+void App::UiFrameGenSection()
 {
 	bool changed = false;
-	float label_w = 260.0f * ui_scale;
-	auto row = [&](const char *t) {
-		if(compact)
-		{
-			ImGui::TextDisabled("%s", t);
-			ImGui::SetNextItemWidth(-1);
-			return;
-		}
-		ImGui::AlignTextToFramePadding();
-		ImGui::TextUnformatted(t);
-		ImGui::SameLine(label_w);
-		ImGui::SetNextItemWidth(360 * ui_scale);
-	};
+	Row("Frame generation");
+	const char *fg[] = { "Off", "Auto (best for this display)", "2x (120 fps)", "3x (180 fps)", "4x (240 fps)" };
+	changed |= ImGui::Combo("##fg", &settings.frame_gen, fg, 5);
+	int mult = FrameGenMultiplier();
+	int fps = session ? session->Config().fps : settings.fps;
+	char buf[320];
+	if(compare_on && settings.frame_gen != 0)
+		snprintf(buf, sizeof(buf), "Paused while split-screen compare is on.");
+	else if(settings.frame_gen == 0)
+		snprintf(buf, sizeof(buf), "Your display runs at %d Hz.", renderer.DisplayHz());
+	else if(mult <= 1)
+		snprintf(buf, sizeof(buf), "Needs a display at %d Hz or more (this one is %d Hz).", fps * 2, renderer.DisplayHz());
+	else
+		snprintf(buf, sizeof(buf), "Active: %d fps on your %d Hz display. Generated frames add about %.0f ms of latency "
+			"and can show artifacts on fast, complex motion.", fps * mult, renderer.DisplayHz(), 1000.0 / fps * (mult - 1) / mult);
+	RowHelp(buf);
+	if(changed)
+		MarkSettingsDirty();
+}
 
-	row("Aspect ratio");
+void App::UiPictureSection()
+{
+	bool changed = false;
+	Row("Aspect ratio");
 	const char *aspects[] = { "Fit (16:9, with ambient bars)", "Fill (crop to screen)", "Stretch" };
 	changed |= ImGui::Combo("##aspect", &settings.aspect_mode, aspects, 3);
 	ImGui::BeginDisabled(settings.aspect_mode != 0);
-	row("Ambient lighting");
-	changed |= ImGui::Checkbox("Glow the picture's edge colors into the bars##amb", &settings.ambient);
-	if(settings.ambient)
-	{
-		row("Ambient intensity");
-		changed |= ImGui::SliderFloat("##ambi", &settings.ambient_intensity, 0.1f, 1.0f, "%.2f");
-	}
+	Row("Ambient lighting");
+	changed |= ImGui::Checkbox("Light the bars with the picture's colors (F5)##amb", &settings.ambient);
+	ImGui::BeginDisabled(!settings.ambient);
+	Row("Ambient style");
+	const char *styles[] = { "Glow (soft colored light)", "Extend (blurred picture continues)" };
+	changed |= ImGui::Combo("##ambstyle", &settings.ambient_style, styles, 2);
+	Row("Ambient intensity");
+	changed |= ImGui::SliderFloat("##ambi", &settings.ambient_intensity, 0.1f, 1.0f, "%.2f");
 	ImGui::EndDisabled();
-	if(!compact)
-	{
-		ImGui::SetCursorPosX(label_w);
-		HelpText("Shows up on ultrawide screens (or any window wider or taller than 16:9).");
-	}
+	ImGui::EndDisabled();
+	RowHelp("Shows on ultrawide screens or any window that isn't 16:9. Calculated in real light levels, so it matches in SDR and HDR.");
 
-	row("Picture mode");
+	Row("Picture mode");
 	const char *presets[] = { "Natural", "Vivid", "Cinema", "Custom" };
 	int preset = settings.picture_preset;
 	if(ImGui::Combo("##preset", &preset, presets, 4))
@@ -1284,18 +1282,123 @@ void App::UiPictureControls(bool compact)
 		changed = true;
 	}
 	bool custom = false;
-	row("Brightness");
+	Row("Brightness");
 	custom |= ImGui::SliderFloat("##bri", &settings.brightness, -0.2f, 0.2f, "%+.2f");
-	row("Contrast");
+	Row("Contrast");
 	custom |= ImGui::SliderFloat("##con", &settings.contrast, 0.7f, 1.3f, "%.2f");
-	row("Saturation");
+	Row("Saturation");
 	custom |= ImGui::SliderFloat("##sat", &settings.saturation, 0.0f, 1.6f, "%.2f");
-	row("Vibrance");
+	Row("Vibrance");
 	custom |= ImGui::SliderFloat("##vib", &settings.vibrance, 0.0f, 1.0f, "%.2f");
 	if(custom)
 	{
 		settings.picture_preset = 3;
 		changed = true;
+	}
+	if(changed)
+		MarkSettingsDirty();
+}
+
+void App::UiControlsSection()
+{
+	bool changed = false;
+	ImGui::TextColored(ImVec4(0.55f, 0.72f, 1.0f, 1.0f), "Keyboard & mouse");
+	Row("Keyboard & mouse");
+	changed |= ImGui::Checkbox("Play with keyboard and mouse##kbm", &settings.kbm_enabled);
+	RowHelp("While playing, the mouse is captured and moves the right stick. Esc or F1 frees the mouse and opens this menu. "
+		"A gamepad keeps working alongside.");
+	ImGui::BeginDisabled(!settings.kbm_enabled);
+	Row("Mouse sensitivity");
+	changed |= ImGui::SliderFloat("##msens", &settings.kbm.sensitivity, 0.1f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+	Row("Anti-deadzone");
+	changed |= ImGui::SliderFloat("##madz", &settings.kbm.anti_deadzone, 0.0f, 0.5f, "%.2f");
+	RowHelp("Games ignore small stick movements. Raise this if slow mouse movements don't turn the camera, lower it if aiming feels jumpy.");
+	Row("Mouse smoothing");
+	changed |= ImGui::SliderFloat("##msmooth", &settings.kbm.smoothing, 0.0f, 1.0f, "%.2f");
+	Row("Invert Y");
+	changed |= ImGui::Checkbox("##minv", &settings.kbm.invert_y);
+
+	Row("Key bindings");
+	if(ImGui::Button("Reset to defaults"))
+	{
+		kbm.ResetBindings();
+		SyncBindingsToSettings();
+	}
+	RowHelp("Click a binding, then press a key, mouse button or scroll the wheel. Esc cancels, Delete clears.");
+	for(int i = 0; i < KeyboardMouse::ActionCount; i++)
+	{
+		ImGui::PushID(2000 + i);
+		Row(KeyboardMouse::ActionName(i));
+		bool capturing = kbm.CapturingAction() == i;
+		std::string label = capturing ? std::string("Press a key...") : KeyboardMouse::BindingName(kbm.bindings[i]);
+		if(capturing)
+			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.44f, 0.82f, 1.0f));
+		if(ImGui::Button(label.c_str(), ImVec2(row_item_w < 0 ? -FLT_MIN : row_item_w, 0)) && !capturing)
+			kbm.BeginCapture(i);
+		if(capturing)
+			ImGui::PopStyleColor();
+		ImGui::PopID();
+	}
+	ImGui::EndDisabled();
+
+	ImGui::Spacing();
+	ImGui::TextColored(ImVec4(0.55f, 0.72f, 1.0f, 1.0f), "Controller");
+	Row("DualSense features");
+	changed |= ImGui::Checkbox("Haptic feedback and adaptive triggers", &settings.dualsense_features);
+	RowHelp("Full haptics need the DualSense on a USB cable; over Bluetooth it falls back to rumble. Adaptive triggers work either way.");
+	Row("Haptics intensity");
+	changed |= ImGui::SliderFloat("##hg", &settings.haptics_gain, 0.0f, 2.0f, "%.2fx");
+	Row("Adaptive triggers");
+	changed |= ImGui::Checkbox("Enabled##trig", &settings.adaptive_triggers);
+	Row("Motion controls");
+	changed |= ImGui::Checkbox("Gyro / accelerometer", &settings.motion_controls);
+	Row("Rumble strength");
+	changed |= ImGui::SliderFloat("##rg", &settings.rumble_gain, 0.0f, 2.0f, "%.2fx");
+	Row("Xbox-style controllers");
+	changed |= ImGui::Checkbox("View button acts as touchpad press", &settings.view_is_touchpad);
+	RowHelp("Open the stream menu with Create + PS (View + Guide on Xbox pads).");
+	if(changed)
+		MarkSettingsDirty();
+}
+
+void App::UiSystemSection()
+{
+	bool changed = false;
+	Row("Fullscreen");
+	bool fs = settings.fullscreen;
+	if(ImGui::Checkbox("Borderless fullscreen (F11)", &fs))
+	{
+		settings.fullscreen = fs;
+		SetFullscreen(fs);
+		changed = true;
+	}
+	Row("V-Sync");
+	changed |= ImGui::Checkbox("Sync to the display (off = lowest latency, may tear)", &settings.vsync);
+	Row("Statistics");
+	changed |= ImGui::Checkbox("Show stream statistics while playing (F2)", &settings.show_stats);
+	Row("Reconnect");
+	changed |= ImGui::Checkbox("Reconnect automatically if the stream drops", &settings.auto_reconnect);
+	Row("Volume");
+	if(ImGui::SliderFloat("##vol", &settings.volume, 0.0f, 1.5f, "%.2f"))
+	{
+		audio.SetVolume(settings.volume);
+		changed = true;
+	}
+	Row("Microphone");
+	changed |= ImGui::Checkbox("Allow voice chat (DualSense mute button or F10)", &settings.microphone);
+
+	ImGui::Spacing();
+	ImGui::TextColored(ImVec4(0.55f, 0.72f, 1.0f, 1.0f), "Hotkeys while playing");
+	static const char *keys[][2] = {
+		{ "Esc / F1", "Stream menu (frees the mouse)" }, { "F2", "Statistics" }, { "F3", "Cycle upscaling" },
+		{ "F4", "Cycle frame generation" }, { "F5", "Ambient light on/off" }, { "F6", "Split-screen compare" },
+		{ "F7 / F8", "Sharpness - / +" }, { "F9", "Cycle picture mode" }, { "F10", "Microphone on/off" },
+		{ "F11", "Fullscreen" }, { "F12", "Screenshot" },
+	};
+	for(auto &k : keys)
+	{
+		Row(k[0]);
+		ImGui::TextUnformatted(k[1]);
 	}
 	if(changed)
 		MarkSettingsDirty();
@@ -1365,6 +1468,8 @@ void App::UiStats()
 	ImGui::Text("Network  %.1f Mbps   RTT %.1f ms   lost frames %llu", s.mbps, s.rtt_ms, (unsigned long long)s.frames_lost);
 	ImGui::Text("Audio    %d ms queued   Haptics %s   Mic %s", audio.QueuedMs(),
 		audio.HapticsActive() ? "DualSense" : "rumble", session->MicMuted() ? "off" : "on");
+	ImGui::Text("Input    %zu controller(s)   keyboard & mouse %s", gamepads.Count(),
+		!settings.kbm_enabled ? "off" : (mouse_captured ? "active" : "paused (menu open)"));
 	// Frame pacing graph: time between presented frames (flat line = smooth)
 	const int n = (int)(sizeof(frame_times) / sizeof(frame_times[0]));
 	float worst = 0.0f;
@@ -1380,69 +1485,241 @@ void App::UiStats()
 void App::UiStreamOverlay()
 {
 	ImGuiViewport *vp = ImGui::GetMainViewport();
+	ImVec2 size(std::min(860.0f * ui_scale, vp->Size.x - 40.0f), std::min(vp->Size.y * 0.88f, 1000.0f * ui_scale));
 	ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-	ImGui::SetNextWindowSize(ImVec2(560 * ui_scale, 0));
-	ImGui::SetNextWindowSizeConstraints(ImVec2(560 * ui_scale, 0), ImVec2(560 * ui_scale, vp->Size.y * 0.9f));
-	ImGui::SetNextWindowBgAlpha(0.92f);
-	ImGui::SetNextWindowFocus();
-	ImGui::Begin("Stream menu", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
-		| ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
-	ImGui::Text("%s", active_host.nickname.empty() ? "PlayStation 5" : active_host.nickname.c_str());
-	ImGui::Separator();
-
-	if(PrimaryButton("Resume", ImVec2(-1, 0)) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight))
+	ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+	ImGui::SetNextWindowBgAlpha(0.94f);
+	// Focus only when the menu opens: focusing every frame would close dropdowns as soon as they open.
+	if(overlay_just_opened)
 	{
-		overlay_open = false;
-		input_guard = true;
+		ImGui::SetNextWindowFocus();
+		overlay_just_opened = false;
 	}
-	if(session && settings.microphone)
+	ImGui::Begin("##streammenu", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+
+	// B on the pad closes the menu, unless it is closing a dropdown
+	bool popup_open = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
+	if(!popup_open && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) && kbm.CapturingAction() < 0)
+		ShowOverlay(false);
+
+	ImGui::SetWindowFontScale(1.2f);
+	ImGui::TextUnformatted(active_host.nickname.empty() ? "PlayStation 5" : active_host.nickname.c_str());
+	ImGui::SetWindowFontScale(1.0f);
+	ImGui::SameLine();
+	int mult = FrameGenMultiplier();
+	ImGui::TextDisabled("   %dx%d -> %dx%d   %s   %d fps", renderer.VideoWidth(), renderer.VideoHeight(),
+		renderer.OutputVideoWidth(), renderer.OutputVideoHeight(), renderer.VideoHdr() ? "HDR" : "SDR",
+		(session ? session->Config().fps : 60) * std::max(1, mult));
+
+	float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 3) / 4.0f;
+	if(PrimaryButton("Resume", ImVec2(bw, 0)))
+		ShowOverlay(false);
+	ImGui::SameLine();
+	bool mic_ok = session && settings.microphone;
+	ImGui::BeginDisabled(!mic_ok);
+	bool muted = !session || session->MicMuted();
+	if(ImGui::Button(muted ? "Mic: off" : "Mic: on", ImVec2(bw, 0)) && session)
 	{
-		bool muted = session->MicMuted();
-		if(ImGui::Button(muted ? "Turn microphone on" : "Mute microphone", ImVec2(-1, 0)))
+		session->SetMicMuted(!muted);
+		gamepads.SetMicLed(muted);
+	}
+	ImGui::EndDisabled();
+	ImGui::SameLine();
+	if(ImGui::Button("Screenshot", ImVec2(bw, 0)))
+		TakeScreenshot();
+	ImGui::SameLine();
+	if(ImGui::Button(compare_on ? "Compare: on" : "Compare: off", ImVec2(bw, 0)))
+		compare_on = !compare_on;
+
+	if(StreamSettingsChanged())
+	{
+		ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.20f, 0.35f, 1.0f));
+		ImGui::BeginChild("##reconnect", ImVec2(0, ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().WindowPadding.y * 2),
+			ImGuiChildFlags_Borders);
+		ImGui::AlignTextToFramePadding();
+		ImGui::TextUnformatted("Stream settings changed - they apply after reconnecting.");
+		ImGui::SameLine();
+		if(PrimaryButton("Reconnect now"))
+			ReconnectNow();
+		ImGui::EndChild();
+		ImGui::PopStyleColor();
+		if(!session)
 		{
-			session->SetMicMuted(!muted);
-			gamepads.SetMicLed(muted);
+			ImGui::End();
+			return;
 		}
 	}
-	if(ImGui::Button("Save screenshot (F12)", ImVec2(-1, 0)))
-		TakeScreenshot();
-	if(ImGui::CollapsingHeader("Image quality & frame rate"))
-		UiEnhancementControls(true);
-	if(ImGui::CollapsingHeader("Picture & ambient light"))
-		UiPictureControls(true);
-	bool changed = false;
-	changed |= ImGui::Checkbox("Show statistics", &settings.show_stats);
-	bool fs = settings.fullscreen;
-	if(ImGui::Checkbox("Fullscreen", &fs))
+
+	float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y * 2;
+	SetRowLayout(true);
+	if(ImGui::BeginTabBar("##menutabs"))
 	{
-		settings.fullscreen = fs;
-		SetFullscreen(fs);
-		changed = true;
+		auto tab = [&](const char *name, auto &&body) {
+			if(ImGui::BeginTabItem(name))
+			{
+				ImGui::BeginChild("##tabbody", ImVec2(0, -footer), ImGuiChildFlags_None, ImGuiWindowFlags_None);
+				body();
+				ImGui::EndChild();
+				ImGui::EndTabItem();
+			}
+		};
+		tab("Image", [&] { UiUpscaleSection(); });
+		tab("Motion", [&] { UiFrameGenSection(); });
+		tab("Picture", [&] { UiPictureSection(); });
+		tab("Controls", [&] { UiControlsSection(); });
+		tab("Stream", [&] { UiStreamSection(); });
+		tab("System", [&] { UiSystemSection(); });
+		ImGui::EndTabBar();
 	}
-	ImGui::SetNextItemWidth(-1);
-	if(ImGui::SliderFloat("##vol_o", &settings.volume, 0.0f, 1.5f, "Volume %.2f"))
-	{
-		audio.SetVolume(settings.volume);
-		changed = true;
-	}
-	if(changed)
-		MarkSettingsDirty();
 
 	ImGui::Separator();
-	if(ImGui::Button("PS Home screen", ImVec2(-1, 0)) && session)
+	float fw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2) / 3.0f;
+	if(ImGui::Button("PS Home screen", ImVec2(fw, 0)) && session)
 	{
 		session->GoHome();
-		overlay_open = false;
-		input_guard = true;
+		ShowOverlay(false);
 	}
-	if(ImGui::Button("Put console in rest mode", ImVec2(-1, 0)) && session)
+	ImGui::SameLine();
+	if(ImGui::Button("Put console in rest mode", ImVec2(fw, 0)) && session)
 	{
 		session->GotoBed();
 		EndStream("", false);
 	}
-	if(ImGui::Button("Disconnect", ImVec2(-1, 0)))
+	ImGui::SameLine();
+	if(ImGui::Button("Disconnect", ImVec2(fw, 0)))
 		EndStream("", false);
 	ImGui::End();
+
+	// Drag the compare divider with the mouse (outside the menu)
+	if(compare_on && ImGui::IsMouseDown(ImGuiMouseButton_Left) && !ImGui::GetIO().WantCaptureMouse)
+	{
+		float rect[4];
+		renderer.GetVideoRect((AspectMode)settings.aspect_mode, rect);
+		if(rect[2] > 0)
+			compare_split = std::clamp((ImGui::GetIO().MousePos.x - rect[0]) / rect[2], 0.02f, 0.98f);
+	}
+}
+
+void App::ShowOverlay(bool open)
+{
+	if(open == overlay_open)
+		return;
+	overlay_open = open;
+	if(open)
+	{
+		overlay_just_opened = true;
+		kbm.Release();
+	}
+	else
+	{
+		kbm.BeginCapture(-1);
+		input_guard = true;
+	}
+}
+
+void App::ShowToast(const std::string &text)
+{
+	toast = text;
+	toast_until = NowMs() + 2200;
+}
+
+bool App::HandleHotkey(SDL_Keycode key)
+{
+	if(phase != Phase::Streaming || !session)
+		return false;
+	char buf[160];
+	switch(key)
+	{
+		case SDLK_F2:
+			settings.show_stats = !settings.show_stats;
+			break;
+		case SDLK_F3:
+		{
+			settings.upscale_mode = (settings.upscale_mode + 1) % 3;
+			const char *names[] = { "Off", "Enhanced", renderer.AiSuperResolutionAvailable() ? "AI super resolution" : "AI (not available - Enhanced)" };
+			ShowToast(std::string("Upscaling: ") + names[settings.upscale_mode]);
+			break;
+		}
+		case SDLK_F4:
+		{
+			settings.frame_gen = (settings.frame_gen + 1) % 5;
+			int mult = FrameGenMultiplier();
+			if(settings.frame_gen == 0)
+				ShowToast("Frame generation: off");
+			else
+			{
+				snprintf(buf, sizeof(buf), "Frame generation: %s -> %d fps", settings.frame_gen == 1 ? "auto" : "manual",
+					session->Config().fps * std::max(1, mult));
+				ShowToast(buf);
+			}
+			break;
+		}
+		case SDLK_F5:
+			settings.ambient = !settings.ambient;
+			ShowToast(settings.ambient ? "Ambient light on" : "Ambient light off");
+			break;
+		case SDLK_F6:
+			compare_on = !compare_on;
+			ShowToast(compare_on ? "Compare: original left | enhanced right (F7/F8 sharpness)" : "Compare off");
+			return true;
+		case SDLK_F7:
+		case SDLK_F8:
+		{
+			bool ai = settings.upscale_mode == 2 && renderer.AiSuperResolutionAvailable();
+			float &v = ai ? settings.ai_sharpness : settings.sharpness;
+			v = std::clamp(v + (key == SDLK_F8 ? 0.05f : -0.05f), 0.0f, 1.0f);
+			snprintf(buf, sizeof(buf), "Sharpness %.2f%s", v, ai ? " (on top of AI)" : "");
+			ShowToast(settings.upscale_mode == 0 ? std::string("Turn on upscaling (F3) to use sharpening") : std::string(buf));
+			break;
+		}
+		case SDLK_F9:
+		{
+			settings.ApplyPicturePreset((std::min(settings.picture_preset, 2) + 1) % 3);
+			const char *names[] = { "Natural", "Vivid", "Cinema" };
+			ShowToast(std::string("Picture mode: ") + names[settings.picture_preset]);
+			break;
+		}
+		case SDLK_F10:
+			if(settings.microphone)
+			{
+				bool m = !session->MicMuted();
+				session->SetMicMuted(m);
+				gamepads.SetMicLed(!m);
+				ShowToast(m ? "Microphone off" : "Microphone on");
+			}
+			return true;
+		case SDLK_F12:
+			TakeScreenshot();
+			return true;
+		default:
+			return false;
+	}
+	MarkSettingsDirty();
+	return true;
+}
+
+void App::SyncBindingsToSettings()
+{
+	for(int i = 0; i < KeyboardMouse::ActionCount; i++)
+		settings.bindings[i] = kbm.bindings[i];
+	MarkSettingsDirty();
+}
+
+bool App::WantMouseCapture() const
+{
+	return phase == Phase::Streaming && session && settings.kbm_enabled && window_focused
+		&& !overlay_open && !keyboard_open && !login_pin_open && renderer.HasVideo();
+}
+
+void App::UpdateMouseCapture()
+{
+	bool want = WantMouseCapture();
+	if(want == mouse_captured)
+		return;
+	SDL_SetWindowRelativeMouseMode(window, want);
+	mouse_captured = want;
+	if(!want)
+		kbm.Release();
 }
 
 void App::UiStreamDialogs()

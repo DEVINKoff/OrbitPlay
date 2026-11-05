@@ -116,6 +116,12 @@ std::string NormalizeMac(const std::string &host_id)
 	return MacToString(mac);
 }
 
+Settings::Settings()
+{
+	for(int i = 0; i < KeyboardMouse::ActionCount; i++)
+		bindings[i] = KeyboardMouse::DefaultBinding(i);
+}
+
 // ---------------------------------------------------------------------------
 // Picture presets
 
@@ -221,6 +227,8 @@ void Settings::Load(const std::string &path)
 	num("upscale_target", upscale_target);
 	flt("artifact_reduction", artifact_reduction);
 	flt("sharpness", sharpness);
+	flt("ai_sharpness", ai_sharpness);
+	flt("deband", deband);
 	num("frame_gen_mode", frame_gen);
 	flt("paper_white_nits", paper_white_nits);
 	bol("ai_hdr", ai_hdr);
@@ -228,6 +236,18 @@ void Settings::Load(const std::string &path)
 	num("aspect_mode", aspect_mode);
 	bol("ambient", ambient);
 	flt("ambient_intensity", ambient_intensity);
+	num("ambient_style", ambient_style);
+	bol("kbm_enabled", kbm_enabled);
+	flt("mouse_sensitivity", kbm.sensitivity);
+	flt("mouse_anti_deadzone", kbm.anti_deadzone);
+	flt("mouse_smoothing", kbm.smoothing);
+	bol("mouse_invert_y", kbm.invert_y);
+	for(int i = 0; i < KeyboardMouse::ActionCount; i++)
+	{
+		std::string key = "bind." + std::to_string(i);
+		if(g.count(key))
+			bindings[i] = KeyboardMouse::Parse(g[key]);
+	}
 	num("picture_preset", picture_preset);
 	flt("brightness", brightness);
 	flt("contrast", contrast);
@@ -292,6 +312,8 @@ void Settings::Save(const std::string &path) const
 	o << "upscale_target=" << upscale_target << "\n";
 	o << "artifact_reduction=" << artifact_reduction << "\n";
 	o << "sharpness=" << sharpness << "\n";
+	o << "ai_sharpness=" << ai_sharpness << "\n";
+	o << "deband=" << deband << "\n";
 	o << "frame_gen_mode=" << frame_gen << "\n";
 	o << "paper_white_nits=" << paper_white_nits << "\n";
 	o << "ai_hdr=" << ai_hdr << "\n";
@@ -299,6 +321,14 @@ void Settings::Save(const std::string &path) const
 	o << "aspect_mode=" << aspect_mode << "\n";
 	o << "ambient=" << ambient << "\n";
 	o << "ambient_intensity=" << ambient_intensity << "\n";
+	o << "ambient_style=" << ambient_style << "\n";
+	o << "kbm_enabled=" << kbm_enabled << "\n";
+	o << "mouse_sensitivity=" << kbm.sensitivity << "\n";
+	o << "mouse_anti_deadzone=" << kbm.anti_deadzone << "\n";
+	o << "mouse_smoothing=" << kbm.smoothing << "\n";
+	o << "mouse_invert_y=" << kbm.invert_y << "\n";
+	for(int i = 0; i < KeyboardMouse::ActionCount; i++)
+		o << "bind." << i << "=" << KeyboardMouse::Serialize(bindings[i]) << "\n";
 	o << "picture_preset=" << picture_preset << "\n";
 	o << "brightness=" << brightness << "\n";
 	o << "contrast=" << contrast << "\n";

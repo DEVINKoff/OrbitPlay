@@ -52,6 +52,24 @@ competitive games, leave frame generation off.
 
 For the best results, connect the PS5 by Ethernet and use a wired or 5 GHz connection on the PC.
 
+## Keyboard & mouse
+
+Keyboard and mouse play is on by default. When the stream starts, the mouse is captured and
+drives the right stick (mouse-look), and a gamepad keeps working at the same time. **Esc** or **F1**
+frees the mouse and opens the menu. All bindings can be changed in *Controls*: click a binding,
+then press a key, mouse button or wheel direction.
+
+| Default | PS5 |
+|---|---|
+| WASD | Left stick (hold **Left Alt** to walk) |
+| Mouse | Right stick (sensitivity, anti-deadzone and smoothing are adjustable) |
+| Left / right mouse | R2 / L2 |
+| Space, C, R, F | Cross, Circle, Square, Triangle |
+| Q, E | L1, R1 |
+| Left Shift, V | L3, R3 |
+| 1 2 3 4 | D-pad up / left / down / right |
+| Enter, Tab, T, Home | Options, Create, touchpad press, PS |
+
 ## Controls while streaming
 
 | Action | Input |
@@ -59,7 +77,15 @@ For the best results, connect the PS5 by Ethernet and use a wired or 5 GHz conne
 | Stream menu (enhancements, mic, rest mode, disconnect) | **Create + PS** together (View + Guide on Xbox pads), or **F1 / Esc** |
 | Fullscreen | **F11** or **Alt+Enter** |
 | Statistics overlay | **F2** |
+| Cycle upscaling / frame generation | **F3** / **F4** |
+| Ambient light on/off, split-screen compare | **F5** / **F6** |
+| Sharpness - / + | **F7** / **F8** |
+| Picture mode, microphone | **F9** / **F10** |
 | Screenshot | **F12** |
+
+Every setting can be changed while you play in the tabbed stream menu. Stream-level settings
+(resolution, frame rate, codec, bitrate, HDR) show a **Reconnect now** button that re-joins in a
+few seconds.
 | Microphone on/off | DualSense **mute button** |
 
 ## Settings worth knowing

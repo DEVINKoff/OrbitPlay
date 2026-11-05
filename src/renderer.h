@@ -40,7 +40,10 @@ struct ProcessOptions
 	UpscaleMode upscale = UpscaleMode::Off;
 	int target_height = 0;          // 0 = match the video area on screen
 	float artifact_reduction = 0.4f;
-	float sharpness = 0.3f;
+	float sharpness = 0.5f;         // enhanced upscaler
+	float ai_sharpness = 0.35f;     // extra sharpening after AI super resolution
+	float deband = 0.3f;            // gradient banding removal, 0 = off
+	float paper_white = 203.0f;     // used to put SDR and HDR on one scale for ambient light
 	bool ai_hdr = false;            // NVIDIA RTX Video HDR for SDR streams on an HDR display
 	bool frame_gen = false;
 	bool ambient = false;
@@ -55,7 +58,10 @@ struct PresentOptions
 	float hdr_boost = 0.0f;         // SDR -> HDR highlight expansion (shader), 0..1
 	float ambient = 0.0f;           // ambient light intensity, 0 = off
 	AspectMode aspect = AspectMode::Fit;
+	int ambient_style = 0;          // 0 glow, 1 extend
 	float brightness = 0.0f, contrast = 1.0f, saturation = 1.0f, vibrance = 0.0f;
+	bool compare = false;           // split screen: original on the left, processed on the right
+	float compare_split = 0.5f;     // divider position, fraction of the video width
 };
 
 enum class VideoView { None, Latest, Interpolated };
@@ -103,6 +109,9 @@ public:
 	void BeginOverlay();
 	void Present(VideoView view, const PresentOptions &options);
 
+	// Where the video is drawn in the window: x, y, w, h in pixels.
+	void GetVideoRect(AspectMode aspect, float rect[4]) const { float uv[4]; VideoRect(aspect, width, height, rect, uv); }
+
 	// Saves the current frame (SDR, tone mapped if needed) as a PNG.
 	bool SaveScreenshot(const std::wstring &path, const PresentOptions &options);
 
@@ -134,10 +143,13 @@ private:
 			ID3D11UnorderedAccessView *uav, ID3D11Buffer *cb, int gx, int gy);
 	void UpdateCB(ID3D11Buffer *cb, const void *data, size_t size);
 	void ComputeLumaPyramid(int slot);
-	void UpdateAmbient();
+	void UpdateAmbient(float paper_white);
 	void VideoRect(AspectMode aspect, int win_w, int win_h, float rect[4], float uv[4]) const;
 	void ProcessFrame(AVFrame *frame, const ProcessOptions &o);
 	bool ShaderUpscale(int tw, int th, const ProcessOptions &o);
+	// deband + sharpen from `src` (tw x th) into proc[latest]; false if nothing to do
+	bool PostProcess(ID3D11ShaderResourceView *src, int tw, int th, float deband, float deband_scale, float sharpness, float noise_floor);
+	void Deband(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst, int w, int h, float strength, float scale);
 	void DrawVideoOut(ID3D11RenderTargetView *rtv, int w, int h, ID3D11ShaderResourceView *video, int vw, int vh,
 			bool content_hdr, bool out_hdr, const PresentOptions &o, bool with_ambient, bool full_rect);
 	ID3D11ShaderResourceView *DisplaySrv(int slot, int *w, int *h) const;
@@ -165,9 +177,9 @@ private:
 
 	// Shaders and states
 	Com<ID3D11VertexShader> vs;
-	Com<ID3D11PixelShader> ps_nv12, ps_planar, ps_denoise, ps_edge, ps_sharpen, ps_out, ps_overlay, ps_interp;
+	Com<ID3D11PixelShader> ps_nv12, ps_planar, ps_denoise, ps_edge, ps_sharpen, ps_deband, ps_out, ps_overlay, ps_interp;
 	Com<ID3D11ComputeShader> cs_luma_half, cs_down2, cs_search, cs_median, cs_box8, cs_amb_blend;
-	Com<ID3D11Buffer> cb_yuv, cb_denoise, cb_up, cb_sharp, cb_out, cb_ui, cb_me, cb_interp, cb_amb;
+	Com<ID3D11Buffer> cb_yuv, cb_denoise, cb_up, cb_sharp, cb_deband, cb_out, cb_ui, cb_me, cb_interp, cb_amb, cb_amb_down;
 	Com<ID3D11SamplerState> samp_linear;
 	Com<ID3D11BlendState> blend_premul;
 	Com<ID3D11RasterizerState> raster;
@@ -195,7 +207,9 @@ private:
 	bool proc_hdr = false;          // processed output is PQ/BT.2020
 	int last_tw = 0, last_th = 0, last_mode = -1;
 	bool last_ai_hdr = false;
-	Target clean, up_tmp;
+	Target clean, clean2, up_tmp, vp_out, post_tmp;
+	DXGI_FORMAT vp_format = DXGI_FORMAT_R10G10B10A2_UNORM;
+	float paper_white_proc = 203.0f;
 	std::string upscaler_status = "Off";
 
 	// Ambient light

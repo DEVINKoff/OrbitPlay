@@ -40,7 +40,38 @@ bool VpScaler::Init(ID3D11Device *device, ID3D11DeviceContext *context)
 		WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
 		LOGI("GPU: %s", name);
 	}
+
+	// Probe which output formats the video processor can write.
+	D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd = {};
+	cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+	cd.InputFrameRate = { 60, 1 };
+	cd.InputWidth = 1920;
+	cd.InputHeight = 1080;
+	cd.OutputFrameRate = { 60, 1 };
+	cd.OutputWidth = 3840;
+	cd.OutputHeight = 2160;
+	cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+	Com<ID3D11VideoProcessorEnumerator> probe;
+	if(SUCCEEDED(vdevice->CreateVideoProcessorEnumerator(&cd, probe.Put())))
+	{
+		UINT flags = 0;
+		out_rgb10 = SUCCEEDED(probe->CheckVideoProcessorFormat(DXGI_FORMAT_R10G10B10A2_UNORM, &flags))
+			&& (flags & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT);
+		flags = 0;
+		out_bgra8 = SUCCEEDED(probe->CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM, &flags))
+			&& (flags & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT);
+		LOGI("Video processor output: RGB10 %s, BGRA8 %s", out_rgb10 ? "yes" : "no", out_bgra8 ? "yes" : "no");
+	}
 	return true;
+}
+
+bool VpScaler::OutputFormatSupported(DXGI_FORMAT format) const
+{
+	if(format == DXGI_FORMAT_R10G10B10A2_UNORM)
+		return out_rgb10;
+	if(format == DXGI_FORMAT_B8G8R8A8_UNORM)
+		return out_bgra8;
+	return false;
 }
 
 void VpScaler::Reset()

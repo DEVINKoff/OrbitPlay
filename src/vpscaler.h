@@ -35,6 +35,9 @@ public:
 
 	void Reset();
 
+	// Whether the video processor can write this format (probed once at startup).
+	bool OutputFormatSupported(DXGI_FORMAT format) const;
+
 private:
 	bool Configure(UINT in_w, UINT in_h, UINT out_w, UINT out_h);
 	void ApplyExtensions(bool super_resolution, bool ai_hdr);
@@ -46,6 +49,7 @@ private:
 	Com<ID3D11VideoProcessor> processor;
 	UINT cfg_in_w = 0, cfg_in_h = 0, cfg_out_w = 0, cfg_out_h = 0;
 	Vendor vendor = Vendor::Unknown;
+	bool out_rgb10 = true, out_bgra8 = true;
 	bool ext_sr = false, ext_hdr = false, ext_applied = false;
 	bool sr_active = false, hdr_active = false;
 

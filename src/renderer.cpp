@@ -27,6 +27,8 @@ struct YuvCB { float rows[12]; float uv_scale[2]; float pad[2]; };
 struct DenoiseCB { float strength; float pad[3]; };
 struct UpCB { float src_size[2]; float edge_strength; float pad; };
 struct SharpCB { float sharpness; float noise_floor; float pad[2]; };
+struct DebandCB { float threshold; float radius; float seed; float grain; };
+struct AmbDownCB { int decode; float paper_white; float pad[2]; };
 struct OutCB
 {
 	float vid_rect[4];
@@ -34,7 +36,8 @@ struct OutCB
 	float src_size[2]; int scaler; int mode;
 	float paper_white; float peak; float ambient; float hdr_boost;
 	float brightness; float contrast; float saturation; float vibrance;
-	float win_size[2]; float pad[2];
+	float win_size[2]; float split; int orig_mode;
+	int ambient_style; float pad[3];
 };
 struct UiCB { int hdr_out; float ui_nits; float pad[2]; };
 struct MeCB
@@ -96,6 +99,8 @@ bool Renderer::Init(HWND window)
 	make_cb(sizeof(DenoiseCB), cb_denoise);
 	make_cb(sizeof(UpCB), cb_up);
 	make_cb(sizeof(SharpCB), cb_sharp);
+	make_cb(sizeof(DebandCB), cb_deband);
+	make_cb(sizeof(AmbDownCB), cb_amb_down);
 	make_cb(sizeof(OutCB), cb_out);
 	make_cb(sizeof(UiCB), cb_ui);
 	make_cb(sizeof(MeCB), cb_me);
@@ -180,6 +185,7 @@ bool Renderer::CompileShaders()
 		&& ps(shaders::kPsDenoise, ps_denoise)
 		&& ps(shaders::kPsEdgeUpscale, ps_edge)
 		&& ps(shaders::kPsSharpen, ps_sharpen)
+		&& ps(shaders::kPsDeband, ps_deband)
 		&& ps(shaders::kPsVideoOut, ps_out)
 		&& ps(shaders::kPsOverlay, ps_overlay)
 		&& ps(shaders::kPsInterp, ps_interp)
@@ -729,7 +735,7 @@ bool Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o)
 	ProcessFrame(frame, o);
 
 	if(o.ambient)
-		UpdateAmbient();
+		UpdateAmbient(o.paper_white);
 	else
 		amb_valid = false;
 
@@ -801,26 +807,53 @@ void Renderer::ProcessFrame(AVFrame *frame, const ProcessOptions &o)
 		return;
 	}
 
-	// 1) Driver AI path (decoder texture -> video processor -> proc[latest])
+	// 1) Driver AI path: decoder texture -> video processor -> (deband, sharpen) -> proc[latest]
 	if(want_ai_sr || want_ai_hdr)
 	{
 		auto *tex = reinterpret_cast<ID3D11Texture2D *>(frame->data[0]);
 		UINT index = (UINT)(intptr_t)frame->data[1];
 		bool out_hdr = video_hdr || want_ai_hdr;
-		if(vp->Process(tex, index, video_w, video_h, video_hdr, proc[latest].tex.Get(), tw, th, out_hdr, want_ai_sr, want_ai_hdr))
+		float scale = (float)th / (float)video_h;
+		bool post = (upscaling && (o.ai_sharpness > 0.01f || o.deband > 0.01f));
+		// The video processor writes 10-bit RGB where supported (needed for HDR)
+		DXGI_FORMAT vfmt = vp->OutputFormatSupported(DXGI_FORMAT_R10G10B10A2_UNORM) ? DXGI_FORMAT_R10G10B10A2_UNORM
+			: DXGI_FORMAT_B8G8R8A8_UNORM;
+		bool format_ok = vfmt == DXGI_FORMAT_R10G10B10A2_UNORM || !out_hdr;
+		bool direct = !post && vfmt == kProcFormat;
+		if(!direct && vp_format != vfmt)
 		{
+			vp->Reset();
+			vp_format = vfmt;
+		}
+		if(!direct && vp_out.tex && (vp_out.w != tw || vp_out.h != th || vp_out.format != vfmt))
+			vp->Reset();
+		bool targets_ok = direct || EnsureTarget(vp_out, tw, th, vfmt, true, false);
+		ID3D11Texture2D *vp_target = direct ? proc[latest].tex.Get() : vp_out.tex.Get();
+		if(format_ok && targets_ok
+			&& vp->Process(tex, index, video_w, video_h, video_hdr, vp_target, tw, th, out_hdr, want_ai_sr, want_ai_hdr))
+		{
+			if(!direct)
+			{
+				ID3D11ShaderResourceView *srv = vp_out.srv.Get();
+				if(!PostProcess(srv, tw, th, upscaling ? o.deband : 0.0f, scale, upscaling ? o.ai_sharpness : 0.0f, 0.012f))
+				{
+					// nothing to do but format conversion
+					DrawFullscreen(ps_sharpen.Get(), proc[latest].rtv.Get(), tw, th, &srv, 1, nullptr);
+				}
+			}
 			proc_hdr = out_hdr;
 			slot_gen[latest] = proc_gen;
-			std::string s;
+			std::string st;
 			if(want_ai_sr)
-				s = vp->GetVendor() == VpScaler::Vendor::Nvidia ? "NVIDIA RTX Video Super Resolution" : "Intel Video Super Resolution";
+				st = vp->GetVendor() == VpScaler::Vendor::Nvidia ? "NVIDIA RTX Video Super Resolution" : "Intel Video Super Resolution";
 			if(want_ai_hdr)
-				s += s.empty() ? "NVIDIA RTX Video HDR" : " + RTX Video HDR";
+				st += st.empty() ? "NVIDIA RTX Video HDR" : " + RTX Video HDR";
 			if(!vp->SuperResolutionActive() && want_ai_sr)
-				s += " (driver declined - check driver settings)";
-			char res[48];
-			snprintf(res, sizeof(res), "  %dx%d", tw, th);
-			upscaler_status = s + res;
+				st += " (driver declined - check driver settings)";
+			char res[96];
+			snprintf(res, sizeof(res), "  %dx%d  sharpen %.2f  deband %.2f", tw, th, upscaling ? o.ai_sharpness : 0.0f,
+				upscaling ? o.deband : 0.0f);
+			upscaler_status = st + res;
 			return;
 		}
 		// fall through to the shader upscaler
@@ -858,6 +891,15 @@ bool Renderer::ShaderUpscale(int tw, int th, const ProcessOptions &o)
 		src = clean.srv.Get();
 	}
 
+	// Gradient debanding at stream resolution
+	if(o.deband > 0.01f)
+	{
+		if(!EnsureTarget(clean2, video_w, video_h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false))
+			return false;
+		Deband(src, clean2.rtv.Get(), video_w, video_h, o.deband, 1.0f);
+		src = clean2.srv.Get();
+	}
+
 	// Edge-directed upscale
 	UpCB u = {};
 	u.src_size[0] = (float)video_w;
@@ -874,7 +916,7 @@ bool Renderer::ShaderUpscale(int tw, int th, const ProcessOptions &o)
 		// Noise-gated sharpening at output resolution
 		SharpCB s = {};
 		s.sharpness = o.sharpness;
-		s.noise_floor = 0.02f + 0.04f * o.artifact_reduction;
+		s.noise_floor = 0.008f + 0.02f * o.artifact_reduction;
 		UpdateCB(cb_sharp.Get(), &s, sizeof(s));
 		ID3D11ShaderResourceView *up = up_tmp.srv.Get();
 		DrawFullscreen(ps_sharpen.Get(), proc[latest].rtv.Get(), tw, th, &up, 1, cb_sharp.Get());
@@ -884,23 +926,70 @@ bool Renderer::ShaderUpscale(int tw, int th, const ProcessOptions &o)
 	return true;
 }
 
-void Renderer::UpdateAmbient()
+void Renderer::Deband(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst, int w, int h, float strength, float scale)
+{
+	DebandCB d = {};
+	d.threshold = 0.004f + 0.014f * strength;  // in signal units (10-bit step = 0.001)
+	d.radius = (6.0f + 14.0f * strength) * scale;
+	d.seed = (float)(frames_submitted % 997);
+	d.grain = 0.0012f;
+	UpdateCB(cb_deband.Get(), &d, sizeof(d));
+	DrawFullscreen(ps_deband.Get(), dst, w, h, &src, 1, cb_deband.Get());
+}
+
+bool Renderer::PostProcess(ID3D11ShaderResourceView *src, int tw, int th, float deband, float deband_scale,
+		float sharpness, float noise_floor)
+{
+	bool do_deband = deband > 0.01f, do_sharpen = sharpness > 0.01f;
+	if(!do_deband && !do_sharpen)
+		return false;
+	if(do_deband)
+	{
+		if(do_sharpen)
+		{
+			if(!EnsureTarget(post_tmp, tw, th, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false))
+				return false;
+			Deband(src, post_tmp.rtv.Get(), tw, th, deband, deband_scale);
+			src = post_tmp.srv.Get();
+		}
+		else
+		{
+			Deband(src, proc[latest].rtv.Get(), tw, th, deband, deband_scale);
+			return true;
+		}
+	}
+	SharpCB s = {};
+	s.sharpness = sharpness;
+	s.noise_floor = noise_floor;
+	UpdateCB(cb_sharp.Get(), &s, sizeof(s));
+	DrawFullscreen(ps_sharpen.Get(), proc[latest].rtv.Get(), tw, th, &src, 1, cb_sharp.Get());
+	return true;
+}
+
+void Renderer::UpdateAmbient(float paper_white)
 {
 	int w1 = std::max(1, video_w / 8), h1 = std::max(1, video_h / 8);
-	int w2 = std::max(1, w1 / 8), h2 = std::max(1, h1 / 8);
+	int w2 = std::max(1, w1 / 4), h2 = std::max(1, h1 / 4);
 	if(!EnsureTarget(amb_small1, w1, h1, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true)
 		|| !EnsureTarget(amb_small2, w2, h2, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true)
 		|| !EnsureTarget(amb[0], w2, h2, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true)
 		|| !EnsureTarget(amb[1], w2, h2, DXGI_FORMAT_R16G16B16A16_FLOAT, false, true))
 		return;
+	// level 1 decodes the stream (PQ or gamma) to linear nits, level 2 averages further
+	AmbDownCB dcb = {};
+	dcb.decode = video_hdr ? 2 : 1;
+	dcb.paper_white = paper_white;
+	UpdateCB(cb_amb_down.Get(), &dcb, sizeof(dcb));
 	ID3D11ShaderResourceView *s = rgb[latest].srv.Get();
-	Dispatch(cs_box8.Get(), &s, 1, amb_small1.uav.Get(), nullptr, w1, h1);
+	Dispatch(cs_box8.Get(), &s, 1, amb_small1.uav.Get(), cb_amb_down.Get(), w1, h1);
+	dcb.decode = 0;
+	UpdateCB(cb_amb_down.Get(), &dcb, sizeof(dcb));
 	s = amb_small1.srv.Get();
-	Dispatch(cs_box8.Get(), &s, 1, amb_small2.uav.Get(), nullptr, w2, h2);
+	Dispatch(cs_box8.Get(), &s, 1, amb_small2.uav.Get(), cb_amb_down.Get(), w2, h2);
 
 	int next = 1 - amb_index;
 	AmbCB a = {};
-	a.alpha = amb_valid ? 0.18f : 1.0f; // smooth over ~5 frames so the glow doesn't flicker
+	a.alpha = amb_valid ? 0.12f : 1.0f; // smooth steady scenes; the shader speeds up on cuts
 	UpdateCB(cb_amb.Get(), &a, sizeof(a));
 	ID3D11ShaderResourceView *srvs[2] = { amb_small2.srv.Get(), amb[amb_index].srv.Get() };
 	Dispatch(cs_amb_blend.Get(), srvs, 2, amb[next].uav.Get(), cb_amb.Get(), w2, h2);
@@ -1080,9 +1169,12 @@ void Renderer::DrawVideoOut(ID3D11RenderTargetView *rtv, int w, int h, ID3D11Sha
 	c.vibrance = o.vibrance;
 	c.win_size[0] = (float)w;
 	c.win_size[1] = (float)h;
+	c.ambient_style = o.ambient_style;
+	c.split = (o.compare && frames_submitted > 0) ? rect[0] + rect[2] * std::clamp(o.compare_split, 0.0f, 1.0f) : -1.0f;
+	c.orig_mode = video_hdr ? (out_hdr ? 2 : 3) : (out_hdr ? 1 : 0);
 	UpdateCB(cb_out.Get(), &c, sizeof(c));
-	ID3D11ShaderResourceView *srvs[2] = { video, amb_valid ? amb[amb_index].srv.Get() : nullptr };
-	DrawFullscreen(ps_out.Get(), rtv, w, h, srvs, 2, cb_out.Get());
+	ID3D11ShaderResourceView *srvs[3] = { video, amb_valid ? amb[amb_index].srv.Get() : nullptr, rgb[latest].srv.Get() };
+	DrawFullscreen(ps_out.Get(), rtv, w, h, srvs, 3, cb_out.Get());
 }
 
 void Renderer::Present(VideoView view, const PresentOptions &opt)
@@ -1192,6 +1284,7 @@ bool Renderer::SaveScreenshot(const std::wstring &path, const PresentOptions &op
 	PresentOptions o = opt;
 	o.aspect = AspectMode::Stretch;
 	o.hdr_boost = 0.0f;
+	o.compare = false;
 	DrawVideoOut(shot.rtv.Get(), vw, vh, video, vw, vh, content_hdr, false, o, false, true);
 
 	D3D11_TEXTURE2D_DESC td;

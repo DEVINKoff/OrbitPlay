@@ -4,6 +4,7 @@
 #include "audio.h"
 #include "discovery.h"
 #include "gamepad.h"
+#include "kbm.h"
 #include "registration.h"
 #include "renderer.h"
 #include "settings.h"
@@ -56,8 +57,26 @@ private:
 	void UiStreamDialogs();
 	void UiConnecting();
 	void UiMessage();
-	void UiEnhancementControls(bool compact);
-	void UiPictureControls(bool compact);
+	void UiStreamSection();
+	void UiUpscaleSection();
+	void UiFrameGenSection();
+	void UiPictureSection();
+	void UiControlsSection();
+	void UiSystemSection();
+	void Row(const char *label);
+	void RowHelp(const char *text);
+	void SetRowLayout(bool compact);
+	float row_label_w = 270.0f, row_item_w = 380.0f;
+
+	// streaming helpers
+	void ShowOverlay(bool open);
+	void ShowToast(const std::string &text);
+	bool HandleHotkey(SDL_Keycode key);
+	bool StreamSettingsChanged() const;
+	void ReconnectNow();
+	void SyncBindingsToSettings();
+	bool WantMouseCapture() const;
+	void UpdateMouseCapture();
 
 	std::string data_dir;
 	std::string settings_path;
@@ -73,6 +92,12 @@ private:
 	Renderer renderer;
 	Audio audio;
 	Gamepads gamepads;
+	KeyboardMouse kbm;
+	bool mouse_captured = false;
+	bool window_focused = true;
+	bool overlay_just_opened = false;
+	bool compare_on = false;
+	float compare_split = 0.5f;
 	Discovery discovery;
 	std::unique_ptr<StreamSession> session;
 	Registration registration;
