@@ -4,6 +4,10 @@ on:
   push:
   workflow_dispatch:
 
+concurrency:
+  group: ipad-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ipad:
     runs-on: macos-15
@@ -12,7 +16,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Tools
-        run: brew install ninja pkg-config || true
+        run: |
+          brew install ninja pkg-config || true
+          python3 -m pip install --break-system-packages protobuf
 
       - name: Restore dependencies
         id: deps-cache
