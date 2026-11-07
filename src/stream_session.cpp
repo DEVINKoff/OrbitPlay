@@ -9,7 +9,9 @@
 extern "C" {
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
+#ifdef _WIN32
 #include <libavutil/hwcontext_d3d11va.h>
+#endif
 }
 
 #include <algorithm>
@@ -21,16 +23,21 @@ static const uint16_t kHapticRumbleMin = 100;
 
 StreamSession::StreamSession()
 {
+#ifdef _WIN32
 	frame_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+#endif
 }
 
 StreamSession::~StreamSession()
 {
 	Stop();
+#ifdef _WIN32
 	if(frame_event)
 		CloseHandle(frame_event);
+#endif
 }
 
+#ifdef _WIN32
 static AVBufferRef *CreateD3D11VAContext(ID3D11Device *device, ID3D11DeviceContext *ctx)
 {
 	AVBufferRef *ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
@@ -50,6 +57,7 @@ static AVBufferRef *CreateD3D11VAContext(ID3D11Device *device, ID3D11DeviceConte
 	}
 	return ref;
 }
+#endif
 
 static ChiakiVideoResolutionPreset ResolutionPreset(int res)
 {
@@ -62,7 +70,7 @@ static ChiakiVideoResolutionPreset ResolutionPreset(int res)
 	}
 }
 
-bool StreamSession::Start(const StreamConfig &cfg, ID3D11Device *device, ID3D11DeviceContext *ctx, Audio *aud, std::string *error)
+bool StreamSession::Start(const StreamConfig &cfg, void *hw_device, void *hw_context, Audio *aud, std::string *error)
 {
 	Stop();
 	config = cfg;
@@ -83,12 +91,24 @@ bool StreamSession::Start(const StreamConfig &cfg, ID3D11Device *device, ID3D11D
 		codec = cfg.hdr ? CHIAKI_CODEC_H265_HDR : CHIAKI_CODEC_H265;
 
 	// Video decoder: D3D11VA on the renderer's device so frames never leave the GPU.
-	hw_device_ctx = CreateD3D11VAContext(device, ctx);
+#ifdef _WIN32
+	hw_device_ctx = CreateD3D11VAContext((ID3D11Device *)hw_device, (ID3D11DeviceContext *)hw_context);
 	if(!hw_device_ctx)
 		LOGW("Could not set up D3D11VA, falling back to software decoding");
+	const char *hw_name = hw_device_ctx ? "d3d11va" : nullptr;
+#elif defined(__APPLE__)
+	// VideoToolbox: chiaki creates the device; frames arrive as CVPixelBuffers (zero copy into Metal)
+	(void)hw_device;
+	(void)hw_context;
+	const char *hw_name = "videotoolbox";
+#else
+	(void)hw_device;
+	(void)hw_context;
+	const char *hw_name = nullptr;
+#endif
 	ChiakiErrorCode err = chiaki_ffmpeg_decoder_init(&decoder, log, codec, (unsigned)cfg.fps,
-			hw_device_ctx ? "d3d11va" : nullptr, hw_device_ctx, FrameAvailableCb, this);
-	if(err != CHIAKI_ERR_SUCCESS && hw_device_ctx)
+			hw_name, hw_device_ctx, FrameAvailableCb, this);
+	if(err != CHIAKI_ERR_SUCCESS && hw_name)
 	{
 		LOGW("Hardware decoder failed to start, trying software decoding");
 		av_buffer_unref(&hw_device_ctx);
@@ -444,7 +464,9 @@ void StreamSession::FrameAvailableCb(ChiakiFfmpegDecoder *, void *user)
 	auto *self = static_cast<StreamSession *>(user);
 	self->decoded_frames++;
 	self->last_frame_us = chiaki_time_now_monotonic_us();
+#ifdef _WIN32
 	SetEvent(self->frame_event);
+#endif
 }
 
 void StreamSession::AudioSettingsCb(uint32_t channels, uint32_t rate, void *user)

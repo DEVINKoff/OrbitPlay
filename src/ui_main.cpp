@@ -16,7 +16,7 @@
 #include <cstring>
 #include <ctime>
 
-#include <shellapi.h>
+#include "platform/platform.h"
 
 #ifndef ORBITPLAY_VERSION
 #define ORBITPLAY_VERSION "dev"
@@ -37,15 +37,7 @@ std::string App::FormatDuration(uint64_t seconds)
 	return b;
 }
 
-static std::string ClockText()
-{
-	wchar_t w[32] = {};
-	if(!GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, nullptr, nullptr, w, 32))
-		return "";
-	char u[64] = {};
-	WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof(u), nullptr, nullptr);
-	return u;
-}
+static std::string ClockText() { return platform::ClockText(); }
 
 // Controller battery: outline with a fill level, blue while charging
 static float DrawBattery(ImDrawList *dl, ImVec2 p, float h, int pct, bool charging)
@@ -70,9 +62,9 @@ static float DrawBattery(ImDrawList *dl, ImVec2 p, float h, int pct, bool chargi
 
 void App::ReleaseBackground()
 {
-	if(bg_srv)
-		bg_srv->Release();
-	bg_srv = nullptr;
+	if(bg_tex)
+		renderer.DestroyImage(bg_tex);
+	bg_tex = 0;
 	bg_w = bg_h = 0;
 }
 
@@ -80,7 +72,7 @@ void App::DrawBackground()
 {
 	ImGuiViewport *vp = ImGui::GetMainViewport();
 	int w = std::max(16, (int)vp->Size.x), h = std::max(16, (int)vp->Size.y);
-	if(!bg_srv || w != bg_w || h != bg_h)
+	if(!bg_tex || w != bg_w || h != bg_h)
 	{
 		ReleaseBackground();
 		std::vector<uint32_t> px((size_t)w * h);
@@ -124,29 +116,14 @@ void App::DrawBackground()
 				px[(size_t)y * w + x] = q(r) | (q(g) << 8) | (q(b) << 16) | 0xff000000u;
 			}
 		}
-		D3D11_TEXTURE2D_DESC td = {};
-		td.Width = (UINT)w;
-		td.Height = (UINT)h;
-		td.MipLevels = 1;
-		td.ArraySize = 1;
-		td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-		td.SampleDesc.Count = 1;
-		td.Usage = D3D11_USAGE_IMMUTABLE;
-		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-		D3D11_SUBRESOURCE_DATA sd = { px.data(), (UINT)(w * 4), 0 };
-		ID3D11Texture2D *tex = nullptr;
-		if(SUCCEEDED(renderer.Device()->CreateTexture2D(&td, &sd, &tex)))
-		{
-			renderer.Device()->CreateShaderResourceView(tex, nullptr, &bg_srv);
-			tex->Release();
-		}
+		bg_tex = renderer.CreateImage(w, h, px.data());
 		bg_w = w;
 		bg_h = h;
 	}
 	ImDrawList *dl = ImGui::GetBackgroundDrawList();
 	ImVec2 a = vp->Pos, b(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y);
-	if(bg_srv)
-		dl->AddImage((ImTextureID)(intptr_t)bg_srv, a, b);
+	if(bg_tex)
+		dl->AddImage(bg_tex, a, b);
 	else
 		dl->AddRectFilledMultiColor(a, b, IM_COL32(24, 25, 30, 255), IM_COL32(20, 22, 28, 255), IM_COL32(9, 10, 14, 255), IM_COL32(10, 11, 15, 255));
 }
@@ -372,12 +349,17 @@ void App::DrawCategory(int cat, bool compact)
 			ImGui::Text("Orbit Play %s", ORBITPLAY_VERSION);
 			Row("Settings and log");
 			if(ImGui::Button("Open folder"))
-				ShellExecuteA(nullptr, "open", data_dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+				platform::OpenFolder(data_dir);
 			RowHelp(data_dir.c_str());
+#ifdef _WIN32
 			Row("Screenshots");
 			ImGui::TextUnformatted("Pictures\\Orbit Play");
 			Row("Recordings");
 			ImGui::TextUnformatted("Videos\\Orbit Play");
+#else
+			Row("Screenshots and recordings");
+			ImGui::TextUnformatted("Files app > On My iPad > Orbit Play");
+#endif
 			SubHeader("Built with");
 			Row("chiaki-ng");
 			ImGui::TextUnformatted("Remote Play protocol  -  AGPL-3.0");

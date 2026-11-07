@@ -7,10 +7,13 @@
 #include <chiaki/common.h>
 #include <chiaki/time.h>
 
+#include "platform/platform.h"
+
+#ifdef _WIN32
 #include <shellapi.h>
+#endif
 
 #include <imgui.h>
-#include <imgui_impl_dx11.h>
 #include <imgui_impl_sdl3.h>
 
 extern "C" {
@@ -36,11 +39,9 @@ static uint64_t NowMs() { return chiaki_time_now_monotonic_ms(); }
 bool App::Init(const std::string &resume)
 {
 	resume_mac = resume;
-	const char *appdata = getenv("APPDATA");
-	data_dir = std::string(appdata ? appdata : ".") + "\\OrbitPlay";
-	CreateDirectoryA(data_dir.c_str(), nullptr);
-	settings_path = data_dir + "\\settings.ini";
-	Log::Get().Open(data_dir + "\\orbitplay.log");
+	data_dir = platform::DataDir();
+	settings_path = platform::JoinPath(data_dir, "settings.ini");
+	Log::Get().Open(platform::JoinPath(data_dir, "orbitplay.log"));
 	LOGI("%s starting", kAppName);
 
 	ChiakiErrorCode err = chiaki_lib_init();
@@ -52,7 +53,7 @@ bool App::Init(const std::string &resume)
 
 	settings.Load(settings_path);
 	if(settings.last_version.empty() && settings.upscale_mode == 1
-		&& GetFileAttributesA((data_dir + "\\crash.dmp").c_str()) != INVALID_FILE_ATTRIBUTES)
+		&& platform::FileExists(platform::JoinPath(data_dir, "crash.dmp")))
 	{
 		settings.upscale_mode = 2;
 		LOGI("Restored AI upscaling (1.6.0 had switched it off after a crash report)");
@@ -76,6 +77,7 @@ bool App::Init(const std::string &resume)
 		return false;
 	}
 
+#ifdef _WIN32
 	// Created hidden: the app's own title bar is installed and the last size/position restored
 	// before the window first appears.
 	window = SDL_CreateWindow(kAppName, 1600, 900, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN
@@ -96,18 +98,41 @@ bool App::Init(const std::string &resume)
 		LOGE("Renderer initialization failed");
 		return false;
 	}
+#else
+	// iPad: one full-screen Metal window
+	window = SDL_CreateWindow(kAppName, 0, 0, SDL_WINDOW_FULLSCREEN | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_METAL
+		| SDL_WINDOW_BORDERLESS | SDL_WINDOW_RESIZABLE);
+	if(!window || !renderer.Init(window))
+	{
+		LOGE("Window / renderer initialization failed: %s", SDL_GetError());
+		return false;
+	}
+#endif
 
 	IMGUI_CHECKVERSION();
 	ImGui::CreateContext();
 	ImGuiIO &io = ImGui::GetIO();
 	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
 	io.IniFilename = nullptr;
+#ifdef _WIN32
+	// Windows: the interface works in pixels; scale with the display's DPI
 	ui_scale = SDL_GetWindowDisplayScale(window);
+	font_density = 1.0f;
+#else
+	// iPad: the interface works in points (fonts are rasterized at the screen's pixel density);
+	// a little larger than on a PC for touch
+	ui_scale = 1.15f;
+	font_density = std::max(1.0f, SDL_GetWindowPixelDensity(window));
+#endif
 	if(ui_scale <= 0.0f)
 		ui_scale = 1.0f;
 	SetupStyle(ui_scale);
+#ifdef _WIN32
 	ImGui_ImplSDL3_InitForD3D(window);
-	ImGui_ImplDX11_Init(renderer.Device(), renderer.Context());
+#else
+	ImGui_ImplSDL3_InitForMetal(window);
+#endif
+	renderer.ImGuiInit();
 
 	audio.SetVolume(settings.volume);
 	sounds.Init();
@@ -133,14 +158,14 @@ bool App::Init(const std::string &resume)
 // at the time so the next stream starts safely.
 void App::CheckCrashMarker()
 {
-	std::string marker = data_dir + "\\crash.txt";
+	std::string marker = platform::JoinPath(data_dir, "crash.txt");
 	std::ifstream in(marker);
 	if(!in)
 		return;
 	std::stringstream ss;
 	ss << in.rdbuf();
 	in.close();
-	DeleteFileA(marker.c_str());
+	platform::RemoveFile(marker);
 	std::string ctx = ss.str();
 	LOGW("Previous run crashed (%s)", ctx.c_str());
 	if(ctx.find("exiting") != std::string::npos)
@@ -168,7 +193,7 @@ void App::Shutdown()
 	settings.Save(settings_path);
 	sounds.Shutdown();
 	ReleaseBackground();
-	ImGui_ImplDX11_Shutdown();
+	renderer.ImGuiShutdown();
 	ImGui_ImplSDL3_Shutdown();
 	ImGui::DestroyContext();
 	renderer.Shutdown();
@@ -178,25 +203,17 @@ void App::Shutdown()
 	LOGI("Bye");
 }
 
-// Fonts are compiled into the exe (IBM Plex Sans, SIL Open Font License).
-static bool FontResource(int id, void **data, int *size)
-{
-	HRSRC r = FindResourceW(nullptr, MAKEINTRESOURCEW(id), (LPCWSTR)RT_RCDATA);
-	HGLOBAL g = r ? LoadResource(nullptr, r) : nullptr;
-	*data = g ? LockResource(g) : nullptr;
-	*size = r ? (int)SizeofResource(nullptr, r) : 0;
-	return *data && *size > 0;
-}
-
 void App::SetupStyle(float scale)
 {
 	ImGuiIO &io = ImGui::GetIO();
 	io.Fonts->Clear();
-	const char *icon_font = "C:\\Windows\\Fonts\\SegoeIcons.ttf";       // Windows 11
-	if(GetFileAttributesA(icon_font) == INVALID_FILE_ATTRIBUTES)
-		icon_font = "C:\\Windows\\Fonts\\segmdl2.ttf";                  // Windows 10
-	auto exists = [](const char *f) { return GetFileAttributesA(f) != INVALID_FILE_ATTRIBUTES; };
-	g_icons = exists(icon_font);
+	std::string icon_path = platform::IconFontPath();   // Segoe Fluent / MDL2 icons on Windows, none on iPad
+	const char *icon_font = icon_path.c_str();
+	auto exists = [](const char *f) { return platform::FileExists(f); };
+	g_icons = !icon_path.empty();
+	// fonts are rasterized at the screen's pixel density and drawn at 1/density (sharp on Retina)
+	float raster = scale * font_density;
+	io.FontGlobalScale = 1.0f / font_density;
 	static const ImWchar icon_ranges[] = { ICON_RANGE_MIN, ICON_RANGE_MAX, 0 };
 	const ImWchar *text_ranges = io.Fonts->GetGlyphRangesCyrillic(); // Latin + Cyrillic game names
 
@@ -206,10 +223,10 @@ void App::SetupStyle(float scale)
 		cfg.OversampleH = 2;
 		cfg.FontDataOwnedByAtlas = false;
 		ImFont *f = nullptr;
-		void *data;
+		const void *data;
 		int size;
-		if(FontResource(100 + weight, &data, &size))
-			f = io.Fonts->AddFontFromMemoryTTF(data, size, px * scale, &cfg, text_ranges);
+		if(platform::FontData(weight, &data, &size))
+			f = io.Fonts->AddFontFromMemoryTTF((void *)data, size, px * raster, &cfg, text_ranges);
 		else
 		{
 			const char *fallback = weight >= 3 ? "C:\\Windows\\Fonts\\seguisb.ttf" : weight == 1 ? "C:\\Windows\\Fonts\\segoeuil.ttf"
@@ -217,11 +234,11 @@ void App::SetupStyle(float scale)
 			if(!exists(fallback))
 				fallback = "C:\\Windows\\Fonts\\segoeui.ttf";
 			if(exists(fallback))
-				f = io.Fonts->AddFontFromFileTTF(fallback, px * scale, &cfg, text_ranges);
+				f = io.Fonts->AddFontFromFileTTF(fallback, px * raster, &cfg, text_ranges);
 			else
 			{
 				ImFontConfig dc;
-				dc.SizePixels = px * 0.8f * scale;
+				dc.SizePixels = px * 0.8f * raster;
 				f = io.Fonts->AddFontDefault(&dc);
 			}
 		}
@@ -229,9 +246,9 @@ void App::SetupStyle(float scale)
 		{
 			ImFontConfig ic;
 			ic.MergeMode = true;
-			ic.GlyphOffset = ImVec2(0, px * 0.14f * scale);
-			ic.GlyphMinAdvanceX = px * scale;
-			io.Fonts->AddFontFromFileTTF(icon_font, px * 0.85f * scale, &ic, icon_ranges);
+			ic.GlyphOffset = ImVec2(0, px * 0.14f * raster);
+			ic.GlyphMinAdvanceX = px * raster;
+			io.Fonts->AddFontFromFileTTF(icon_font, px * 0.85f * raster, &ic, icon_ranges);
 		}
 		return f;
 	};
@@ -313,6 +330,9 @@ void App::SetFullscreen(bool fullscreen)
 
 bool App::FrameGenActive() const
 {
+#ifndef _WIN32
+	return false; // not on iPad yet
+#endif
 	return settings.frame_gen != 0 && !compare_on && !showcase_on;
 }
 
@@ -358,17 +378,14 @@ void App::TakeScreenshot()
 {
 	if(!renderer.HasVideo())
 		return;
-	wchar_t profile[MAX_PATH] = {};
-	DWORD n = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
-	std::wstring dir = (n ? std::wstring(profile) : std::wstring(L".")) + L"\\Pictures\\Orbit Play";
-	CreateDirectoryW(dir.c_str(), nullptr);
-	SYSTEMTIME st;
-	GetLocalTime(&st);
-	wchar_t name[64];
-	swprintf(name, 64, L"\\OrbitPlay_%04d%02d%02d_%02d%02d%02d.png", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-	if(renderer.SaveScreenshot(dir + name, MakePresentOptions(1)))
+	std::string path = platform::JoinPath(platform::CaptureDir(false), platform::TimestampName("OrbitPlay", "png"));
+	if(renderer.SaveScreenshot(path, MakePresentOptions(1)))
 	{
+#ifdef _WIN32
 		toast = "Screenshot saved to Pictures\\Orbit Play";
+#else
+		toast = "Screenshot saved (Files > On My iPad > Orbit Play)";
+#endif
 		toast_until = NowMs() + 2500;
 	}
 }
@@ -423,6 +440,10 @@ void App::ProcessPendingFrames()
 
 void App::Run()
 {
+#ifndef _WIN32
+	RunApple();
+}
+#else
 	while(!quit)
 	{
 		if(renderer.DeviceLost())
@@ -502,6 +523,7 @@ void App::Run()
 		PresentFrame(new_frame);
 	}
 }
+#endif
 
 void App::PumpEvents()
 {
@@ -517,8 +539,19 @@ void App::PumpEvents()
 				SyncBindingsToSettings();
 			continue;
 		}
+		// Touches arrive as mouse events too: they drive the interface, never the camera.
+		// While playing, tapping the screen opens the menu (iPad has no Esc key on screen).
+		bool from_touch = (e.type == SDL_EVENT_MOUSE_MOTION && e.motion.which == SDL_TOUCH_MOUSEID)
+			|| ((e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_UP) && e.button.which == SDL_TOUCH_MOUSEID)
+			|| (e.type == SDL_EVENT_MOUSE_WHEEL && e.wheel.which == SDL_TOUCH_MOUSEID);
+		if(from_touch && e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && phase == Phase::Streaming && !overlay_open && !keyboard_open
+			&& !login_pin_open)
+		{
+			ShowOverlay(true);
+			continue;
+		}
 		// While the mouse is captured, keyboard and mouse play the game
-		if(kbm_event && mouse_captured)
+		if(kbm_event && mouse_captured && !from_touch)
 			kbm.HandleEvent(e);
 		else
 			ImGui_ImplSDL3_ProcessEvent(&e);
@@ -534,7 +567,19 @@ void App::PumpEvents()
 				break;
 			case SDL_EVENT_QUIT:
 			case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+			case SDL_EVENT_TERMINATING:
 				quit = true;
+				break;
+			// iPad: leaving the app ends the stream (the system suspends the network anyway)
+			case SDL_EVENT_WILL_ENTER_BACKGROUND:
+				if(session)
+					EndStream("", false);
+				FlushPlaytime();
+				settings.Save(settings_path);
+				in_background = true;
+				break;
+			case SDL_EVENT_DID_ENTER_FOREGROUND:
+				in_background = false;
 				break;
 			case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
 				renderer.Resize(e.window.data1, e.window.data2);
@@ -554,7 +599,7 @@ void App::PumpEvents()
 				{
 					ui_scale = s;
 					SetupStyle(ui_scale);
-					ImGui_ImplDX11_InvalidateDeviceObjects();
+					renderer.ImGuiInvalidate();
 				}
 				break;
 			}
@@ -590,6 +635,21 @@ void App::Tick()
 	{
 		renderer.RefreshDisplayInfo();
 		last_display_refresh = now;
+	}
+
+	// iPad: broadcasts are blocked without a special entitlement, so ask every address of the local
+	// network directly, 16 at a time, a full sweep every ~10 s. (Nothing to do on Windows.)
+	if(phase != Phase::Streaming && now - last_subnet_probe > 250)
+	{
+		last_subnet_probe = now;
+		if(subnet_pos >= subnet_hosts.size() && now - last_subnet_sweep > 10000)
+		{
+			subnet_hosts = platform::LocalSubnetHosts();
+			subnet_pos = 0;
+			last_subnet_sweep = now;
+		}
+		for(int k = 0; k < 16 && subnet_pos < subnet_hosts.size(); k++)
+			discovery.ProbeAddress(subnet_hosts[subnet_pos++]);
 	}
 
 	// Probe consoles by IP: manual entries and the last address of paired consoles.
@@ -928,13 +988,13 @@ void App::SendInput()
 
 void App::PresentFrame(bool new_frame)
 {
-	ImGui_ImplDX11_NewFrame();
+	renderer.ImGuiNewFrame();
 	ImGui_ImplSDL3_NewFrame();
 	ImGui::NewFrame();
 	BuildUi();
 	ImGui::Render();
 	renderer.BeginOverlay();
-	ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+	renderer.ImGuiRender();
 
 	bool streaming = phase == Phase::Streaming && session;
 	bool fg = streaming && FrameGenActive();
@@ -1033,7 +1093,7 @@ void App::StartStream()
 	session = std::make_unique<StreamSession>();
 	renderer.ResetVideo();
 	std::string error;
-	if(!session->Start(cfg, renderer.Device(), renderer.Context(), &audio, &error))
+	if(!session->Start(cfg, renderer.DecoderDevice(), renderer.DecoderContext(), &audio, &error))
 	{
 		session.reset();
 		phase = Phase::Idle;
@@ -1157,6 +1217,10 @@ void App::UpdateBatteryWarnings(uint64_t now)
 // Small always-on-top window in the corner of the screen (watch while doing something else)
 void App::ToggleMiniPlayer()
 {
+#ifndef _WIN32
+	ShowToast("The mini player is only on Windows");
+	return;
+#endif
 	if(!mini_mode)
 	{
 		mini_was_fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
@@ -1819,21 +1883,7 @@ void App::UiSystemSection()
 
 std::string App::CapturePath(const char *prefix)
 {
-	wchar_t profile[MAX_PATH] = {};
-	DWORD n = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
-	std::wstring dir = (n ? std::wstring(profile) : std::wstring(L".")) + L"\\Videos\\Orbit Play";
-	CreateDirectoryW((n ? std::wstring(profile) + L"\\Videos" : std::wstring(L".")).c_str(), nullptr);
-	CreateDirectoryW(dir.c_str(), nullptr);
-	SYSTEMTIME st;
-	GetLocalTime(&st);
-	wchar_t name[96];
-	swprintf(name, 96, L"\\%hs_%04d%02d%02d_%02d%02d%02d.mp4", prefix, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-	std::wstring w = dir + name;
-	int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
-	std::string out(len > 0 ? len - 1 : 0, '\0');
-	if(len > 0)
-		WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &out[0], len, nullptr, nullptr);
-	return out;
+	return platform::JoinPath(platform::CaptureDir(true), platform::TimestampName(prefix, "mp4"));
 }
 
 void App::ToggleRecording()
@@ -1927,17 +1977,12 @@ void App::UiCaptureSection()
 	RowHelp("Missed a great moment? Press F10 and the last seconds are saved as a clip. "
 		"Uses about 2 MB of memory per second of replay.");
 	Row("Folder");
+#ifdef _WIN32
 	if(ImGui::Button("Open Videos\\Orbit Play"))
-	{
-		std::string p = CapturePath("x");
-		size_t slash = p.find_last_of('\\');
-		std::string dir = slash == std::string::npos ? p : p.substr(0, slash);
-		int wl = MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), -1, nullptr, 0);
-		std::wstring wd(wl > 0 ? wl - 1 : 0, L'\0');
-		if(wl > 0)
-			MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), -1, &wd[0], wl);
-		ShellExecuteW(nullptr, L"open", wd.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-	}
+		platform::OpenFolder(platform::CaptureDir(true));
+#else
+	ImGui::TextUnformatted("Files app > On My iPad > Orbit Play");
+#endif
 	if(changed)
 		MarkSettingsDirty();
 }

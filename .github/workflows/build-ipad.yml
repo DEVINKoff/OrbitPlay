@@ -1,0 +1,42 @@
+name: Build iPad app
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  ipad:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: brew install ninja pkg-config || true
+
+      - name: Restore dependencies
+        id: deps-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ios/deps/prefix
+          key: ios-deps-${{ hashFiles('ios/deps.version') }}
+
+      - name: Build dependencies
+        run: ios/build.sh deps
+
+      - name: Save dependencies
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ios/deps/prefix
+          key: ios-deps-${{ hashFiles('ios/deps.version') }}
+
+      - name: Build app
+        run: ios/build.sh
+
+      - name: Upload unsigned .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrbitPlay-iPad-unsigned
+          path: build-ios/OrbitPlay.ipa
+          if-no-files-found: error

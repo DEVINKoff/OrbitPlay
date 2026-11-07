@@ -1449,8 +1449,12 @@ static bool WritePng(const std::wstring &path, int w, int h, const std::vector<u
 	return ok;
 }
 
-bool Renderer::SaveScreenshot(const std::wstring &path, const PresentOptions &opt)
+bool Renderer::SaveScreenshot(const std::string &path_utf8, const PresentOptions &opt)
 {
+	int wl = MultiByteToWideChar(CP_UTF8, 0, path_utf8.c_str(), -1, nullptr, 0);
+	std::wstring path(wl > 0 ? wl - 1 : 0, L'\0');
+	if(wl > 0)
+		MultiByteToWideChar(CP_UTF8, 0, path_utf8.c_str(), -1, &path[0], wl);
 	if(frames_submitted == 0)
 		return false;
 	int vw, vh;
@@ -1496,4 +1500,40 @@ bool Renderer::SaveScreenshot(const std::wstring &path, const PresentOptions &op
 			LOGE("Could not save screenshot");
 	}).detach();
 	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Interface drawing
+
+#include <imgui_impl_dx11.h>
+
+bool Renderer::ImGuiInit() { return ImGui_ImplDX11_Init(device.Get(), context.Get()); }
+void Renderer::ImGuiShutdown() { ImGui_ImplDX11_Shutdown(); }
+void Renderer::ImGuiNewFrame() { ImGui_ImplDX11_NewFrame(); }
+void Renderer::ImGuiRender() { ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData()); }
+void Renderer::ImGuiInvalidate() { ImGui_ImplDX11_InvalidateDeviceObjects(); }
+
+ImTextureID Renderer::CreateImage(int w, int h, const uint32_t *rgba)
+{
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = (UINT)w;
+	td.Height = (UINT)h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_IMMUTABLE;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	D3D11_SUBRESOURCE_DATA sd = { rgba, (UINT)(w * 4), 0 };
+	Com<ID3D11Texture2D> tex;
+	ID3D11ShaderResourceView *srv = nullptr;
+	if(FAILED(device->CreateTexture2D(&td, &sd, tex.Put())) || FAILED(device->CreateShaderResourceView(tex.Get(), nullptr, &srv)))
+		return 0;
+	return (ImTextureID)(intptr_t)srv;
+}
+
+void Renderer::DestroyImage(ImTextureID id)
+{
+	if(id)
+		((ID3D11ShaderResourceView *)(intptr_t)id)->Release();
 }

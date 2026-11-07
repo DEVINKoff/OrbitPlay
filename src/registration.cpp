@@ -5,11 +5,17 @@
 #include <cstring>
 #include <thread>
 
+#include <SDL3/SDL_misc.h>
+
 #ifdef _WIN32
 #include <windows.h>
-#include <shellapi.h>
 #include <winhttp.h>
 #endif
+
+// One HTTPS request to Sony's sign-in server (WinHTTP on Windows, NSURLSession on Apple).
+// `headers` are "Name: value\r\n" lines.
+bool HttpsRequest(const std::string &method, const std::string &path, const std::string &headers,
+		const std::string &body, std::string *response, int *status);
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -141,10 +147,7 @@ std::string PsnLogin::LoginUrl()
 
 void PsnLogin::OpenLoginPage()
 {
-#ifdef _WIN32
-	std::string url = LoginUrl();
-	ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-#endif
+	SDL_OpenURL(LoginUrl().c_str());
 }
 
 void PsnLogin::Start(const std::string &redirect_url)
@@ -220,7 +223,7 @@ static std::wstring Widen(const std::string &s)
 }
 
 // Minimal HTTPS request through WinHTTP (uses the Windows certificate store and proxy settings).
-static bool HttpsRequest(const std::string &method, const std::string &path, const std::string &headers,
+bool HttpsRequest(const std::string &method, const std::string &path, const std::string &headers,
 		const std::string &body, std::string *response, int *status)
 {
 	bool ok = false;
@@ -265,7 +268,6 @@ void PsnLogin::Run(std::string code)
 		state = State::Failed;
 		LOGE("PSN sign-in: %s", msg.c_str());
 	};
-#ifdef _WIN32
 	std::string creds = std::string(kClientId) + ":" + kClientSecret;
 	std::string auth = "Authorization: Basic " + Base64Encode((const uint8_t *)creds.data(), creds.size()) + "\r\n";
 
@@ -295,8 +297,4 @@ void PsnLogin::Run(std::string code)
 		state = State::Success;
 	}
 	LOGI("PSN sign-in succeeded, account id fetched");
-#else
-	(void)code;
-	fail("PSN sign-in is only implemented on Windows.");
-#endif
 }

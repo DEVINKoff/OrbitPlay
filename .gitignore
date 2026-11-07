@@ -1,3 +1,5 @@
 build/
 dist/
 *.zip
+ios/deps/
+build-ios/

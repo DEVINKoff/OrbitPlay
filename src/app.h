@@ -8,7 +8,11 @@
 #include "frametimeline.h"
 #include "recorder.h"
 #include "registration.h"
+#ifdef _WIN32
 #include "renderer.h"
+#else
+#include "apple/renderer_metal.h"
+#endif
 #include "settings.h"
 #include "stream_session.h"
 #include "uisound.h"
@@ -28,6 +32,9 @@ class App
 public:
 	bool Init(const std::string &resume_mac = "");
 	void Run();
+#ifndef _WIN32
+	void RunApple();   // iPad main loop (apple/app_apple.cpp)
+#endif
 	void Shutdown();
 
 	// The GPU was reset: main() restarts the app, which then reconnects to this console.
@@ -36,7 +43,9 @@ public:
 	// Mini player hit-testing (drag the borderless window)
 	bool MiniMode() const { return mini_mode; }
 	// Custom title bar (window_chrome.cpp)
+#ifdef _WIN32
 	LRESULT ChromeHitTest(int x, int y);
+#endif
 	float MiniAspect() const;
 	bool WindowFullscreen() const;
 
@@ -148,8 +157,11 @@ private:
 	uint64_t last_settings_save = 0;
 
 	SDL_Window *window = nullptr;
+#ifdef _WIN32
 	HWND hwnd = nullptr;
+#endif
 	float ui_scale = 1.0f;
+	float font_density = 1.0f;          // fonts are rasterized at this many pixels per UI unit
 	struct ImFont *label_font = nullptr;   // large font for the compare / showcase labels
 	bool quit = false;
 
@@ -233,11 +245,15 @@ private:
 	// v1.6: PS5-style home, sounds, intro
 	UiSound sounds;
 	int home_sel = 0;
+	bool in_background = false;          // iPad: app is in the background (no drawing allowed)
+	std::vector<std::string> subnet_hosts; // iPad: addresses still to ask while looking for consoles
+	size_t subnet_pos = 0;
+	uint64_t last_subnet_probe = 0, last_subnet_sweep = 0;
 	std::vector<ImVec4> chrome_nodrag;   // clickable things in the drag band (client coords)
 	float caption_h = 0.0f, chrome_alpha = 1.0f;
 	uint64_t page_change_ms = 0;
 	int page_key = -1;
-	struct ID3D11ShaderResourceView *bg_srv = nullptr;
+	ImTextureID bg_tex = 0;
 	int bg_w = 0, bg_h = 0;
 	bool home_focus_pending = true;
 

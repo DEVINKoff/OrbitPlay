@@ -9,6 +9,8 @@
 #include <memory>
 #include <string>
 
+#include <imgui.h>
+
 struct AVFrame;
 class VpScaler;
 
@@ -31,50 +33,7 @@ private:
 	T *p = nullptr;
 };
 
-enum class UpscaleMode : int { Off = 0, Enhanced = 1, AI = 2 };
-enum class AspectMode : int { Fit = 0, Fill = 1, Stretch = 2 };
-
-// How each decoded frame is processed (applied in SubmitFrame).
-struct ProcessOptions
-{
-	UpscaleMode upscale = UpscaleMode::Off;
-	int target_height = 0;          // 0 = match the video area on screen
-	float artifact_reduction = 0.4f;
-	float sharpness = 0.5f;         // enhanced upscaler
-	float ai_sharpness = 0.35f;     // extra sharpening after AI super resolution (0..2)
-	float texture_boost = 0.0f;     // fine texture enhancement, 0..1
-	float clarity = 0.0f;           // large-radius local contrast, 0..1
-	float overshoot = 0.0f;         // allow sharpening past local min/max (0 = no halos), 0..1
-	float deband = 0.3f;            // gradient banding removal, 0 = off
-	float paper_white = 203.0f;     // used to put SDR and HDR on one scale for ambient light
-	bool ai_hdr = false;            // NVIDIA RTX Video HDR for SDR streams on an HDR display
-	bool frame_gen = false;
-	bool ambient = false;
-	AspectMode aspect = AspectMode::Fit;
-};
-
-// How the picture is shown (applied in Present).
-struct PresentOptions
-{
-	int sync_interval = 1;          // 0 = present immediately (tearing allowed if supported)
-	float paper_white = 203.0f;
-	float hdr_boost = 0.0f;         // SDR -> HDR highlight expansion (shader), 0..1
-	float ambient = 0.0f;           // ambient light intensity, 0 = off
-	AspectMode aspect = AspectMode::Fit;
-	int ambient_style = 0;          // 0 glow, 1 extend
-	float brightness = 0.0f, contrast = 1.0f, saturation = 1.0f, vibrance = 0.0f;
-	bool compare = false;           // split screen: original on the left, processed on the right
-	float compare_split = 0.5f;     // divider position, fraction of the video width
-};
-
-enum class VideoView { None, Latest, Interpolated };
-
-struct SubmitResult
-{
-	uint64_t serial = 0;     // id of the stored frame, 0 = not stored
-	bool duplicate = false;  // identical to the previous frame (30 fps game in a 60 fps stream, static scene)
-	bool scene_cut = false;  // most of the picture changed: don't interpolate across it
-};
+#include "renderer_types.h"
 
 // D3D11 renderer: hardware decoded frames in, HDR10 or SDR swap chain out.
 class Renderer
@@ -89,6 +48,18 @@ public:
 
 	ID3D11Device *Device() const { return device.Get(); }
 	ID3D11DeviceContext *Context() const { return context.Get(); }
+	// For the hardware video decoder (D3D11VA): device and immediate context
+	void *DecoderDevice() const { return device.Get(); }
+	void *DecoderContext() const { return context.Get(); }
+
+	// Interface (Dear ImGui) drawing, and simple images for it
+	bool ImGuiInit();
+	void ImGuiShutdown();
+	void ImGuiNewFrame();
+	void ImGuiRender();
+	void ImGuiInvalidate();
+	ImTextureID CreateImage(int w, int h, const uint32_t *rgba);
+	void DestroyImage(ImTextureID id);
 
 	void RefreshDisplayInfo();
 	bool DisplayHdr() const { return display_hdr; }
@@ -136,7 +107,7 @@ public:
 	void GetVideoRect(AspectMode aspect, float rect[4]) const { float uv[4]; VideoRect(aspect, width, height, rect, uv); }
 
 	// Saves the current frame (SDR, tone mapped if needed) as a PNG.
-	bool SaveScreenshot(const std::wstring &path, const PresentOptions &options);
+	bool SaveScreenshot(const std::string &path_utf8, const PresentOptions &options);
 
 private:
 	struct Target

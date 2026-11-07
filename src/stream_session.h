@@ -8,8 +8,9 @@
 #include <chiaki/opusencoder.h>
 #include <chiaki/ffmpegdecoder.h>
 
+#ifdef _WIN32
 #include <windows.h>
-#include <d3d11.h>
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -66,7 +67,9 @@ public:
 	StreamSession();
 	~StreamSession();
 
-	bool Start(const StreamConfig &config, ID3D11Device *device, ID3D11DeviceContext *ctx, Audio *audio, std::string *error);
+	// hw_device / hw_context: the renderer's D3D11 device and context on Windows (D3D11VA decoding);
+	// unused on Apple, where VideoToolbox decodes into CVPixelBuffers.
+	bool Start(const StreamConfig &config, void *hw_device, void *hw_context, Audio *audio, std::string *error);
 	void SetRecorder(Recorder *r) { recorder = r; }
 	void Stop();
 
@@ -77,7 +80,11 @@ public:
 	AVFrame *PullFrame();
 	// When the newest frame finished decoding (microseconds, chiaki monotonic clock).
 	uint64_t LastFrameTimeUs() const { return last_frame_us; }
+#ifdef _WIN32
 	HANDLE FrameEvent() const { return frame_event; }
+#endif
+	// Frames decoded so far (lets a platform without event handles see that a new one arrived)
+	uint64_t DecodedFrames() const { return decoded_frames; }
 
 	void SetControllerState(const ChiakiControllerState &state);
 	std::vector<SessionEvent> TakeEvents();
@@ -122,7 +129,9 @@ private:
 	ChiakiOpusEncoder opus_encoder = {};
 	AVBufferRef *hw_device_ctx = nullptr;
 	bool session_inited = false, decoder_inited = false, opus_inited = false;
+#ifdef _WIN32
 	HANDLE frame_event = nullptr;
+#endif
 
 	std::atomic<bool> running{ false };
 	std::atomic<bool> connected{ false };

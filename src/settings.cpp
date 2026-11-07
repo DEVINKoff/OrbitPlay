@@ -2,7 +2,12 @@
 #include "settings.h"
 #include "log.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <cstdio>
+#include <filesystem>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -493,9 +498,16 @@ void Settings::Save(const std::string &path) const
 	}
 	// Replace in one step (a crash or power cut can never leave a half-written or missing file),
 	// keeping the previous version as a backup.
+#ifdef _WIN32
 	CopyFileA(path.c_str(), (path + ".bak").c_str(), FALSE);
 	if(!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
 		LOGE("Could not replace %s (error %lu)", path.c_str(), (unsigned long)GetLastError());
+#else
+	std::error_code ec;
+	std::filesystem::copy_file(path, path + ".bak", std::filesystem::copy_options::overwrite_existing, ec);
+	if(std::rename(tmp.c_str(), path.c_str()) != 0) // atomic on POSIX
+		LOGE("Could not replace %s", path.c_str());
+#endif
 }
 
 GameProfile *Settings::FindProfile(const std::string &game)
