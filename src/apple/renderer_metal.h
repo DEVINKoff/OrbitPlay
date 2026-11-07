@@ -34,7 +34,7 @@ public:
 	void ImGuiRender() {}          // drawn inside Present, on top of the video
 	void ImGuiInvalidate() {}
 	ImTextureID CreateImage(int w, int h, const uint32_t *rgba);
-	void DestroyImage(ImTextureID id);
+	void DestroyImage(ImTextureID tex);
 
 	void RefreshDisplayInfo();
 	bool DisplayHdr() const { return false; }   // HDR streams are tone-mapped for now

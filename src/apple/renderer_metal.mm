@@ -363,13 +363,13 @@ ImTextureID Renderer::CreateImage(int w, int h, const uint32_t *rgba)
 	td.storageMode = MTLStorageModeShared;
 	id<MTLTexture> t = [d->dev newTextureWithDescriptor:td];
 	[t replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)w, (NSUInteger)h) mipmapLevel:0 withBytes:rgba bytesPerRow:(NSUInteger)w * 4];
-	return (ImTextureID)(__bridge_retained void *)t;
+	return (ImTextureID)(intptr_t)(__bridge_retained void *)t;
 }
 
-void Renderer::DestroyImage(ImTextureID id)
+void Renderer::DestroyImage(ImTextureID tex)
 {
-	if(id)
-		CFRelease((CFTypeRef)(void *)id);
+	if(tex)
+		CFRelease((CFTypeRef)(void *)(intptr_t)tex);
 }
 
 // ---------------------------------------------------------------------------
