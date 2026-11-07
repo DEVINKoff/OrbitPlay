@@ -17,7 +17,7 @@ jobs:
 
       - name: Tools
         run: |
-          brew install ninja pkg-config || true
+          brew install ninja pkg-config protobuf || true
           python3 -m pip install --break-system-packages protobuf
 
       - name: Restore dependencies

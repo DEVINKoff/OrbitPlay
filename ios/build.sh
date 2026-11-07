@@ -90,7 +90,7 @@ step "Orbit Play"
 B="$ROOT/build-ios"
 cmake -S "$ROOT" -B "$B" "${CMAKE_IOS[@]}" -DCMAKE_INSTALL_PREFIX="$B/install" \
 	-DCHIAKI_LIB_ENABLE_MBEDTLS=OFF -DCHIAKI_ENABLE_RUDP=OFF -DOPENSSL_ROOT_DIR="$P" -DOPENSSL_USE_STATIC_LIBS=ON \
-	-DSDL3_DIR="$P/lib/cmake/SDL3"
+	-DSDL3_DIR="$P/lib/cmake/SDL3" -DPROTOC="$(command -v protoc)"
 cmake --build "$B" -j "$JOBS" --target OrbitPlay
 
 # ---- package: Payload/OrbitPlay.app -> OrbitPlay.ipa (unsigned)
