@@ -57,7 +57,7 @@ bool App::Init(const std::string &resume)
 		settings.upscale_mode = 2;
 		LOGI("Restored AI upscaling (1.6.0 had switched it off after a crash report)");
 	}
-	settings.last_version = "1.6.2";
+	settings.last_version = "1.7.0";
 	MarkSettingsDirty();
 	CheckCrashMarker();
 	for(int i = 0; i < KeyboardMouse::ActionCount; i++)
@@ -74,13 +74,21 @@ bool App::Init(const std::string &resume)
 		return false;
 	}
 
-	window = SDL_CreateWindow(kAppName, 1600, 900, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+	// Created hidden: the app's own title bar is installed and the last size/position restored
+	// before the window first appears.
+	window = SDL_CreateWindow(kAppName, 1600, 900, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN
+		| SDL_WINDOW_BORDERLESS);
 	if(!window)
 	{
 		LOGE("SDL_CreateWindow failed: %s", SDL_GetError());
 		return false;
 	}
 	hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+	if(hwnd)
+	{
+		InstallChrome();
+		RestoreWindowPlacement();
+	}
 	if(!hwnd || !renderer.Init(hwnd))
 	{
 		LOGE("Renderer initialization failed");
@@ -107,39 +115,14 @@ bool App::Init(const std::string &resume)
 	if(settings.fullscreen)
 		SetFullscreen(true);
 	present_window_start = NowMs();
-	// Mini player: the borderless window is dragged from anywhere, resized from its edges
-	SDL_SetWindowHitTest(window, [](SDL_Window *w, const SDL_Point *pt, void *user) -> SDL_HitTestResult {
-		App *app = (App *)user;
-		if(!app->MiniMode())
-			return SDL_HITTEST_NORMAL;
-		int ww, wh;
-		SDL_GetWindowSize(w, &ww, &wh);
-		const int e = 10;
-		bool l = pt->x < e, r = pt->x >= ww - e, t = pt->y < e, b = pt->y >= wh - e;
-		if(t && l) return SDL_HITTEST_RESIZE_TOPLEFT;
-		if(t && r) return SDL_HITTEST_RESIZE_TOPRIGHT;
-		if(b && l) return SDL_HITTEST_RESIZE_BOTTOMLEFT;
-		if(b && r) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
-		if(t) return SDL_HITTEST_RESIZE_TOP;
-		if(b) return SDL_HITTEST_RESIZE_BOTTOM;
-		if(l) return SDL_HITTEST_RESIZE_LEFT;
-		if(r) return SDL_HITTEST_RESIZE_RIGHT;
-		return SDL_HITTEST_DRAGGABLE;
-	}, this);
 	if(!resume_mac.empty())
 	{
 		// Restarted after a GPU reset: go straight back into the game
-		boot_start_ms = 0;
 		ShowToast("The graphics driver restarted - reconnecting...");
 		toast_until = NowMs() + 5000;
 		reconnect_at = NowMs() + 1500;
 		if(RegisteredHost *h = settings.FindHost(resume_mac))
 			active_host = *h;
-	}
-	else if(settings.boot_animation)
-	{
-		boot_start_ms = NowMs();
-		sounds.Play(UiSound::Boot);
 	}
 	return true;
 }
@@ -171,6 +154,7 @@ void App::Shutdown()
 	FlushPlaytime();
 	if(mini_mode)
 		ToggleMiniPlayer();
+	SaveWindowPlacement();
 	if(session)
 	{
 		session->Stop();
@@ -1015,6 +999,7 @@ void App::BeginConnect(const std::string &mac)
 	}
 	if(found && d.ready)
 	{
+		last_wakeup = 0; // no wake-up step needed
 		StartStream();
 		return;
 	}
@@ -1179,22 +1164,32 @@ void App::ToggleMiniPlayer()
 		SDL_DisplayID disp = SDL_GetDisplayForWindow(window);
 		SDL_Rect r = { 0, 0, 1920, 1080 };
 		SDL_GetDisplayUsableBounds(disp, &r);
-		int w = std::max(480, r.w / 4), h = w * 9 / 16;
+		if(SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED)
+		{
+			SDL_RestoreWindow(window);
+			SDL_SyncWindow(window);
+			SDL_GetWindowPosition(window, &mini_prev_x, &mini_prev_y);
+			SDL_GetWindowSize(window, &mini_prev_w, &mini_prev_h);
+			mini_was_maximized = true;
+		}
+		else
+			mini_was_maximized = false;
+		int w = std::max(480, r.w / 4), h = (int)std::lround(w / MiniAspect());
 		mini_mode = true;
 		ShowOverlay(false);
-		SDL_SetWindowBordered(window, false);
 		SDL_SetWindowAlwaysOnTop(window, true);
 		SDL_SetWindowSize(window, w, h);
 		SDL_SetWindowPosition(window, r.x + r.w - w - 24, r.y + r.h - h - 24);
-		ShowToast("Mini player - drag to move, Ctrl+M to go back");
+		ShowToast("Mini player: drag to move, drag an edge to resize, Ctrl+M to go back");
 	}
 	else
 	{
 		mini_mode = false;
 		SDL_SetWindowAlwaysOnTop(window, false);
-		SDL_SetWindowBordered(window, true);
 		SDL_SetWindowSize(window, mini_prev_w, mini_prev_h);
 		SDL_SetWindowPosition(window, mini_prev_x, mini_prev_y);
+		if(mini_was_maximized)
+			SDL_MaximizeWindow(window);
 		if(mini_was_fullscreen)
 			SDL_SetWindowFullscreen(window, true);
 	}
@@ -1252,8 +1247,15 @@ void App::EndStream(const std::string &msg, bool is_error)
 // ---------------------------------------------------------------------------
 // UI
 
+void App::NoDragLastItem()
+{
+	ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax(), o = ImGui::GetMainViewport()->Pos;
+	chrome_nodrag.push_back(ImVec4(a.x - o.x, a.y - o.y, b.x - o.x, b.y - o.y));
+}
+
 void App::BuildUi()
 {
+	chrome_nodrag.clear();
 	if(phase == Phase::Streaming && renderer.HasVideo())
 	{
 		if(compare_on || showcase_on)
@@ -1297,6 +1299,7 @@ void App::BuildUi()
 		}
 		UiStreamDialogs();
 		UiMessage();
+		DrawWindowControls();
 		return;
 	}
 
@@ -1313,7 +1316,7 @@ void App::BuildUi()
 	UiPairDialog();
 	UiStreamDialogs();
 	UiMessage();
-	UiBootIntro();
+	DrawWindowControls();
 }
 
 void App::UiPairDialog()
@@ -1953,44 +1956,83 @@ void App::UiLog()
 	ImGui::EndChild();
 }
 
+// Connecting: a full-window view with the console's name and three steps, instead of a dialog.
 void App::UiConnecting()
 {
 	ImGuiViewport *vp = ImGui::GetMainViewport();
-	ImGui::GetBackgroundDrawList()->AddRectFilled(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y), IM_COL32(0, 0, 0, 90));
-	ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-	ImGui::SetNextWindowSize(ImVec2(460 * ui_scale, 0));
+	float s = ui_scale;
+	ImDrawList *bg = ImGui::GetForegroundDrawList();
+	ImVec2 a = vp->Pos, b(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y);
+	(void)bg;
+	ImGui::SetNextWindowPos(a);
+	ImGui::SetNextWindowSize(vp->Size);
+	ImGui::SetNextWindowBgAlpha(0.0f);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
 	ImGui::Begin("##connecting", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings
-		| ImGuiWindowFlags_AlwaysAutoResize);
+		| ImGuiWindowFlags_NoBringToFrontOnFocus);
+	ImGui::PopStyleVar();
 	ImDrawList *dl = ImGui::GetWindowDrawList();
-	ImVec2 p = ImGui::GetCursorScreenPos();
-	float R = 26.0f * ui_scale, W = ImGui::GetContentRegionAvail().x;
-	ImVec2 c(p.x + W * 0.5f, p.y + R + 6 * ui_scale);
+	dl->AddRectFilled(a, b, IM_COL32(10, 11, 15, 236));
+
+	float mx = std::clamp(vp->Size.x * 0.06f, 48.0f * s, 128.0f * s);
+	float x = a.x + mx, y = a.y + std::max(150.0f * s, vp->Size.y * 0.27f);
+	ImFont *df = g_display ? g_display : (g_title ? g_title : ImGui::GetFont());
+	ImFont *hf = g_heading ? g_heading : ImGui::GetFont();
+	std::string name = active_host.nickname.empty() ? "PlayStation 5" : active_host.nickname;
+	dl->AddText(ImVec2(x + 2 * s, y), IM_COL32(150, 156, 168, 255), "CONNECTING");
+	y += ImGui::GetFontSize() + 8 * s;
+	dl->AddText(df, df->FontSize, ImVec2(x - 3 * s, y), IM_COL32(244, 245, 248, 255), name.c_str());
+	y += df->FontSize + 34 * s;
+
+	// steps: done (check), current (spinner), upcoming (dim)
+	int cur = phase == Phase::Waking ? 0 : phase == Phase::Connecting ? 1 : 2;
+	const char *steps[] = { "Waking the console", "Connecting and signing in", "Starting the picture" };
+	const char *hints[] = { "From rest mode this can take up to a minute.", "", "" };
 	float t = (float)ImGui::GetTime();
-	dl->PathArcTo(c, R, 0, 6.2831853f, 48);
-	dl->PathStroke(IM_COL32(255, 255, 255, 25), 0, 3.0f * ui_scale);
-	dl->PathArcTo(c, R, t * 5.0f, t * 5.0f + 1.6f + 0.8f * sinf(t * 2.0f), 32);
-	dl->PathStroke(IM_COL32(236, 238, 242, 255), 0, 3.0f * ui_scale);
-	ImGui::Dummy(ImVec2(W, R * 2 + 20 * ui_scale));
-	const char *what = phase == Phase::Waking ? "Waking up" : "Connecting to";
-	char line[160];
-	snprintf(line, sizeof(line), "%s %s", what, active_host.nickname.empty() ? "your PS5" : active_host.nickname.c_str());
-	if(g_heading)
-		ImGui::PushFont(g_heading);
-	ImGui::SetCursorPosX((ImGui::GetWindowWidth() - ImGui::CalcTextSize(line).x) * 0.5f);
-	ImGui::TextUnformatted(line);
-	if(g_heading)
-		ImGui::PopFont();
-	const char *sub = phase == Phase::Waking ? "This can take up to a minute from rest mode." : "Starting Remote Play...";
-	ImGui::SetCursorPosX((ImGui::GetWindowWidth() - ImGui::CalcTextSize(sub).x) * 0.5f);
-	ImGui::TextDisabled("%s", sub);
-	ImGui::Dummy(ImVec2(0, 6 * ui_scale));
-	if(ImGui::Button("Cancel", ImVec2(-1, 0)))
+	for(int i = 0; i < 3; i++)
+	{
+		ImVec2 c(x + 10 * s, y + hf->FontSize * 0.5f);
+		bool skipped = i == 0 && cur > 0 && last_wakeup == 0;
+		if(i < cur)
+		{
+			ImU32 col = skipped ? IM_COL32(110, 116, 128, 255) : IM_COL32(236, 238, 242, 255);
+			dl->AddLine(ImVec2(c.x - 6 * s, c.y), ImVec2(c.x - 2 * s, c.y + 4 * s), col, 2.0f * s);
+			dl->AddLine(ImVec2(c.x - 2 * s, c.y + 4 * s), ImVec2(c.x + 7 * s, c.y - 5 * s), col, 2.0f * s);
+		}
+		else if(i == cur)
+		{
+			dl->PathArcTo(c, 8 * s, 0, 6.2831853f, 32);
+			dl->PathStroke(IM_COL32(255, 255, 255, 30), 0, 2.0f * s);
+			dl->PathArcTo(c, 8 * s, t * 5.0f, t * 5.0f + 1.8f + 0.7f * sinf(t * 2.0f), 24);
+			dl->PathStroke(IM_COL32(236, 238, 242, 255), 0, 2.0f * s);
+		}
+		else
+			dl->AddCircle(c, 3.0f * s, IM_COL32(110, 116, 128, 255), 12, 1.5f * s);
+		ImU32 tc = i == cur ? IM_COL32(242, 244, 248, 255) : i < cur ? IM_COL32(170, 176, 188, 255) : IM_COL32(110, 116, 128, 255);
+		dl->AddText(hf, hf->FontSize, ImVec2(x + 34 * s, y), tc, steps[i]);
+		y += hf->FontSize + 6 * s;
+		if(i == cur && *hints[i])
+		{
+			dl->AddText(ImVec2(x + 34 * s, y), IM_COL32(140, 146, 158, 255), hints[i]);
+			y += ImGui::GetFontSize() + 6 * s;
+		}
+		y += 12 * s;
+	}
+	y += 18 * s;
+	ImGui::SetCursorScreenPos(ImVec2(x, y));
+	if(hf)
+		ImGui::PushFont(hf);
+	if(ImGui::Button("Cancel", ImVec2(180 * s, 50 * s)) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)
+		|| ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))
 	{
 		if(phase == Phase::Waking)
 			phase = Phase::Idle;
 		else
 			EndStream("", false);
+		sounds.Play(UiSound::Back);
 	}
+	if(hf)
+		ImGui::PopFont();
 	ImGui::End();
 }
 
@@ -2062,6 +2104,10 @@ void App::UiStreamOverlay()
 	}
 	ImGui::Begin("##streammenu", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings
 		| ImGuiWindowFlags_NoScrollbar);
+	{
+		ImVec2 a = ImGui::GetWindowPos(), b(a.x + ImGui::GetWindowWidth(), a.y + ImGui::GetWindowHeight()), o = vp->Pos;
+		chrome_nodrag.push_back(ImVec4(a.x - o.x, a.y - o.y, b.x - o.x, b.y - o.y));
+	}
 
 	// B on the pad closes the menu, unless it is closing a dropdown
 	bool popup_open = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);

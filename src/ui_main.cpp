@@ -16,6 +16,12 @@
 #include <cstring>
 #include <ctime>
 
+#include <shellapi.h>
+
+#ifndef ORBITPLAY_VERSION
+#define ORBITPLAY_VERSION "dev"
+#endif
+
 static uint64_t NowMs() { return chiaki_time_now_monotonic_ms(); }
 static float Smooth01(float x) { x = std::clamp(x, 0.0f, 1.0f); return x * x * (3.0f - 2.0f * x); }
 
@@ -231,6 +237,7 @@ void App::Row(const char *label)
 		dl->AddText(f, f->FontSize, ImVec2(lp.x, lp.y + (fh - f->FontSize) * 0.5f), ImGui::GetColorU32(ImGuiCol_Text), label);
 		dl->PopClipRect();
 	}
+	ImGui::AlignTextToFramePadding(); // plain-text values line up with the label
 	ImGui::Dummy(ImVec2(1, fh));
 	ImGui::SameLine(row_label_w);
 	ImGui::SetNextItemWidth(row_item_w);
@@ -314,6 +321,7 @@ static const CatInfo kCats[App::Cat_Count] = {
 	{ "Interface", "Sounds, the start-up animation, battery warnings and per-game profiles." },
 	{ "System", "Display, audio, connection behavior and hotkeys." },
 	{ "Account", "The PSN account used to pair consoles." },
+	{ "About", "Version, where your data is kept, and the open-source software this app is built on." },
 };
 
 const char *App::CategoryName(int cat) { return kCats[std::clamp(cat, 0, Cat_Count - 1)].name; }
@@ -356,6 +364,35 @@ void App::DrawCategory(int cat, bool compact)
 			Row("Get it from PSN");
 			if(ImGui::Button("Sign in in the browser"))
 				PsnLogin::OpenLoginPage();
+			break;
+		}
+		case Cat_About:
+		{
+			Row("Version");
+			ImGui::Text("Orbit Play %s", ORBITPLAY_VERSION);
+			Row("Settings and log");
+			if(ImGui::Button("Open folder"))
+				ShellExecuteA(nullptr, "open", data_dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+			RowHelp(data_dir.c_str());
+			Row("Screenshots");
+			ImGui::TextUnformatted("Pictures\\Orbit Play");
+			Row("Recordings");
+			ImGui::TextUnformatted("Videos\\Orbit Play");
+			SubHeader("Built with");
+			Row("chiaki-ng");
+			ImGui::TextUnformatted("Remote Play protocol  -  AGPL-3.0");
+			Row("FFmpeg");
+			ImGui::TextUnformatted("Video decoding and recording  -  LGPL");
+			Row("SDL 3");
+			ImGui::TextUnformatted("Controllers, audio, window  -  zlib");
+			Row("Dear ImGui");
+			ImGui::TextUnformatted("Interface toolkit  -  MIT");
+			Row("IBM Plex Sans");
+			ImGui::TextUnformatted("Typeface  -  SIL Open Font License 1.1");
+			Row("License");
+			ImGui::TextUnformatted("Orbit Play is free software under the AGPL-3.0.");
+			RowHelp("Not affiliated with or endorsed by Sony Interactive Entertainment. PlayStation and PS5 are "
+				"trademarks of Sony Interactive Entertainment Inc.");
 			break;
 		}
 	}
@@ -414,13 +451,22 @@ void App::UiSettingsScreen()
 	ImGuiViewport *vp = ImGui::GetMainViewport();
 	float W = vp->Size.x, H = vp->Size.y;
 	float mx = std::clamp(W * 0.05f, 40.0f * ui_scale, 96.0f * ui_scale);
-	float top = 44.0f * ui_scale;
+	float top = 56.0f * ui_scale;
 	ImDrawList *dl = ImGui::GetWindowDrawList();
 
 	ImFont *tf = g_title ? g_title : ImGui::GetFont();
 	dl->AddText(tf, tf->FontSize, ImVec2(vp->Pos.x + mx, vp->Pos.y + top), IM_COL32(240, 242, 246, 255),
 		screen == Screen::Log ? "Log" : "Settings");
 	TopRightStatus(this, dl, vp->Pos.x + W - mx, vp->Pos.y + top, tf->FontSize, ui_scale, gamepads.Info(), ClockText());
+
+	// pages fade and rise in slightly when you switch
+	int key = screen == Screen::Log ? 999 : settings_cat;
+	if(key != page_key)
+	{
+		page_key = key;
+		page_change_ms = NowMs();
+	}
+	float fade = Smooth01((NowMs() - page_change_ms) / 170.0f);
 
 	// Esc / Circle: back to the home screen (unless closing a dropdown or typing)
 	bool popup = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
@@ -469,13 +515,15 @@ void App::UiSettingsScreen()
 
 	float rx0 = vp->Pos.x + mx + list_w + gap;
 	float rw = std::min(vp->Pos.x + W - mx - rx0, 1180.0f * ui_scale);
-	ImGui::SetCursorScreenPos(ImVec2(rx0, vp->Pos.y + body_top));
+	ImGui::SetCursorScreenPos(ImVec2(rx0, vp->Pos.y + body_top + (1.0f - fade) * 10.0f * ui_scale));
+	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.05f + 0.95f * fade);
 	ImGui::BeginChild("##page", ImVec2(rw, H - body_top - 24 * ui_scale), ImGuiChildFlags_None, ImGuiWindowFlags_None);
 	if(screen == Screen::Log)
 		UiLog();
 	else
 		DrawCategory(settings_cat, false);
 	ImGui::EndChild();
+	ImGui::PopStyleVar();
 }
 
 // ---------------------------------------------------------------------------
@@ -487,30 +535,25 @@ void App::UiHome()
 	ImGuiViewport *vp = ImGui::GetMainViewport();
 	float W = vp->Size.x, H = vp->Size.y, s = ui_scale;
 	float mx = std::clamp(W * 0.06f, 48.0f * s, 128.0f * s);
-	float top = 40.0f * s;
+	float top = 56.0f * s;
 	ImDrawList *dl = ImGui::GetWindowDrawList();
 	ImFont *hf = g_heading ? g_heading : ImGui::GetFont();
 	ImFont *df = g_display ? g_display : (g_title ? g_title : ImGui::GetFont());
 
-	// ---- top bar: wordmark, then Settings, controllers and clock on the right
+	// ---- top row: Settings, controllers and clock on the right (the window buttons sit above)
 	{
-		ImVec2 p(vp->Pos.x + mx, vp->Pos.y + top);
-		float R = 9.0f * s;
-		ImVec2 c(p.x + R, p.y + hf->FontSize * 0.5f + 1);
-		dl->AddCircleFilled(c, R * 0.62f, IM_COL32(236, 238, 242, 255), 24);
-		dl->AddEllipse(c, ImVec2(R * 1.35f, R * 0.42f), IM_COL32(236, 238, 242, 220), -0.35f, 40, 1.5f * s);
-		dl->AddText(hf, hf->FontSize, ImVec2(p.x + R * 2 + 14 * s, p.y), IM_COL32(236, 238, 242, 255), "Orbit Play");
-
+		float y = vp->Pos.y + top;
 		const char *sl = g_icons ? ICON_SETTINGS "  Settings" : "Settings";
 		float bw = ImGui::CalcTextSize(sl).x + 32 * s;
 		float right = vp->Pos.x + W - mx;
-		ImGui::SetCursorScreenPos(ImVec2(right - bw, p.y + (hf->FontSize - ImGui::GetFrameHeight()) * 0.5f));
+		ImGui::SetCursorScreenPos(ImVec2(right - bw, y + (hf->FontSize - ImGui::GetFrameHeight()) * 0.5f));
 		if(ImGui::Button(sl, ImVec2(bw, 0)))
 		{
 			screen = Screen::Settings;
 			sounds.Play(UiSound::Select);
 		}
-		TopRightStatus(this, dl, right - bw - 28 * s, p.y, hf->FontSize, s, gamepads.Info(), ClockText());
+		NoDragLastItem();
+		TopRightStatus(this, dl, right - bw - 28 * s, y, hf->FontSize, s, gamepads.Info(), ClockText());
 	}
 	// Options on the pad opens Settings
 	if(ImGui::IsKeyPressed(ImGuiKey_GamepadStart, false))
@@ -822,94 +865,6 @@ void App::UiHome()
 }
 
 // ---------------------------------------------------------------------------
-// Boot intro: the logo forms out of light, then the home screen fades in. Any key skips it.
-
-void App::UiBootIntro()
-{
-	if(!boot_start_ms)
-		return;
-	float t = (NowMs() - boot_start_ms) / 1000.0f;
-	const float fade_start = 1.9f, end = 2.6f;
-	ImGuiIO &io = ImGui::GetIO();
-	bool skip = ImGui::IsMouseClicked(0) || ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_Escape)
-		|| ImGui::IsKeyPressed(ImGuiKey_Space) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown);
-	if(skip && t < fade_start)
-	{
-		boot_start_ms = NowMs() - (uint64_t)(fade_start * 1000);
-		t = fade_start;
-	}
-	if(t >= end)
-	{
-		boot_start_ms = 0;
-		return;
-	}
-	(void)io;
-	float alpha = 1.0f - Smooth01((t - fade_start) / (end - fade_start));
-	ImDrawList *dl = ImGui::GetForegroundDrawList();
-	ImGuiViewport *vp = ImGui::GetMainViewport();
-	ImVec2 a = vp->Pos, b(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y), c = vp->GetCenter();
-	auto A = [&](float v) { return (int)std::clamp(v * alpha * 255.0f, 0.0f, 255.0f); };
-	dl->AddRectFilled(a, b, IM_COL32(10, 11, 15, A(1.0f)));
-	float R = vp->Size.y * 0.075f;
-	c.y -= R * 0.6f;
-	// ring drawn progressively: the half behind the planet first, then the planet, then the front half
-	float ring = Smooth01((t - 0.25f) / 0.9f);
-	auto draw_ring = [&](bool front) {
-		if(ring <= 0)
-			return;
-		const int n = 120;
-		ImVec2 pts[n + 1];
-		int cnt = 0;
-		float rot = -0.35f, start = 3.14159f * 0.9f;
-		auto at = [&](float u) {
-			float ex = std::cos(u) * R * 1.32f, ey = std::sin(u) * R * 0.42f;
-			return ImVec2(c.x + ex * std::cos(rot) - ey * std::sin(rot), c.y + ex * std::sin(rot) + ey * std::cos(rot));
-		};
-		ImU32 rc = IM_COL32(236, 238, 242, A(0.95f));
-		for(int i = 1; i <= n; i++)
-		{
-			float u0 = start + (float)(i - 1) / n * 6.28318f * ring, u1 = start + (float)i / n * 6.28318f * ring;
-			bool edge_front = std::sin((u0 + u1) * 0.5f) > 0.0f; // which side this piece of the ring is on
-			if(edge_front == front)
-			{
-				if(!cnt)
-					pts[cnt++] = at(u0);
-				pts[cnt++] = at(u1);
-			}
-			else if(cnt)
-			{
-				dl->AddPolyline(pts, cnt, rc, 0, R * 0.07f);
-				cnt = 0;
-			}
-		}
-		if(cnt > 1)
-			dl->AddPolyline(pts, cnt, rc, 0, R * 0.07f);
-	};
-	draw_ring(false);
-	dl->AddCircleFilled(c, R * 0.62f * Smooth01(t / 0.7f), IM_COL32(255, 255, 255, A(0.95f)), 64);
-	draw_ring(true);
-	// title
-	float ta = Smooth01((t - 0.7f) / 0.6f);
-	if(ta > 0 && g_hero)
-	{
-		const char *title = "Orbit Play";
-		float spacing = (1.0f - ta) * 14.0f * ui_scale; // letters settle together
-		float w = 0;
-		for(const char *ch = title; *ch; ch++)
-			w += g_hero->CalcTextSizeA(g_hero->FontSize, FLT_MAX, 0, ch, ch + 1).x + spacing;
-		float x = c.x - w * 0.5f, y = c.y + R * 1.25f;
-		for(const char *ch = title; *ch; ch++)
-		{
-			dl->AddText(g_hero, g_hero->FontSize, ImVec2(x, y), IM_COL32(255, 255, 255, A(ta)), ch, ch + 1);
-			x += g_hero->CalcTextSizeA(g_hero->FontSize, FLT_MAX, 0, ch, ch + 1).x + spacing;
-		}
-		const char *sub = "PS5 Remote Play";
-		ImVec2 ss = ImGui::CalcTextSize(sub);
-		dl->AddText(ImVec2(c.x - ss.x * 0.5f, y + g_hero->FontSize + 10 * ui_scale), IM_COL32(170, 185, 210, A(ta * 0.9f)), sub);
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Control-center bar along the bottom while the stream menu is open (PS5 style)
 
 void App::UiControlCenterBar()
@@ -1009,8 +964,6 @@ void App::UiInterfaceSection()
 		if(ImGui::IsItemDeactivatedAfterEdit())
 			sounds.Play(UiSound::Select);
 	}
-	Row("Start-up");
-	changed |= Toggle("Play the intro animation", &settings.boot_animation);
 	Row("Controllers");
 	changed |= Toggle("Warn when a controller's battery is low", &settings.low_battery_warning);
 	Row("Game profiles");

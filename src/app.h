@@ -35,10 +35,14 @@ public:
 	const std::string &RelaunchResumeMac() const { return relaunch_mac; }
 	// Mini player hit-testing (drag the borderless window)
 	bool MiniMode() const { return mini_mode; }
+	// Custom title bar (window_chrome.cpp)
+	LRESULT ChromeHitTest(int x, int y);
+	float MiniAspect() const;
+	bool WindowFullscreen() const;
 
 	// Settings pages (shared by the Settings screen and the in-game menu)
 	enum Cat { Cat_Game, Cat_Stream, Cat_Image, Cat_Motion, Cat_Picture, Cat_Controls, Cat_Capture, Cat_Interface, Cat_System,
-		Cat_Account, Cat_Count };
+		Cat_Account, Cat_About, Cat_Count };
 	static const char *CategoryName(int cat);
 
 private:
@@ -79,7 +83,11 @@ private:
 	void RowsEnd();
 	void CloseRow();
 	void SubHeader(const char *text);
-	void UiBootIntro();
+	void InstallChrome();
+	void DrawWindowControls();
+	void SaveWindowPlacement();
+	void RestoreWindowPlacement();
+	void NoDragLastItem();
 	void UiControlCenterBar();
 	void UiInterfaceSection();
 	void UiGameSection();
@@ -223,8 +231,11 @@ private:
 
 	// v1.6: PS5-style home, sounds, intro
 	UiSound sounds;
-	uint64_t boot_start_ms = 0;
 	int home_sel = 0;
+	std::vector<ImVec4> chrome_nodrag;   // clickable things in the drag band (client coords)
+	float caption_h = 0.0f, chrome_alpha = 1.0f;
+	uint64_t page_change_ms = 0;
+	int page_key = -1;
 	struct ID3D11ShaderResourceView *bg_srv = nullptr;
 	int bg_w = 0, bg_h = 0;
 	bool home_focus_pending = true;
@@ -232,6 +243,7 @@ private:
 	// mini player
 	bool mini_mode = false;
 	bool mini_was_fullscreen = false;
+	bool mini_was_maximized = false;
 	int mini_prev_x = 0, mini_prev_y = 0, mini_prev_w = 1600, mini_prev_h = 900;
 
 	// current game, play time, session summary

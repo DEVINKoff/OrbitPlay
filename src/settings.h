@@ -118,10 +118,11 @@ struct Settings
 	// Interface
 	bool ui_sounds = true;
 	float ui_sound_volume = 0.5f;
-	bool boot_animation = true;
 	bool game_profiles = true;        // apply a game's saved profile when it starts
 	bool low_battery_warning = true;
 	std::string last_version;         // version that last saved this file
+	int win_x = 0, win_y = 0, win_w = 0, win_h = 0; // window position/size (0 = first start)
+	bool win_max = false;
 
 	std::vector<RegisteredHost> hosts;
 	std::vector<ManualHost> manual_hosts;

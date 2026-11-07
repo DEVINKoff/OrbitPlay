@@ -316,7 +316,11 @@ void Settings::Load(const std::string &path)
 	bol("microphone", microphone);
 	bol("ui_sounds", ui_sounds);
 	flt("ui_sound_volume", ui_sound_volume);
-	bol("boot_animation", boot_animation);
+	num("win_x", win_x);
+	num("win_y", win_y);
+	num("win_w", win_w);
+	num("win_h", win_h);
+	bol("win_max", win_max);
 	bol("game_profiles", game_profiles);
 	bol("low_battery_warning", low_battery_warning);
 	str("last_version", last_version);
@@ -435,7 +439,7 @@ void Settings::Save(const std::string &path) const
 	o << "microphone=" << microphone << "\n";
 	o << "ui_sounds=" << ui_sounds << "\n";
 	o << "ui_sound_volume=" << ui_sound_volume << "\n";
-	o << "boot_animation=" << boot_animation << "\n";
+	o << "win_x=" << win_x << "\nwin_y=" << win_y << "\nwin_w=" << win_w << "\nwin_h=" << win_h << "\nwin_max=" << win_max << "\n";
 	o << "game_profiles=" << game_profiles << "\n";
 	o << "low_battery_warning=" << low_battery_warning << "\n";
 	o << "last_version=" << last_version << "\n";

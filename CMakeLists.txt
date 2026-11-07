@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(OrbitPlay VERSION 1.6.2 LANGUAGES C CXX)
+project(OrbitPlay VERSION 1.7.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -75,16 +75,17 @@ add_executable(OrbitPlay WIN32
 	src/kbm.cpp
 	src/recorder.cpp
 	src/ui_main.cpp
+	src/window_chrome.cpp
 	src/uisound.cpp
 	res/orbitplay.rc)
 
-target_compile_definitions(OrbitPlay PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_compile_definitions(OrbitPlay PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00 ORBITPLAY_VERSION="${PROJECT_VERSION}")
 target_link_libraries(OrbitPlay PRIVATE
 	chiaki-lib
 	imgui
 	SDL3::SDL3
 	PkgConfig::FFMPEG
-	d3d11 dxgi d3dcompiler winmm winhttp shell32 iphlpapi ws2_32 windowscodecs ole32 uuid dbghelp)
+	d3d11 dxgi d3dcompiler winmm winhttp shell32 iphlpapi ws2_32 windowscodecs ole32 uuid dbghelp comctl32 dwmapi)
 
 if(MINGW)
 	target_link_options(OrbitPlay PRIVATE -static-libgcc -static-libstdc++)
