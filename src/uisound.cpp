@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
+#include <string>
 
 static const int kRate = 48000;
 static const float kPi = 3.14159265f;
@@ -47,14 +49,67 @@ void UiSound::Init()
 	// shimmer
 	AddTone(clips[Boot], 0.45f, 1.4f, 1760.0f, 1760.0f, 0.03f, 2.8f, 0.2f);
 
-	SDL_AudioSpec spec = { SDL_AUDIO_F32, 1, kRate };
-	stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+	Route();
+}
+
+static bool IsControllerAudio(const char *name)
+{
+	if(!name)
+		return false;
+	std::string n = name;
+	for(char &c : n)
+		c = (char)tolower((unsigned char)c);
+	return n.find("dualsense") != std::string::npos || n.find("wireless controller") != std::string::npos
+		|| n.find("dualshock") != std::string::npos;
+}
+
+// Interface sounds must never go to a DualSense: when it's plugged in by USB, Windows often makes
+// it the default speaker, and its extra channels drive the haptic motors (that's the buzzing).
+// Pick the default device unless it looks like the controller, else the first real speaker.
+bool UiSound::Route()
+{
+	last_route_ms = SDL_GetTicks();
+	int count = 0;
+	SDL_AudioDeviceID *devs = SDL_GetAudioPlaybackDevices(&count);
+	bool controller_present = false;
+	SDL_AudioDeviceID speaker = 0;
+	for(int i = 0; i < count; i++)
+	{
+		if(IsControllerAudio(SDL_GetAudioDeviceName(devs[i])))
+			controller_present = true;
+		else if(!speaker)
+			speaker = devs[i];
+	}
+	SDL_free(devs);
+	SDL_AudioDeviceID want = SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
+	if(controller_present)
+	{
+		// the DualSense audio device has 4 channels; ordinary speakers/headsets have 2, 6 or 8
+		SDL_AudioSpec ds;
+		int frames = 0;
+		bool default_is_controller = SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &ds, &frames) && ds.channels == 4;
+		if(default_is_controller)
+			want = speaker; // 0 = nowhere safe to play
+	}
+	if(stream && want == device)
+		return true;
+	if(stream)
+	{
+		SDL_DestroyAudioStream(stream);
+		stream = nullptr;
+	}
+	device = want;
+	if(!want)
+		return false;
+	SDL_AudioSpec spec = { SDL_AUDIO_F32, 2, kRate };
+	stream = SDL_OpenAudioDeviceStream(want, &spec, nullptr, nullptr);
 	if(!stream)
 	{
 		LOGW("UI sounds unavailable: %s", SDL_GetError());
-		return;
+		return false;
 	}
 	SDL_ResumeAudioStreamDevice(stream);
+	return true;
 }
 
 void UiSound::Shutdown()
@@ -68,9 +123,13 @@ void UiSound::Shutdown()
 
 void UiSound::Play(Kind kind)
 {
-	if(!stream || !enabled || volume <= 0.0f || kind < 0 || kind >= Count)
+	if(!enabled || volume <= 0.0f || kind < 0 || kind >= Count)
 		return;
 	Uint64 now = SDL_GetTicks();
+	if(now - last_route_ms > 2000)
+		Route(); // controllers come and go
+	if(!stream)
+		return;
 	if(kind == Move)
 	{
 		if(now - last_move_ms < 45)
@@ -78,12 +137,12 @@ void UiSound::Play(Kind kind)
 		last_move_ms = now;
 	}
 	// Don't let sounds pile up behind each other: drop what's queued for anything but Move
-	if(kind != Move || SDL_GetAudioStreamQueued(stream) > (int)(kRate * sizeof(float) / 10))
+	if(kind != Move || SDL_GetAudioStreamQueued(stream) > (int)(kRate * 2 * sizeof(float) / 10))
 		SDL_ClearAudioStream(stream);
 	std::vector<float> &c = clips[kind];
-	std::vector<float> out(c.size());
+	std::vector<float> out(c.size() * 2);
 	float v = volume * volume;
 	for(size_t i = 0; i < c.size(); i++)
-		out[i] = std::clamp(c[i] * v, -1.0f, 1.0f);
+		out[i * 2] = out[i * 2 + 1] = std::clamp(c[i] * v, -1.0f, 1.0f);
 	SDL_PutAudioStreamData(stream, out.data(), (int)(out.size() * sizeof(float)));
 }

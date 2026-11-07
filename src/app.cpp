@@ -57,7 +57,7 @@ bool App::Init(const std::string &resume)
 		settings.upscale_mode = 2;
 		LOGI("Restored AI upscaling (1.6.0 had switched it off after a crash report)");
 	}
-	settings.last_version = "1.6.1";
+	settings.last_version = "1.6.2";
 	MarkSettingsDirty();
 	CheckCrashMarker();
 	for(int i = 0; i < KeyboardMouse::ActionCount; i++)
@@ -181,6 +181,7 @@ void App::Shutdown()
 	discovery.Stop();
 	settings.Save(settings_path);
 	sounds.Shutdown();
+	ReleaseBackground();
 	ImGui_ImplDX11_Shutdown();
 	ImGui_ImplSDL3_Shutdown();
 	ImGui::DestroyContext();
@@ -252,6 +253,7 @@ void App::SetupStyle(float scale)
 	g_heading = add(2, 23.0f, true);    // row titles, page descriptions, list entries
 	g_title = add(1, 42.0f, false);     // page titles: light weight, large
 	g_hero = add(1, 56.0f, false);
+	g_display = add(1, 80.0f, false);   // the console name on the home screen
 	label_font = add(3, 50.0f, false);  // compare / showcase labels
 
 	ImGuiStyle &st = ImGui::GetStyle();
@@ -625,6 +627,25 @@ void App::Tick()
 		if(!current_game.empty() && now - game_since_ms >= 60000)
 			FlushPlaytime();
 		UpdateWatchdog(now);
+		if(!upscale_reported && renderer.HasVideo() && now - stream_start_ms > 4000)
+		{
+			upscale_reported = true;
+			const std::string &st = renderer.UpscalerStatus();
+			LOGI("Upscaler: %s", st.c_str());
+			bool ai_on = st.rfind("NVIDIA RTX Video Super", 0) == 0 || st.rfind("Intel Video Super", 0) == 0;
+			if(settings.upscale_mode == 2 && (!ai_on || st.find("declined") != std::string::npos)
+				&& st.rfind("Not needed", 0) != 0)
+			{
+				ShowToast("AI upscaling isn't running - see Settings > Image > Running now");
+				toast_until = now + 6000;
+			}
+			else if(settings.upscale_mode == 1 && renderer.AiSuperResolutionAvailable() && !enhanced_hint_shown)
+			{
+				enhanced_hint_shown = true; // once per run: Enhanced may be a deliberate choice
+				ShowToast("Upscaling is set to Enhanced. AI super resolution is available: Settings > Image");
+				toast_until = now + 6000;
+			}
+		}
 	}
 	UpdateBatteryWarnings(now);
 	snprintf(g_crash_context, sizeof(g_crash_context), "streaming=%d fg=%d upscale=%d game=%s",
@@ -768,6 +789,7 @@ void App::HandleSessionEvents()
 				phase = Phase::Streaming;
 				reconnect_attempts = 0;
 				stream_start_ms = NowMs();
+				upscale_reported = false;
 				stat_fps_sum = stat_rtt_sum = 0.0;
 				stat_samples = 0;
 				stat_lost = 0;
@@ -1476,6 +1498,24 @@ void App::UiUpscaleSection()
 		: std::string("AI super resolution (needs NVIDIA RTX / Intel)");
 	const char *modes[] = { "Off", "Enhanced (any GPU)", ai_name.c_str() };
 	changed |= ImGui::Combo("##upmode", &settings.upscale_mode, modes, 3);
+	Row("Running now");
+	if(phase == Phase::Streaming && renderer.HasVideo())
+	{
+		const std::string &st = renderer.UpscalerStatus();
+		bool ai_on = st.rfind("NVIDIA RTX Video Super", 0) == 0 || st.rfind("Intel Video Super", 0) == 0;
+		bool problem = settings.upscale_mode == 2 && (!ai_on || st.find("declined") != std::string::npos);
+		ImGui::PushStyleColor(ImGuiCol_Text, problem ? kWarn : ImVec4(0.80f, 0.82f, 0.87f, 1.0f));
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextUnformatted(st.c_str());
+		ImGui::PopTextWrapPos();
+		ImGui::PopStyleColor();
+		if(problem)
+			RowHelp(nvidia ? "AI upscaling isn't running. In the NVIDIA App: System > Video > RTX Video Enhancement, turn on Super "
+				"Resolution and set quality to 4. For HDR streams you need NVIDIA driver 551 or newer."
+				: "AI upscaling isn't running on this GPU, so the Enhanced upscaler is used instead.");
+	}
+	else
+		ImGui::TextDisabled("Shown while you play");
 
 	ImGui::BeginDisabled(settings.upscale_mode == 0);
 	Row("Upscale to");

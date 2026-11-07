@@ -19,7 +19,10 @@ public:
 	void Play(Kind kind);
 
 private:
+	bool Route();                       // (re)open on a device that isn't a game controller
 	SDL_AudioStream *stream = nullptr;
+	SDL_AudioDeviceID device = 0;
+	Uint64 last_route_ms = 0;
 	std::vector<float> clips[Count];
 	float volume = 0.5f;
 	bool enabled = true;

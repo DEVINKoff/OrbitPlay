@@ -69,7 +69,9 @@ private:
 	// UI
 	void SetupStyle(float scale);
 	void UiMain();
-	void UiConsolesPage();
+	void UiHome();
+	void UiSettingsScreen();
+	void ReleaseBackground();
 	void DrawBackground();
 	void DrawCategory(int cat, bool compact);
 	bool ListItem(const char *label, bool active);
@@ -223,6 +225,8 @@ private:
 	UiSound sounds;
 	uint64_t boot_start_ms = 0;
 	int home_sel = 0;
+	struct ID3D11ShaderResourceView *bg_srv = nullptr;
+	int bg_w = 0, bg_h = 0;
 	bool home_focus_pending = true;
 
 	// mini player
@@ -242,6 +246,8 @@ private:
 	// stability
 	uint64_t last_keyframe_req = 0;
 	bool frozen_warned = false;
+	bool upscale_reported = false;
+	bool enhanced_hint_shown = false;
 	uint64_t last_battery_check = 0;
 	std::map<std::string, bool> battery_warned;
 	bool relaunch = false;

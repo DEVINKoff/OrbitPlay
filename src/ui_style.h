@@ -9,7 +9,7 @@
 #include <algorithm>
 
 inline bool g_icons = false;
-inline ImFont *g_heading = nullptr, *g_title = nullptr, *g_hero = nullptr;
+inline ImFont *g_heading = nullptr, *g_title = nullptr, *g_hero = nullptr, *g_display = nullptr;
 inline const char *Ico(const char *icon) { return g_icons ? icon : ""; }
 
 // Colors: flat, neutral surfaces; white is the selection color; one muted accent for controls
