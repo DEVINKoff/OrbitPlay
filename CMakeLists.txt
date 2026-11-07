@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(OrbitPlay VERSION 1.6.0 LANGUAGES C CXX)
+project(OrbitPlay VERSION 1.6.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -74,7 +74,7 @@ add_executable(OrbitPlay WIN32
 	src/vpscaler.cpp
 	src/kbm.cpp
 	src/recorder.cpp
-	src/ui_home.cpp
+	src/ui_main.cpp
 	src/uisound.cpp
 	res/orbitplay.rc)
 

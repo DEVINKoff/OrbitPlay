@@ -677,6 +677,41 @@ cbuffer InterpCB : register(b0)
 	float t;
 	float3 padi;
 };
+// Catmull-Rom bicubic from 9 bilinear taps: moving the picture by a fraction of a pixel
+// keeps its detail (plain bilinear softens every generated frame).
+float3 SampleSharp(Texture2D<float4> tex, float2 uv)
+{
+	float2 size; tex.GetDimensions(size.x, size.y);
+	float2 pos = uv * size;
+	float2 tc1 = floor(pos - 0.5) + 0.5;
+	float2 f = pos - tc1;
+	float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+	float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+	float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+	float2 w3 = f * f * (-0.5 + 0.5 * f);
+	float2 w12 = w1 + w2;
+	float2 off12 = w2 / w12;
+	float2 tc0 = (tc1 - 1.0) / size, tc3 = (tc1 + 2.0) / size, tc12 = (tc1 + off12) / size;
+	float3 r = 0;
+	r += tex.SampleLevel(samp, float2(tc0.x, tc0.y), 0).rgb * w0.x * w0.y;
+	r += tex.SampleLevel(samp, float2(tc12.x, tc0.y), 0).rgb * w12.x * w0.y;
+	r += tex.SampleLevel(samp, float2(tc3.x, tc0.y), 0).rgb * w3.x * w0.y;
+	r += tex.SampleLevel(samp, float2(tc0.x, tc12.y), 0).rgb * w0.x * w12.y;
+	r += tex.SampleLevel(samp, float2(tc12.x, tc12.y), 0).rgb * w12.x * w12.y;
+	r += tex.SampleLevel(samp, float2(tc3.x, tc12.y), 0).rgb * w3.x * w12.y;
+	r += tex.SampleLevel(samp, float2(tc0.x, tc3.y), 0).rgb * w0.x * w3.y;
+	r += tex.SampleLevel(samp, float2(tc12.x, tc3.y), 0).rgb * w12.x * w3.y;
+	r += tex.SampleLevel(samp, float2(tc3.x, tc3.y), 0).rgb * w3.x * w3.y;
+	return max(r, 0.0);
+}
+
+// Exact pixel of a frame (no filtering at all)
+float3 LoadExact(Texture2D<float4> tex, float2 uv)
+{
+	float2 size; tex.GetDimensions(size.x, size.y);
+	return tex.Load(int3(clamp(int2(uv * size), int2(0, 0), int2(size) - 1), 0)).rgb;
+}
+
 float4 main(VSOut i) : SV_Target
 {
 	float2 uv = i.uv;
@@ -691,15 +726,21 @@ float4 main(VSOut i) : SV_Target
 	m = mv.SampleLevel(samp, mid_uv * grid_scale, 0);
 	full = 2.0 * m.xy / src_size;
 
-	float3 a = prevF.SampleLevel(samp, uv - full * t, 0).rgb;
-	float3 b = curF.SampleLevel(samp, uv + full * (1.0 - t), 0).rgb;
 	float failed = saturate((m.z - 0.07) / 0.08);
+	// How far this pixel moves, in output pixels. Still areas (HUD, text, static scenery)
+	// are shown exactly as decoded, so they stay as sharp as the upscaled frame.
+	float2 osize; curF.GetDimensions(osize.x, osize.y);
+	float move_px = length(full * osize) * max(t, 1.0 - t);
+	float still = 1.0 - saturate((move_px - 0.15) / 0.35);
 	if(t > 1.0)
 	{
 		// Predictive: the newest frame moved forward along its motion
-		float3 now = curF.SampleLevel(samp, uv, 0).rgb;
-		return float4(lerp(b, now, failed), 1.0);
+		float3 now = LoadExact(curF, uv);
+		float3 moved = SampleSharp(curF, uv + full * (1.0 - t));
+		return float4(lerp(moved, now, max(failed, still)), 1.0);
 	}
+	float3 a = SampleSharp(prevF, uv - full * t);
+	float3 b = SampleSharp(curF, uv + full * (1.0 - t));
 	float3 blended = lerp(a, b, t);
 
 	// Where the two motion-compensated frames disagree (something appears / disappears),
@@ -707,8 +748,10 @@ float4 main(VSOut i) : SV_Target
 	float disagree = saturate((abs(Luma(a) - Luma(b)) - 0.04) / 0.10);
 	float3 c = lerp(blended, t < 0.5 ? a : b, disagree);
 	// Only where block matching failed completely (particles, flashes) show the unmoved real frame.
-	float3 nearest = t < 0.5 ? prevF.SampleLevel(samp, uv, 0).rgb : curF.SampleLevel(samp, uv, 0).rgb;
-	return float4(lerp(c, nearest, failed), 1.0);
+	float3 nearest = t < 0.5 ? LoadExact(prevF, uv) : LoadExact(curF, uv);
+	// Nothing moves here: the nearer real frame, untouched
+	float pixel_still = still * (1.0 - disagree);
+	return float4(lerp(c, nearest, max(failed, pixel_still)), 1.0);
 }
 )HLSL";
 

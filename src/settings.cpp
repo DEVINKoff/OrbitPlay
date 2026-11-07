@@ -319,6 +319,7 @@ void Settings::Load(const std::string &path)
 	bol("boot_animation", boot_animation);
 	bol("game_profiles", game_profiles);
 	bol("low_battery_warning", low_battery_warning);
+	str("last_version", last_version);
 
 	hosts.clear();
 	manual_hosts.clear();
@@ -437,6 +438,7 @@ void Settings::Save(const std::string &path) const
 	o << "boot_animation=" << boot_animation << "\n";
 	o << "game_profiles=" << game_profiles << "\n";
 	o << "low_battery_warning=" << low_battery_warning << "\n";
+	o << "last_version=" << last_version << "\n";
 
 	for(size_t i = 0; i < hosts.size(); i++)
 	{

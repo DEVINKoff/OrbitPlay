@@ -121,6 +121,7 @@ struct Settings
 	bool boot_animation = true;
 	bool game_profiles = true;        // apply a game's saved profile when it starts
 	bool low_battery_warning = true;
+	std::string last_version;         // version that last saved this file
 
 	std::vector<RegisteredHost> hosts;
 	std::vector<ManualHost> manual_hosts;

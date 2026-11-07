@@ -18,7 +18,7 @@ hardware video decoding, an HDR10 swap chain and SDL3 for controllers.
 | **Ambient lighting** | On ultrawide (or any non-16:9) windows, the bars glow with the picture's edge colors, smoothed over time. |
 | Aspect modes, picture modes | Fit, Fill (crop) and Stretch. Natural, Vivid and Cinema presets, plus brightness, contrast, saturation and vibrance. |
 | Screenshots | **F12** saves a PNG to `Pictures\Orbit Play`, at the upscaled resolution and tone-mapped if the stream is HDR. |
-| **PS5-style home screen** | Consoles as tiles with an animated background that takes on the selected console's color, a game hub with a big Play button, controller batteries and a clock in the top bar, interface sounds and a start-up intro. Fully usable with a controller: D-pad to move, Cross to select, L1/R1 to switch tabs. |
+| **Console-style interface** | Settings laid out like a console settings menu: sections on the left, full-width rows with switches and values on the right, usable with a controller (D-pad, Cross, L1/R1 to change section). Set in IBM Plex Sans, which is built into the app. Optional interface sounds and start-up animation. |
 | **Game profiles & play time** | Orbit Play sees which game is running. Save your upscaling, detail, frame generation, picture and mouse settings for a game (stream menu → Game) and they load every time it starts. Play time per game is shown on the home screen. |
 | **Mini player** | **Ctrl+M** shrinks the stream into a small always-on-top window in the corner; drag it anywhere. |
 | **Stability** | A stalled picture is fixed by requesting a fresh frame, then by reconnecting. A graphics driver reset restarts the app and rejoins the game. Crash reports are saved, settings are written atomically with a backup, and starting the app twice brings the open window forward. |
@@ -113,7 +113,7 @@ fast flicks turn fast. *Mouse feel* presets: **PC-like** (default), **Direct**, 
 | Mini player | **Ctrl+M** |
 | Microphone on/off | DualSense **mute button** |
 
-While the menu is open, a control-center bar along the bottom shows the game, session and total
+The stream menu uses the same layout as Settings. While it is open, a bar along the bottom shows the game, session and total
 play time, network delay, controller batteries and the clock.
 
 The stream menu can be dragged anywhere by its header and resized from its edges. It remembers

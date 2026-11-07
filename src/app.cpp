@@ -51,6 +51,14 @@ bool App::Init(const std::string &resume)
 	}
 
 	settings.Load(settings_path);
+	if(settings.last_version.empty() && settings.upscale_mode == 1
+		&& GetFileAttributesA((data_dir + "\\crash.dmp").c_str()) != INVALID_FILE_ATTRIBUTES)
+	{
+		settings.upscale_mode = 2;
+		LOGI("Restored AI upscaling (1.6.0 had switched it off after a crash report)");
+	}
+	settings.last_version = "1.6.1";
+	MarkSettingsDirty();
 	CheckCrashMarker();
 	for(int i = 0; i < KeyboardMouse::ActionCount; i++)
 		kbm.bindings[i] = settings.bindings[i];
@@ -150,23 +158,16 @@ void App::CheckCrashMarker()
 	DeleteFileA(marker.c_str());
 	std::string ctx = ss.str();
 	LOGW("Previous run crashed (%s)", ctx.c_str());
-	message = "Orbit Play closed unexpectedly last time. A crash report was saved to " + data_dir + "\\crash.dmp.";
-	if(ctx.find("streaming=1") != std::string::npos)
-	{
-		bool fg = ctx.find("fg=0") == std::string::npos, up = ctx.find("upscale=2") != std::string::npos;
-		if(fg)
-			settings.frame_gen = 0;
-		if(up)
-			settings.upscale_mode = 1;
-		if(fg || up)
-			message += std::string(" To be safe, ") + (fg ? "frame generation was turned off" : "")
-				+ (fg && up ? " and " : "") + (up ? "AI upscaling was switched to Enhanced" : "") + ". You can turn it back on in Settings.";
-	}
+	if(ctx.find("exiting") != std::string::npos)
+		return; // crashed while closing: nothing was lost, no need to bother anyone
+	message = "Orbit Play closed unexpectedly last time. A crash report was saved to " + data_dir + "\\crash.dmp - "
+		"please attach it if you report the problem.";
 	message_is_error = true;
 }
 
 void App::Shutdown()
 {
+	snprintf(g_crash_context, sizeof(g_crash_context), "exiting");
 	FlushPlaytime();
 	if(mini_mode)
 		ToggleMiniPlayer();
@@ -190,104 +191,130 @@ void App::Shutdown()
 	LOGI("Bye");
 }
 
+// Fonts are compiled into the exe (IBM Plex Sans, SIL Open Font License).
+static bool FontResource(int id, void **data, int *size)
+{
+	HRSRC r = FindResourceW(nullptr, MAKEINTRESOURCEW(id), (LPCWSTR)RT_RCDATA);
+	HGLOBAL g = r ? LoadResource(nullptr, r) : nullptr;
+	*data = g ? LockResource(g) : nullptr;
+	*size = r ? (int)SizeofResource(nullptr, r) : 0;
+	return *data && *size > 0;
+}
+
 void App::SetupStyle(float scale)
 {
 	ImGuiIO &io = ImGui::GetIO();
 	io.Fonts->Clear();
-	const char *regular = "C:\\Windows\\Fonts\\segoeui.ttf";
-	const char *semibold = "C:\\Windows\\Fonts\\seguisb.ttf";
-	const char *bold = "C:\\Windows\\Fonts\\segoeuib.ttf";
 	const char *icon_font = "C:\\Windows\\Fonts\\SegoeIcons.ttf";       // Windows 11
 	if(GetFileAttributesA(icon_font) == INVALID_FILE_ATTRIBUTES)
 		icon_font = "C:\\Windows\\Fonts\\segmdl2.ttf";                  // Windows 10
 	auto exists = [](const char *f) { return GetFileAttributesA(f) != INVALID_FILE_ATTRIBUTES; };
-	if(!exists(semibold))
-		semibold = regular;
-	if(!exists(bold))
-		bold = semibold;
 	g_icons = exists(icon_font);
 	static const ImWchar icon_ranges[] = { ICON_RANGE_MIN, ICON_RANGE_MAX, 0 };
+	const ImWchar *text_ranges = io.Fonts->GetGlyphRangesCyrillic(); // Latin + Cyrillic game names
 
-	auto add = [&](const char *file, float px, bool icons) -> ImFont * {
+	// 1 light, 2 regular, 3 medium, 4 semibold; fallback: Segoe UI
+	auto add = [&](int weight, float px, bool icons) -> ImFont * {
 		ImFontConfig cfg;
 		cfg.OversampleH = 2;
+		cfg.FontDataOwnedByAtlas = false;
 		ImFont *f = nullptr;
-		if(exists(file))
-			f = io.Fonts->AddFontFromFileTTF(file, px * scale, &cfg);
+		void *data;
+		int size;
+		if(FontResource(100 + weight, &data, &size))
+			f = io.Fonts->AddFontFromMemoryTTF(data, size, px * scale, &cfg, text_ranges);
 		else
 		{
-			cfg.SizePixels = px * 0.8f * scale;
-			f = io.Fonts->AddFontDefault(&cfg);
+			const char *fallback = weight >= 3 ? "C:\\Windows\\Fonts\\seguisb.ttf" : weight == 1 ? "C:\\Windows\\Fonts\\segoeuil.ttf"
+				: "C:\\Windows\\Fonts\\segoeui.ttf";
+			if(!exists(fallback))
+				fallback = "C:\\Windows\\Fonts\\segoeui.ttf";
+			if(exists(fallback))
+				f = io.Fonts->AddFontFromFileTTF(fallback, px * scale, &cfg, text_ranges);
+			else
+			{
+				ImFontConfig dc;
+				dc.SizePixels = px * 0.8f * scale;
+				f = io.Fonts->AddFontDefault(&dc);
+			}
 		}
 		if(icons && g_icons)
 		{
 			ImFontConfig ic;
 			ic.MergeMode = true;
-			ic.GlyphOffset = ImVec2(0, px * 0.12f * scale);
+			ic.GlyphOffset = ImVec2(0, px * 0.14f * scale);
 			ic.GlyphMinAdvanceX = px * scale;
-			io.Fonts->AddFontFromFileTTF(icon_font, px * 0.92f * scale, &ic, icon_ranges);
+			io.Fonts->AddFontFromFileTTF(icon_font, px * 0.85f * scale, &ic, icon_ranges);
 		}
 		return f;
 	};
-	add(regular, 19.0f, true);          // default UI font (first = default)
-	g_heading = add(semibold, 23.0f, true);
-	g_title = add(bold, 34.0f, true);
-	g_hero = add(bold, 60.0f, true);
-	label_font = add(bold, 52.0f, false);
+	add(2, 19.0f, true);                // body (first = default)
+	g_heading = add(2, 23.0f, true);    // row titles, page descriptions, list entries
+	g_title = add(1, 42.0f, false);     // page titles: light weight, large
+	g_hero = add(1, 56.0f, false);
+	label_font = add(3, 50.0f, false);  // compare / showcase labels
 
 	ImGuiStyle &st = ImGui::GetStyle();
 	st = ImGuiStyle();
 	ImGui::StyleColorsDark(&st);
-	st.WindowRounding = 16.0f;
-	st.ChildRounding = 14.0f;
-	st.FrameRounding = 9.0f;
-	st.GrabRounding = 9.0f;
-	st.PopupRounding = 12.0f;
-	st.TabRounding = 9.0f;
-	st.ScrollbarRounding = 9.0f;
-	st.FramePadding = ImVec2(14, 9);
-	st.ItemSpacing = ImVec2(12, 10);
+	st.WindowRounding = 8.0f;
+	st.ChildRounding = 6.0f;
+	st.FrameRounding = 4.0f;
+	st.GrabRounding = 4.0f;
+	st.PopupRounding = 6.0f;
+	st.TabRounding = 4.0f;
+	st.ScrollbarRounding = 4.0f;
+	st.FramePadding = ImVec2(12, 8);
+	st.ItemSpacing = ImVec2(10, 9);
 	st.ItemInnerSpacing = ImVec2(8, 6);
-	st.WindowPadding = ImVec2(22, 18);
-	st.ScrollbarSize = 10.0f;
+	st.WindowPadding = ImVec2(20, 18);
+	st.ScrollbarSize = 8.0f;
 	st.GrabMinSize = 14.0f;
 	st.WindowBorderSize = 1.0f;
-	st.ChildBorderSize = 1.0f;
+	st.ChildBorderSize = 0.0f;
 	st.PopupBorderSize = 1.0f;
+	st.FrameBorderSize = 0.0f;
 	st.TabBarBorderSize = 0.0f;
+	st.DisabledAlpha = 0.45f;
 	ImVec4 *c = st.Colors;
-	c[ImGuiCol_Text] = ImVec4(0.94f, 0.95f, 0.98f, 1.0f);
+	const ImVec4 white(1, 1, 1, 1);
+	auto w = [](float a) { return ImVec4(1, 1, 1, a); };
+	c[ImGuiCol_Text] = ImVec4(0.92f, 0.93f, 0.95f, 1.0f);
 	c[ImGuiCol_TextDisabled] = kTextDim;
-	c[ImGuiCol_WindowBg] = ImVec4(0.045f, 0.055f, 0.085f, 0.97f);
-	c[ImGuiCol_ChildBg] = ImVec4(1, 1, 1, 0.035f);
-	c[ImGuiCol_PopupBg] = ImVec4(0.07f, 0.085f, 0.12f, 0.98f);
-	c[ImGuiCol_Border] = ImVec4(1, 1, 1, 0.08f);
-	c[ImGuiCol_FrameBg] = ImVec4(1, 1, 1, 0.06f);
-	c[ImGuiCol_FrameBgHovered] = ImVec4(1, 1, 1, 0.10f);
-	c[ImGuiCol_FrameBgActive] = ImVec4(1, 1, 1, 0.14f);
-	c[ImGuiCol_Button] = ImVec4(1, 1, 1, 0.07f);
-	c[ImGuiCol_ButtonHovered] = ImVec4(1, 1, 1, 0.13f);
-	c[ImGuiCol_ButtonActive] = ImVec4(1, 1, 1, 0.18f);
-	c[ImGuiCol_CheckMark] = kAccentHi;
-	c[ImGuiCol_SliderGrab] = kAccent;
-	c[ImGuiCol_SliderGrabActive] = kAccentHi;
-	c[ImGuiCol_Header] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.35f);
-	c[ImGuiCol_HeaderHovered] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.55f);
-	c[ImGuiCol_HeaderActive] = kAccent;
-	c[ImGuiCol_Tab] = ImVec4(1, 1, 1, 0.04f);
-	c[ImGuiCol_TabHovered] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.55f);
-	c[ImGuiCol_TabSelected] = kAccent;
+	c[ImGuiCol_WindowBg] = ImVec4(0.075f, 0.082f, 0.105f, 0.97f);
+	c[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
+	c[ImGuiCol_PopupBg] = ImVec4(0.10f, 0.11f, 0.14f, 0.99f);
+	c[ImGuiCol_Border] = w(0.09f);
+	c[ImGuiCol_FrameBg] = w(0.06f);
+	c[ImGuiCol_FrameBgHovered] = w(0.09f);
+	c[ImGuiCol_FrameBgActive] = w(0.12f);
+	c[ImGuiCol_Button] = w(0.08f);
+	c[ImGuiCol_ButtonHovered] = w(0.13f);
+	c[ImGuiCol_ButtonActive] = w(0.18f);
+	c[ImGuiCol_CheckMark] = white;
+	c[ImGuiCol_SliderGrab] = ImVec4(0.88f, 0.89f, 0.92f, 1.0f);
+	c[ImGuiCol_SliderGrabActive] = white;
+	c[ImGuiCol_Header] = w(0.08f);
+	c[ImGuiCol_HeaderHovered] = w(0.12f);
+	c[ImGuiCol_HeaderActive] = w(0.16f);
+	c[ImGuiCol_Tab] = w(0.04f);
+	c[ImGuiCol_TabHovered] = w(0.12f);
+	c[ImGuiCol_TabSelected] = w(0.16f);
 	c[ImGuiCol_TabSelectedOverline] = ImVec4(0, 0, 0, 0);
-	c[ImGuiCol_TabDimmed] = ImVec4(1, 1, 1, 0.04f);
-	c[ImGuiCol_TabDimmedSelected] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.7f);
-	c[ImGuiCol_NavCursor] = kAccentHi;
-	c[ImGuiCol_Separator] = ImVec4(1, 1, 1, 0.08f);
+	c[ImGuiCol_TabDimmed] = w(0.04f);
+	c[ImGuiCol_TabDimmedSelected] = w(0.12f);
+	c[ImGuiCol_NavCursor] = w(0.80f);
+	c[ImGuiCol_Separator] = w(0.08f);
 	c[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0);
-	c[ImGuiCol_ScrollbarGrab] = ImVec4(1, 1, 1, 0.12f);
-	c[ImGuiCol_ResizeGrip] = ImVec4(1, 1, 1, 0.06f);
-	c[ImGuiCol_ResizeGripHovered] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.6f);
-	c[ImGuiCol_ModalWindowDimBg] = ImVec4(0, 0, 0, 0.65f);
-	c[ImGuiCol_PlotLines] = kAccentHi;
+	c[ImGuiCol_ScrollbarGrab] = w(0.12f);
+	c[ImGuiCol_ScrollbarGrabHovered] = w(0.20f);
+	c[ImGuiCol_ScrollbarGrabActive] = w(0.28f);
+	c[ImGuiCol_ResizeGrip] = w(0.05f);
+	c[ImGuiCol_ResizeGripHovered] = w(0.25f);
+	c[ImGuiCol_ResizeGripActive] = w(0.40f);
+	c[ImGuiCol_TextSelectedBg] = ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.35f);
+	c[ImGuiCol_ModalWindowDimBg] = ImVec4(0, 0, 0, 0.6f);
+	c[ImGuiCol_PlotLines] = ImVec4(0.85f, 0.87f, 0.9f, 1.0f);
 	st.ScaleAllSizes(scale);
 }
 
@@ -1251,43 +1278,13 @@ void App::BuildUi()
 		return;
 	}
 
-	ImGuiViewport *vp = ImGui::GetMainViewport();
-	ImGui::SetNextWindowPos(vp->Pos);
-	ImGui::SetNextWindowSize(vp->Size);
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-	ImGui::Begin("##main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings
-		| ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoBackground);
-	ImGui::PopStyleVar();
 	static Screen last_screen = Screen::Consoles;
 	if(screen != last_screen)
 	{
 		home_focus_pending = screen == Screen::Consoles;
 		last_screen = screen;
 	}
-	if(screen == Screen::Consoles)
-		UiHome();
-	else
-	{
-		DrawPs5Background(ImVec4(0.0f, 0.35f, 0.85f, 1.0f));
-		// Settings / Log: one readable centered column under the top bar
-		float top = 96 * ui_scale;
-		float w = std::min(vp->Size.x - 96 * ui_scale, 1180 * ui_scale);
-		ImGui::SetCursorScreenPos(ImVec2(vp->Pos.x + (vp->Size.x - w) * 0.5f, vp->Pos.y + top));
-		ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.03f, 0.04f, 0.08f, 0.72f));
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(36 * ui_scale, 26 * ui_scale));
-		ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 18 * ui_scale);
-		ImGui::BeginChild("##content", ImVec2(w, vp->Size.y - top - 28 * ui_scale), ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_Borders,
-			ImGuiWindowFlags_None);
-		ImGui::PopStyleVar(2);
-		ImGui::PopStyleColor();
-		if(screen == Screen::Settings)
-			UiSettings();
-		else
-			UiLog();
-		ImGui::EndChild();
-	}
-	UiTopBar();
-	ImGui::End();
+	UiMain();
 
 	if(phase == Phase::Waking || phase == Phase::Connecting || (phase == Phase::Streaming && !renderer.HasVideo()))
 		UiConnecting();
@@ -1391,61 +1388,6 @@ void App::UiPairDialog()
 	ImGui::EndPopup();
 }
 
-void App::Row(const char *label)
-{
-	ImGui::AlignTextToFramePadding();
-	ImGui::TextUnformatted(label);
-	ImGui::SameLine(row_label_w);
-	ImGui::SetNextItemWidth(row_item_w);
-}
-
-void App::RowHelp(const char *text)
-{
-	ImGui::SetCursorPosX(row_label_w);
-	HelpText(text);
-}
-
-void App::SetRowLayout(bool compact)
-{
-	row_label_w = (compact ? 210.0f : 270.0f) * ui_scale;
-	row_item_w = compact ? -FLT_MIN : 380.0f * ui_scale;
-}
-
-void App::UiSettings()
-{
-	if(g_title)
-		ImGui::PushFont(g_title);
-	ImGui::TextUnformatted("Settings");
-	if(g_title)
-		ImGui::PopFont();
-	HelpText("Everything here can also be changed while playing: open the stream menu with Create + PS, F1 or Esc.");
-	SetRowLayout(false);
-
-	SectionTitle("Stream");
-	UiStreamSection();
-	SectionTitle("Upscaling");
-	UiUpscaleSection();
-	SectionTitle("Frame generation");
-	UiFrameGenSection();
-	SectionTitle("Picture & ambient light");
-	UiPictureSection();
-	SectionTitle("Keyboard, mouse & controller");
-	UiControlsSection();
-	SectionTitle("Display & audio");
-	UiSystemSection();
-	SectionTitle("Interface & game profiles");
-	UiInterfaceSection();
-
-	SectionTitle("Account");
-	Row("PSN Account ID");
-	if(ImGui::InputText("##acc2", account_buf, sizeof(account_buf)))
-	{
-		settings.psn_account_id = account_buf;
-		MarkSettingsDirty();
-	}
-	ImGui::Dummy(ImVec2(0, 30 * ui_scale));
-}
-
 bool App::StreamSettingsChanged() const
 {
 	if(!session)
@@ -1499,9 +1441,9 @@ void App::UiStreamSection()
 		changed = true;
 	}
 	Row("HDR");
-	changed |= ImGui::Checkbox("Stream in HDR10 when the display is in HDR mode", &settings.hdr);
+	changed |= Toggle("Stream in HDR10 when the display is in HDR mode", &settings.hdr);
 	ImGui::SetCursorPosX(row_label_w);
-	changed |= ImGui::Checkbox("Also on SDR displays (tone-mapped on the PC)", &settings.hdr_force);
+	changed |= Toggle("Also on SDR displays (tone-mapped on the PC)", &settings.hdr_force);
 	RowHelp(renderer.DisplayHdr() ? "This display is in HDR mode." :
 		"This display is in SDR mode. Turn on \"Use HDR\" in Windows Settings > Display to get real HDR.");
 	Row("SDR / UI brightness in HDR");
@@ -1608,7 +1550,7 @@ void App::UiUpscaleSection()
 
 	Row("AI HDR for SDR games");
 	ImGui::BeginDisabled(!renderer.AiHdrAvailable());
-	changed |= ImGui::Checkbox(renderer.AiHdrAvailable() ? "NVIDIA RTX Video HDR##aihdr" : "Needs an NVIDIA RTX GPU##aihdr", &settings.ai_hdr);
+	changed |= Toggle(renderer.AiHdrAvailable() ? "NVIDIA RTX Video HDR##aihdr" : "Needs an NVIDIA RTX GPU##aihdr", &settings.ai_hdr);
 	ImGui::EndDisabled();
 	Row("HDR boost (any GPU)");
 	changed |= ImGui::SliderFloat("##hdrboost", &settings.hdr_boost, 0.0f, 1.0f, settings.hdr_boost < 0.01f ? "Off" : "%.2f");
@@ -1662,7 +1604,7 @@ void App::UiPictureSection()
 	changed |= ImGui::Combo("##aspect", &settings.aspect_mode, aspects, 3);
 	ImGui::BeginDisabled(settings.aspect_mode != 0);
 	Row("Ambient lighting");
-	changed |= ImGui::Checkbox("Light the bars with the picture's colors (F5)##amb", &settings.ambient);
+	changed |= Toggle("Light the bars with the picture's colors (F5)##amb", &settings.ambient);
 	ImGui::BeginDisabled(!settings.ambient);
 	Row("Ambient style");
 	const char *styles[] = { "Glow (soft colored light)", "Extend (blurred picture continues)" };
@@ -1702,9 +1644,9 @@ void App::UiPictureSection()
 void App::UiControlsSection()
 {
 	bool changed = false;
-	ImGui::TextColored(ImVec4(0.55f, 0.72f, 1.0f, 1.0f), "Keyboard & mouse");
+	SubHeader("Keyboard & mouse");
 	Row("Keyboard & mouse");
-	changed |= ImGui::Checkbox("Play with keyboard and mouse##kbm", &settings.kbm_enabled);
+	changed |= Toggle("Play with keyboard and mouse##kbm", &settings.kbm_enabled);
 	RowHelp("While playing, the mouse is captured and moves the right stick. Esc or F1 frees the mouse and opens this menu. "
 		"A gamepad keeps working alongside.");
 	ImGui::BeginDisabled(!settings.kbm_enabled);
@@ -1739,7 +1681,7 @@ void App::UiControlsSection()
 		changed = true;
 	}
 	Row("Invert Y");
-	changed |= ImGui::Checkbox("##minv", &settings.kbm.invert_y);
+	changed |= Toggle("##minv", &settings.kbm.invert_y);
 
 	Row("Key bindings");
 	if(ImGui::Button("Reset to defaults"))
@@ -1764,21 +1706,20 @@ void App::UiControlsSection()
 	}
 	ImGui::EndDisabled();
 
-	ImGui::Spacing();
-	ImGui::TextColored(ImVec4(0.55f, 0.72f, 1.0f, 1.0f), "Controller");
+	SubHeader("Controller");
 	Row("DualSense features");
-	changed |= ImGui::Checkbox("Haptic feedback and adaptive triggers", &settings.dualsense_features);
+	changed |= Toggle("Haptic feedback and adaptive triggers", &settings.dualsense_features);
 	RowHelp("Full haptics need the DualSense on a USB cable; over Bluetooth it falls back to rumble. Adaptive triggers work either way.");
 	Row("Haptics intensity");
 	changed |= ImGui::SliderFloat("##hg", &settings.haptics_gain, 0.0f, 2.0f, "%.2fx");
 	Row("Adaptive triggers");
-	changed |= ImGui::Checkbox("Enabled##trig", &settings.adaptive_triggers);
+	changed |= Toggle("Enabled##trig", &settings.adaptive_triggers);
 	Row("Motion controls");
-	changed |= ImGui::Checkbox("Gyro / accelerometer", &settings.motion_controls);
+	changed |= Toggle("Gyro / accelerometer", &settings.motion_controls);
 	Row("Rumble strength");
 	changed |= ImGui::SliderFloat("##rg", &settings.rumble_gain, 0.0f, 2.0f, "%.2fx");
 	Row("Xbox-style controllers");
-	changed |= ImGui::Checkbox("View button acts as touchpad press", &settings.view_is_touchpad);
+	changed |= Toggle("View button acts as touchpad press", &settings.view_is_touchpad);
 	RowHelp("Open the stream menu with Create + PS (View + Guide on Xbox pads).");
 	if(changed)
 		MarkSettingsDirty();
@@ -1789,18 +1730,18 @@ void App::UiSystemSection()
 	bool changed = false;
 	Row("Fullscreen");
 	bool fs = settings.fullscreen;
-	if(ImGui::Checkbox("Borderless fullscreen (F11)", &fs))
+	if(Toggle("Borderless fullscreen (F11)", &fs))
 	{
 		settings.fullscreen = fs;
 		SetFullscreen(fs);
 		changed = true;
 	}
 	Row("V-Sync");
-	changed |= ImGui::Checkbox("Sync to the display (off = lowest latency, may tear)", &settings.vsync);
+	changed |= Toggle("Sync to the display (off = lowest latency, may tear)", &settings.vsync);
 	Row("Statistics");
-	changed |= ImGui::Checkbox("Show stream statistics while playing (F2)", &settings.show_stats);
+	changed |= Toggle("Show stream statistics while playing (F2)", &settings.show_stats);
 	Row("Reconnect");
-	changed |= ImGui::Checkbox("Reconnect automatically if the stream drops", &settings.auto_reconnect);
+	changed |= Toggle("Reconnect automatically if the stream drops", &settings.auto_reconnect);
 	Row("Volume");
 	if(ImGui::SliderFloat("##vol", &settings.volume, 0.0f, 1.5f, "%.2f"))
 	{
@@ -1808,10 +1749,9 @@ void App::UiSystemSection()
 		changed = true;
 	}
 	Row("Microphone");
-	changed |= ImGui::Checkbox("Allow voice chat (DualSense mute button or F10)", &settings.microphone);
+	changed |= Toggle("Allow voice chat (DualSense mute button or F10)", &settings.microphone);
 
-	ImGui::Spacing();
-	ImGui::TextColored(ImVec4(0.55f, 0.72f, 1.0f, 1.0f), "Hotkeys while playing");
+	SubHeader("Hotkeys while playing");
 	static const char *keys[][2] = {
 		{ "Esc / F1", "Stream menu (frees the mouse)" }, { "F2", "Statistics" }, { "F3", "Cycle upscaling" },
 		{ "F4", "Cycle frame generation" }, { "F5", "Ambient light on/off" }, { "F6", "Split-screen compare" },
@@ -1892,7 +1832,7 @@ void App::DrawRecordingBadge()
 	ImVec2 sz = ImGui::CalcTextSize(txt);
 	float pad = 10.0f * ui_scale, r = 6.0f * ui_scale;
 	ImVec2 p(vp->Pos.x + vp->Size.x - sz.x - pad * 3 - r * 2 - 20.0f * ui_scale, vp->Pos.y + 20.0f * ui_scale);
-	dl->AddRectFilled(p, ImVec2(p.x + sz.x + pad * 3 + r * 2, p.y + sz.y + pad), IM_COL32(0, 0, 0, 170), 10.0f * ui_scale);
+	dl->AddRectFilled(p, ImVec2(p.x + sz.x + pad * 3 + r * 2, p.y + sz.y + pad), IM_COL32(20, 22, 28, 220), 4.0f * ui_scale);
 	bool blink = ((int)(ImGui::GetTime() * 2.0)) % 2 == 0;
 	dl->AddCircleFilled(ImVec2(p.x + pad + r, p.y + (sz.y + pad) * 0.5f), r, blink ? IM_COL32(235, 60, 60, 255) : IM_COL32(140, 30, 30, 255));
 	dl->AddText(ImVec2(p.x + pad * 2 + r * 2, p.y + pad * 0.5f), IM_COL32(255, 255, 255, 235), txt);
@@ -1911,7 +1851,7 @@ void App::UiCaptureSection()
 		"HDR kept. Files go to Videos\\Orbit Play.");
 
 	Row("Instant replay");
-	if(ImGui::Checkbox("Keep the last moments in memory##replay", &settings.replay_enabled))
+	if(Toggle("Keep the last moments in memory##replay", &settings.replay_enabled))
 	{
 		recorder.SetReplay(settings.replay_enabled, settings.replay_seconds);
 		if(settings.replay_enabled && session)
@@ -1955,11 +1895,6 @@ void App::UiCaptureSection()
 
 void App::UiLog()
 {
-	if(g_title)
-		ImGui::PushFont(g_title);
-	ImGui::TextUnformatted("Log");
-	if(g_title)
-		ImGui::PopFont();
 	HelpText(("Saved to " + data_dir + "\\orbitplay.log").c_str());
 	ImGui::BeginChild("##logtext", ImVec2(0, 0), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
 	for(const auto &line : Log::Get().Recent())
@@ -1992,9 +1927,9 @@ void App::UiConnecting()
 	ImVec2 c(p.x + W * 0.5f, p.y + R + 6 * ui_scale);
 	float t = (float)ImGui::GetTime();
 	dl->PathArcTo(c, R, 0, 6.2831853f, 48);
-	dl->PathStroke(IM_COL32(255, 255, 255, 25), 0, 4.0f * ui_scale);
+	dl->PathStroke(IM_COL32(255, 255, 255, 25), 0, 3.0f * ui_scale);
 	dl->PathArcTo(c, R, t * 5.0f, t * 5.0f + 1.6f + 0.8f * sinf(t * 2.0f), 32);
-	dl->PathStroke(kAccentU, 0, 4.0f * ui_scale);
+	dl->PathStroke(IM_COL32(236, 238, 242, 255), 0, 3.0f * ui_scale);
 	ImGui::Dummy(ImVec2(W, R * 2 + 20 * ui_scale));
 	const char *what = phase == Phase::Waking ? "Waking up" : "Connecting to";
 	char line[160];
@@ -2069,7 +2004,7 @@ void App::UiStats()
 void App::UiStreamOverlay()
 {
 	ImGuiViewport *vp = ImGui::GetMainViewport();
-	ImVec2 size(std::min(880.0f * ui_scale, vp->Size.x - 40.0f), std::min(vp->Size.y * 0.86f, 980.0f * ui_scale));
+	ImVec2 size(std::min(1100.0f * ui_scale, vp->Size.x - 40.0f), std::min(vp->Size.y * 0.84f, 940.0f * ui_scale));
 	// Opens centered; afterwards it stays where you drag it (grab the header or any empty area)
 	if(menu_reset_pos)
 	{
@@ -2077,8 +2012,8 @@ void App::UiStreamOverlay()
 		ImGui::SetNextWindowSize(size, ImGuiCond_Always);
 		menu_reset_pos = false;
 	}
-	ImGui::SetNextWindowSizeConstraints(ImVec2(560 * ui_scale, 420 * ui_scale), ImVec2(vp->Size.x, vp->Size.y));
-	ImGui::SetNextWindowBgAlpha(0.93f);
+	ImGui::SetNextWindowSizeConstraints(ImVec2(720 * ui_scale, 460 * ui_scale), ImVec2(vp->Size.x, vp->Size.y));
+	ImGui::SetNextWindowBgAlpha(0.96f);
 	// Focus only when the menu opens: focusing every frame would close dropdowns as soon as they open.
 	if(overlay_just_opened)
 	{
@@ -2102,7 +2037,7 @@ void App::UiStreamOverlay()
 		ImGui::Dummy(ImVec2(0, 2 * ui_scale));
 		if(g_heading)
 			ImGui::PushFont(g_heading);
-		ImGui::Text("%s%s%s", Ico(ICON_GAME), g_icons ? "  " : "", active_host.nickname.empty() ? "PlayStation 5" : active_host.nickname.c_str());
+		ImGui::TextUnformatted(!current_game.empty() ? current_game.c_str() : active_host.nickname.empty() ? "PlayStation 5" : active_host.nickname.c_str());
 		if(g_heading)
 			ImGui::PopFont();
 		ImGui::SameLine();
@@ -2142,7 +2077,7 @@ void App::UiStreamOverlay()
 		};
 		float n = (float)qa.size();
 		float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * (n - 1)) / n;
-		float bh = 64.0f * ui_scale;
+		float bh = 54.0f * ui_scale;
 		for(size_t i = 0; i < qa.size(); i++)
 		{
 			if(i)
@@ -2151,24 +2086,28 @@ void App::UiStreamOverlay()
 			bool dis = (qa[i].id == 1 && !(session && settings.microphone)) || (qa[i].id == 4 && !recorder.ReplayEnabled());
 			ImGui::BeginDisabled(dis);
 			ImVec2 p = ImGui::GetCursorScreenPos();
-			bool primary = qa[i].id == 0, on = qa[i].on;
-			if(primary || on)
+			bool on = qa[i].on, rec = qa[i].id == 3 && on;
+			if(on)
 			{
-				ImGui::PushStyleColor(ImGuiCol_Button, qa[i].id == 3 && on ? ImVec4(0.75f, 0.15f, 0.18f, 1) : kAccent);
-				ImGui::PushStyleColor(ImGuiCol_ButtonHovered, qa[i].id == 3 && on ? ImVec4(0.88f, 0.22f, 0.25f, 1) : kAccentHi);
+				ImGui::PushStyleColor(ImGuiCol_Button, rec ? ImVec4(0.70f, 0.16f, 0.18f, 1) : ImVec4(0.90f, 0.91f, 0.93f, 1));
+				ImGui::PushStyleColor(ImGuiCol_ButtonHovered, rec ? ImVec4(0.80f, 0.22f, 0.24f, 1) : ImVec4(1, 1, 1, 1));
 			}
 			bool clicked = ImGui::Button("##qa", ImVec2(bw, bh));
-			if(primary || on)
+			if(on)
 				ImGui::PopStyleColor(2);
 			ImDrawList *dl = ImGui::GetWindowDrawList();
 			const char *ic = Ico(qa[i].icon);
 			ImVec2 isz = ImGui::CalcTextSize(ic), lsz = ImGui::CalcTextSize(qa[i].label.c_str());
-			float top = p.y + (bh - isz.y - lsz.y - 2 * ui_scale) * 0.5f;
-			ImU32 tc = ImGui::GetColorU32(ImGuiCol_Text, dis ? 0.4f : 1.0f);
+			// icon and label side by side
+			float gapx = *ic ? 8 * ui_scale : 0;
+			float tw = isz.x + gapx + lsz.x;
+			float tx = p.x + (bw - tw) * 0.5f, ty = p.y + (bh - lsz.y) * 0.5f;
+			ImU32 tc = on && !rec ? IM_COL32(14, 16, 22, 255) : ImGui::GetColorU32(ImGuiCol_Text, dis ? 0.4f : 1.0f);
+			dl->PushClipRect(p, ImVec2(p.x + bw, p.y + bh), true);
 			if(*ic)
-				dl->AddText(ImVec2(p.x + (bw - isz.x) * 0.5f, top), tc, ic);
-			dl->AddText(ImVec2(p.x + (bw - lsz.x) * 0.5f, *ic ? top + isz.y + 2 * ui_scale : p.y + (bh - lsz.y) * 0.5f), tc,
-				qa[i].label.c_str());
+				dl->AddText(ImVec2(tx, ty), tc, ic);
+			dl->AddText(ImVec2(tx + isz.x + gapx, ty), tc, qa[i].label.c_str());
+			dl->PopClipRect();
 			ImGui::EndDisabled();
 			ImGui::PopID();
 			if(!clicked)
@@ -2207,7 +2146,7 @@ void App::UiStreamOverlay()
 
 	if(StreamSettingsChanged())
 	{
-		ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.30f, 0.62f, 0.45f));
+		ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 0.06f));
 		ImGui::BeginChild("##reconnect", ImVec2(0, ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().WindowPadding.y * 2),
 			ImGuiChildFlags_Borders);
 		ImGui::AlignTextToFramePadding();
@@ -2225,34 +2164,23 @@ void App::UiStreamOverlay()
 	}
 
 	float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y * 2;
-	SetRowLayout(true);
-	if(ImGui::BeginTabBar("##menutabs"))
+	ImGui::Dummy(ImVec2(0, 6 * ui_scale));
 	{
-		auto tab = [&](const char *name, auto &&body) {
-			if(ImGui::BeginTabItem(name))
-			{
-				ImGui::BeginChild("##tabbody", ImVec2(0, -footer), ImGuiChildFlags_None, ImGuiWindowFlags_None);
-				body();
-				ImGui::EndChild();
-				ImGui::EndTabItem();
-			}
-		};
-		char tlabel[8][64];
-		int tk = 0;
-		auto tl = [&](const char *icon, const char *name) {
-			tk = (tk + 1) % 8;
-			snprintf(tlabel[tk], sizeof(tlabel[tk]), "%s%s%s###%s", Ico(icon), g_icons ? "  " : "", name, name);
-			return (const char *)tlabel[tk];
-		};
-		tab(tl(ICON_GAME, "Game"), [&] { UiGameSection(); });
-		tab(tl(ICON_PHOTO, "Image"), [&] { UiUpscaleSection(); });
-		tab(tl(ICON_SPEED, "Motion"), [&] { UiFrameGenSection(); });
-		tab(tl(ICON_BRIGHTNESS, "Picture"), [&] { UiPictureSection(); });
-		tab(tl(ICON_VIDEO, "Capture"), [&] { UiCaptureSection(); });
-		tab(tl(ICON_KEYBOARD, "Controls"), [&] { UiControlsSection(); });
-		tab(tl(ICON_WIFI, "Stream"), [&] { UiStreamSection(); });
-		tab(tl(ICON_SETTINGS, "System"), [&] { UiSystemSection(); });
-		ImGui::EndTabBar();
+		// left: sections, right: the section's rows (same layout as Settings)
+		const int cats[] = { Cat_Game, Cat_Image, Cat_Motion, Cat_Picture, Cat_Controls, Cat_Capture, Cat_Stream, Cat_System, Cat_Interface };
+		float body_h = ImGui::GetContentRegionAvail().y - footer;
+		float lw = std::clamp(ImGui::GetContentRegionAvail().x * 0.22f, 170.0f * ui_scale, 240.0f * ui_scale);
+		ImGui::BeginChild("##menucats", ImVec2(lw, body_h), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+		for(int c : cats)
+			if(ListItem(CategoryName(c), menu_cat == c))
+				menu_cat = c;
+		ImGui::EndChild();
+		ImGui::SameLine(0, 18 * ui_scale);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+		ImGui::BeginChild("##menupage", ImVec2(0, body_h), ImGuiChildFlags_None, ImGuiWindowFlags_None);
+		ImGui::PopStyleVar();
+		DrawCategory(menu_cat, true);
+		ImGui::EndChild();
 	}
 
 	ImGui::Separator();
@@ -2521,20 +2449,20 @@ void App::UiMessage()
 {
 	if(!toast.empty() && NowMs() < toast_until)
 	{
-		// pill at the top, slides in and fades out
+		// a plain notification card in the top-right corner; fades out
 		uint64_t left = toast_until - NowMs();
 		float alpha = std::min(1.0f, left / 300.0f);
 		ImGuiViewport *tv = ImGui::GetMainViewport();
 		ImDrawList *dl = ImGui::GetForegroundDrawList();
-		std::string text = std::string(Ico(ICON_INFO)) + (g_icons ? "   " : "") + toast;
-		ImVec2 ts = ImGui::CalcTextSize(text.c_str());
-		float padx = 22 * ui_scale, pady = 12 * ui_scale;
-		float y = tv->Pos.y + 26 * ui_scale - (1.0f - alpha) * 12 * ui_scale;
-		ImVec2 a(tv->GetCenter().x - ts.x * 0.5f - padx, y), b(tv->GetCenter().x + ts.x * 0.5f + padx, y + ts.y + pady * 2);
-		dl->AddRectFilled(ImVec2(a.x + 2, a.y + 4), ImVec2(b.x + 2, b.y + 4), IM_COL32(0, 0, 0, (int)(70 * alpha)), 40.0f);
-		dl->AddRectFilled(a, b, IM_COL32(16, 22, 38, (int)(235 * alpha)), 40.0f);
-		dl->AddRect(a, b, IM_COL32(70, 140, 255, (int)(110 * alpha)), 40.0f, 0, 1.2f);
-		dl->AddText(ImVec2(a.x + padx, a.y + pady), IM_COL32(240, 244, 255, (int)(255 * alpha)), text.c_str());
+		float maxw = std::min(560.0f * ui_scale, tv->Size.x - 48 * ui_scale);
+		float padx = 20 * ui_scale, pady = 14 * ui_scale;
+		ImVec2 ts = ImGui::CalcTextSize(toast.c_str(), nullptr, false, maxw - padx * 2);
+		float w = std::min(maxw, ts.x + padx * 2);
+		ImVec2 a(tv->Pos.x + tv->Size.x - w - 24 * ui_scale, tv->Pos.y + 24 * ui_scale), b(a.x + w, a.y + ts.y + pady * 2);
+		dl->AddRectFilled(a, b, IM_COL32(28, 30, 37, (int)(245 * alpha)), 6.0f * ui_scale);
+		dl->AddRect(a, b, IM_COL32(255, 255, 255, (int)(26 * alpha)), 6.0f * ui_scale, 0, 1.0f);
+		dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(a.x + padx, a.y + pady), IM_COL32(236, 238, 242, (int)(255 * alpha)),
+			toast.c_str(), nullptr, maxw - padx * 2);
 	}
 	if(message.empty())
 		return;

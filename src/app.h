@@ -36,6 +36,11 @@ public:
 	// Mini player hit-testing (drag the borderless window)
 	bool MiniMode() const { return mini_mode; }
 
+	// Settings pages (shared by the Settings screen and the in-game menu)
+	enum Cat { Cat_Game, Cat_Stream, Cat_Image, Cat_Motion, Cat_Picture, Cat_Controls, Cat_Capture, Cat_Interface, Cat_System,
+		Cat_Account, Cat_Count };
+	static const char *CategoryName(int cat);
+
 private:
 	enum class Screen { Consoles, Settings, Log };
 	enum class Phase { Idle, Waking, Connecting, Streaming };
@@ -63,17 +68,21 @@ private:
 
 	// UI
 	void SetupStyle(float scale);
-	void UiTopBar();
-	void UiHome();
+	void UiMain();
+	void UiConsolesPage();
+	void DrawBackground();
+	void DrawCategory(int cat, bool compact);
+	bool ListItem(const char *label, bool active);
+	void RowsBegin();
+	void RowsEnd();
+	void CloseRow();
+	void SubHeader(const char *text);
 	void UiBootIntro();
 	void UiControlCenterBar();
 	void UiInterfaceSection();
 	void UiGameSection();
-	void DrawPs5Background(const ImVec4 &tint);
-	static ImVec4 HostColor(const std::string &id);
 	static std::string FormatDuration(uint64_t seconds);
 	static std::string SanitizeKey(const std::string &s);
-	void UiSettings();
 	void UiLog();
 	void UiPairDialog();
 	void UiStreamOverlay();
@@ -91,6 +100,11 @@ private:
 	void RowHelp(const char *text);
 	void SetRowLayout(bool compact);
 	float row_label_w = 270.0f, row_item_w = 380.0f;
+	bool rows_active = false, row_open = false;
+	float row_x0 = 0, row_x1 = 0, row_y0 = 0;
+	ImDrawListSplitter row_splitter;
+	int settings_cat = Cat_Stream;
+	int menu_cat = Cat_Game;
 
 	// streaming helpers
 	void ShowOverlay(bool open);
@@ -210,10 +224,6 @@ private:
 	uint64_t boot_start_ms = 0;
 	int home_sel = 0;
 	bool home_focus_pending = true;
-	float home_scroll = 0.0f;
-	std::map<std::string, float> tile_anim;
-	ImVec4 bg_tint = ImVec4(0.0f, 0.35f, 0.85f, 1.0f);
-	std::string forget_mac;
 
 	// mini player
 	bool mini_mode = false;
