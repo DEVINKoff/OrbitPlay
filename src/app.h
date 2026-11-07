@@ -87,6 +87,7 @@ private:
 	void DrawWindowControls();
 	void SaveWindowPlacement();
 	void RestoreWindowPlacement();
+	void RememberWindowRect();
 	void NoDragLastItem();
 	void UiControlCenterBar();
 	void UiInterfaceSection();

@@ -57,7 +57,9 @@ bool App::Init(const std::string &resume)
 		settings.upscale_mode = 2;
 		LOGI("Restored AI upscaling (1.6.0 had switched it off after a crash report)");
 	}
-	settings.last_version = "1.7.0";
+	if(settings.last_version == "1.7.0")
+		settings.win_w = settings.win_h = 0; // 1.7.0 saved a window rect that could be off screen: start fresh
+	settings.last_version = "1.7.1";
 	MarkSettingsDirty();
 	CheckCrashMarker();
 	for(int i = 0; i < KeyboardMouse::ActionCount; i++)
@@ -540,6 +542,10 @@ void App::PumpEvents()
 			case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
 			case SDL_EVENT_WINDOW_MOVED:
 				last_display_refresh = 0;
+				RememberWindowRect();
+				break;
+			case SDL_EVENT_WINDOW_RESIZED:
+				RememberWindowRect();
 				break;
 			case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
 			{

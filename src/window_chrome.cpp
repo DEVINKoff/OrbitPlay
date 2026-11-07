@@ -238,44 +238,60 @@ void App::DrawWindowControls()
 	ImGui::End();
 }
 
-// Window size, position and maximized state are restored on the next start.
+// Window size, position and maximized state are restored on the next start. The normal
+// (not maximized) rectangle is remembered as the window moves, in SDL's own coordinates.
+void App::RememberWindowRect()
+{
+	SDL_WindowFlags f = SDL_GetWindowFlags(window);
+	if(mini_mode || (f & (SDL_WINDOW_MAXIMIZED | SDL_WINDOW_MINIMIZED | SDL_WINDOW_FULLSCREEN | SDL_WINDOW_HIDDEN)))
+		return;
+	SDL_GetWindowPosition(window, &settings.win_x, &settings.win_y);
+	SDL_GetWindowSize(window, &settings.win_w, &settings.win_h);
+	MarkSettingsDirty();
+}
+
 void App::SaveWindowPlacement()
 {
-	if(!hwnd || mini_mode)
+	if(!window)
 		return;
-	WINDOWPLACEMENT wp = { sizeof(wp) };
-	if(!GetWindowPlacement(hwnd, &wp))
-		return;
-	RECT r = wp.rcNormalPosition;
-	settings.win_x = r.left;
-	settings.win_y = r.top;
-	settings.win_w = r.right - r.left;
-	settings.win_h = r.bottom - r.top;
-	settings.win_max = wp.showCmd == SW_SHOWMAXIMIZED || (wp.flags & WPF_RESTORETOMAXIMIZED);
+	RememberWindowRect();
+	if(!mini_mode)
+		settings.win_max = (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
 }
 
 void App::RestoreWindowPlacement()
 {
-	RECT r = { settings.win_x, settings.win_y, settings.win_x + settings.win_w, settings.win_y + settings.win_h };
-	bool valid = settings.win_w >= 640 && settings.win_h >= 360 && MonitorFromRect(&r, MONITOR_DEFAULTTONULL);
-	if(!valid)
+	SDL_Rect want = { settings.win_x, settings.win_y, settings.win_w, settings.win_h };
+	bool saved = settings.win_w >= 640 && settings.win_h >= 360;
+	SDL_DisplayID disp = saved ? SDL_GetDisplayForRect(&want) : 0;
+	if(!disp)
+		disp = SDL_GetPrimaryDisplay();
+	SDL_Rect work = { 0, 0, 1920, 1080 };
+	SDL_GetDisplayUsableBounds(disp, &work);
+	if(!saved)
 	{
-		// first start: 70% of the work area, centered
-		HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
-		MONITORINFO mi = { sizeof(mi) };
-		GetMonitorInfoW(mon, &mi);
-		int ww = (mi.rcWork.right - mi.rcWork.left) * 7 / 10, wh = ww * 9 / 16;
-		r.left = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - ww) / 2;
-		r.top = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - wh) / 2;
-		r.right = r.left + ww;
-		r.bottom = r.top + wh;
+		// first start: the largest 16:9 window that fits in 85% of the screen, centered
+		// (works for 16:9, 21:9 and 32:9 displays alike)
+		int h = work.h * 85 / 100, w = h * 16 / 9;
+		if(w > work.w * 85 / 100)
+		{
+			w = work.w * 85 / 100;
+			h = w * 9 / 16;
+		}
+		want = { work.x + (work.w - w) / 2, work.y + (work.h - h) / 2, w, h };
 	}
-	// set the normal position while still hidden, then show through SDL so it knows the state
-	WINDOWPLACEMENT wp = { sizeof(wp) };
-	wp.rcNormalPosition = r;
-	wp.showCmd = SW_HIDE;
-	SetWindowPlacement(hwnd, &wp);
+	else
+	{
+		// never bigger than the screen, never off it
+		want.w = std::min(want.w, work.w);
+		want.h = std::min(want.h, work.h);
+		want.x = std::clamp(want.x, work.x, work.x + work.w - want.w);
+		want.y = std::clamp(want.y, work.y, work.y + work.h - want.h);
+	}
+	SDL_SetWindowSize(window, want.w, want.h);
+	SDL_SetWindowPosition(window, want.x, want.y);
 	SDL_ShowWindow(window);
-	if(valid && settings.win_max)
+	SDL_SyncWindow(window);
+	if(saved && settings.win_max)
 		SDL_MaximizeWindow(window);
 }
