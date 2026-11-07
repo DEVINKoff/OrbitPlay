@@ -129,6 +129,8 @@ public:
 	void BeginOverlay();
 	// Shows the frame `serial` (0 = newest) or the interpolated frame.
 	void Present(VideoView view, const PresentOptions &options, uint64_t serial = 0);
+	// The GPU was reset (driver update / crash / TDR). The app restarts itself to recover.
+	bool DeviceLost() const { return device_lost; }
 
 	// Where the video is drawn in the window: x, y, w, h in pixels.
 	void GetVideoRect(AspectMode aspect, float rect[4]) const { float uv[4]; VideoRect(aspect, width, height, rect, uv); }
@@ -185,6 +187,7 @@ private:
 	HWND hwnd = nullptr;
 	int width = 0, height = 0;
 
+	bool device_lost = false;
 	Com<ID3D11Device> device;
 	Com<ID3D11DeviceContext> context;
 	Com<IDXGISwapChain1> swapchain;

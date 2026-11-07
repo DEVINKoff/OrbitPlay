@@ -395,6 +395,25 @@ bool Gamepads::AnyWiredDualSense() const
 	return false;
 }
 
+std::vector<Gamepads::PadInfo> Gamepads::Info() const
+{
+	std::vector<PadInfo> out;
+	for(auto &p : pads)
+	{
+		PadInfo i;
+		i.name = p->name;
+		i.dualsense = p->dualsense;
+		i.wired = SDL_GetGamepadConnectionState(p->gamepad) == SDL_JOYSTICK_CONNECTION_WIRED;
+		int pct = -1;
+		SDL_PowerState ps = SDL_GetGamepadPowerInfo(p->gamepad, &pct);
+		i.charging = ps == SDL_POWERSTATE_CHARGING || ps == SDL_POWERSTATE_CHARGED;
+		if(ps == SDL_POWERSTATE_ON_BATTERY || ps == SDL_POWERSTATE_CHARGING || ps == SDL_POWERSTATE_CHARGED)
+			i.battery = ps == SDL_POWERSTATE_CHARGED ? 100 : pct;
+		out.push_back(i);
+	}
+	return out;
+}
+
 std::vector<std::string> Gamepads::Names() const
 {
 	std::vector<std::string> n;

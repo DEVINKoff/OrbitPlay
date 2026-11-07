@@ -2,6 +2,7 @@
 #include "app.h"
 #include "log.h"
 #include "icons.h"
+#include "ui_style.h"
 
 #include <chiaki/common.h>
 #include <chiaki/time.h>
@@ -20,6 +21,9 @@ extern "C" {
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <fstream>
+#include <sstream>
 
 static const char *kAppName = "Orbit Play";
 static const uint64_t kWakeTimeoutMs = 60000;
@@ -29,8 +33,9 @@ static uint64_t NowMs() { return chiaki_time_now_monotonic_ms(); }
 // ---------------------------------------------------------------------------
 // Init / shutdown
 
-bool App::Init()
+bool App::Init(const std::string &resume)
 {
+	resume_mac = resume;
 	const char *appdata = getenv("APPDATA");
 	data_dir = std::string(appdata ? appdata : ".") + "\\OrbitPlay";
 	CreateDirectoryA(data_dir.c_str(), nullptr);
@@ -46,6 +51,7 @@ bool App::Init()
 	}
 
 	settings.Load(settings_path);
+	CheckCrashMarker();
 	for(int i = 0; i < KeyboardMouse::ActionCount; i++)
 		kbm.bindings[i] = settings.bindings[i];
 	strncpy(account_buf, settings.psn_account_id.c_str(), sizeof(account_buf) - 1);
@@ -86,15 +92,84 @@ bool App::Init()
 	ImGui_ImplDX11_Init(renderer.Device(), renderer.Context());
 
 	audio.SetVolume(settings.volume);
+	sounds.Init();
+	sounds.SetEnabled(settings.ui_sounds);
+	sounds.SetVolume(settings.ui_sound_volume);
 	discovery.Start();
 	if(settings.fullscreen)
 		SetFullscreen(true);
 	present_window_start = NowMs();
+	// Mini player: the borderless window is dragged from anywhere, resized from its edges
+	SDL_SetWindowHitTest(window, [](SDL_Window *w, const SDL_Point *pt, void *user) -> SDL_HitTestResult {
+		App *app = (App *)user;
+		if(!app->MiniMode())
+			return SDL_HITTEST_NORMAL;
+		int ww, wh;
+		SDL_GetWindowSize(w, &ww, &wh);
+		const int e = 10;
+		bool l = pt->x < e, r = pt->x >= ww - e, t = pt->y < e, b = pt->y >= wh - e;
+		if(t && l) return SDL_HITTEST_RESIZE_TOPLEFT;
+		if(t && r) return SDL_HITTEST_RESIZE_TOPRIGHT;
+		if(b && l) return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+		if(b && r) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+		if(t) return SDL_HITTEST_RESIZE_TOP;
+		if(b) return SDL_HITTEST_RESIZE_BOTTOM;
+		if(l) return SDL_HITTEST_RESIZE_LEFT;
+		if(r) return SDL_HITTEST_RESIZE_RIGHT;
+		return SDL_HITTEST_DRAGGABLE;
+	}, this);
+	if(!resume_mac.empty())
+	{
+		// Restarted after a GPU reset: go straight back into the game
+		boot_start_ms = 0;
+		ShowToast("The graphics driver restarted - reconnecting...");
+		toast_until = NowMs() + 5000;
+		reconnect_at = NowMs() + 1500;
+		if(RegisteredHost *h = settings.FindHost(resume_mac))
+			active_host = *h;
+	}
+	else if(settings.boot_animation)
+	{
+		boot_start_ms = NowMs();
+		sounds.Play(UiSound::Boot);
+	}
 	return true;
+}
+
+// A crash report from the previous run: say so, and turn off what was running on the GPU
+// at the time so the next stream starts safely.
+void App::CheckCrashMarker()
+{
+	std::string marker = data_dir + "\\crash.txt";
+	std::ifstream in(marker);
+	if(!in)
+		return;
+	std::stringstream ss;
+	ss << in.rdbuf();
+	in.close();
+	DeleteFileA(marker.c_str());
+	std::string ctx = ss.str();
+	LOGW("Previous run crashed (%s)", ctx.c_str());
+	message = "Orbit Play closed unexpectedly last time. A crash report was saved to " + data_dir + "\\crash.dmp.";
+	if(ctx.find("streaming=1") != std::string::npos)
+	{
+		bool fg = ctx.find("fg=0") == std::string::npos, up = ctx.find("upscale=2") != std::string::npos;
+		if(fg)
+			settings.frame_gen = 0;
+		if(up)
+			settings.upscale_mode = 1;
+		if(fg || up)
+			message += std::string(" To be safe, ") + (fg ? "frame generation was turned off" : "")
+				+ (fg && up ? " and " : "") + (up ? "AI upscaling was switched to Enhanced" : "") + ". You can turn it back on in Settings.";
+	}
+	message_is_error = true;
 }
 
 void App::Shutdown()
 {
+	FlushPlaytime();
+	if(mini_mode)
+		ToggleMiniPlayer();
 	if(session)
 	{
 		session->Stop();
@@ -104,6 +179,7 @@ void App::Shutdown()
 	registration.Cancel();
 	discovery.Stop();
 	settings.Save(settings_path);
+	sounds.Shutdown();
 	ImGui_ImplDX11_Shutdown();
 	ImGui_ImplSDL3_Shutdown();
 	ImGui::DestroyContext();
@@ -113,18 +189,6 @@ void App::Shutdown()
 	SDL_Quit();
 	LOGI("Bye");
 }
-
-static bool g_icons = false;
-static ImFont *g_heading = nullptr, *g_title = nullptr;
-static const char *Ico(const char *icon) { return g_icons ? icon : ""; }
-
-// Colors
-static const ImVec4 kAccent(0.00f, 0.44f, 0.86f, 1.0f);       // PlayStation blue
-static const ImVec4 kAccentHi(0.20f, 0.58f, 1.00f, 1.0f);
-static const ImU32 kAccentU = IM_COL32(0, 112, 219, 255);
-static const ImVec4 kTextDim(0.62f, 0.66f, 0.74f, 1.0f);
-static const ImVec4 kGood(0.35f, 0.88f, 0.55f, 1.0f);
-static const ImVec4 kWarn(1.00f, 0.74f, 0.30f, 1.0f);
 
 void App::SetupStyle(float scale)
 {
@@ -168,6 +232,7 @@ void App::SetupStyle(float scale)
 	add(regular, 19.0f, true);          // default UI font (first = default)
 	g_heading = add(semibold, 23.0f, true);
 	g_title = add(bold, 34.0f, true);
+	g_hero = add(bold, 60.0f, true);
 	label_font = add(bold, 52.0f, false);
 
 	ImGuiStyle &st = ImGui::GetStyle();
@@ -345,6 +410,15 @@ void App::Run()
 {
 	while(!quit)
 	{
+		if(renderer.DeviceLost())
+		{
+			// Driver update / GPU crash: the D3D device is gone. Restart cleanly and reconnect.
+			relaunch = true;
+			relaunch_mac = (phase == Phase::Streaming || phase == Phase::Connecting) ? active_host.mac : "";
+			LOGW("Restarting after a GPU reset%s", relaunch_mac.empty() ? "" : " (will reconnect)");
+			quit = true;
+			break;
+		}
 		UpdateMouseCapture();
 		PumpEvents();
 		Tick();
@@ -509,6 +583,27 @@ void App::Tick()
 		last_probe = now;
 	}
 
+	if(phase == Phase::Streaming && session)
+	{
+		// What's running on the console (for play time, profiles, the menu)
+		if(now - last_game_check > 3000)
+		{
+			last_game_check = now;
+			discovery.ProbeAddress(active_address);
+			DiscoveredHost d;
+			if(discovery.Find(active_host.mac, &d) && !d.running_app.empty() && d.running_app != current_game)
+				OnGameChanged(d.running_app);
+		}
+		// save play time every minute, so a crash or power cut loses at most a minute
+		if(!current_game.empty() && now - game_since_ms >= 60000)
+			FlushPlaytime();
+		UpdateWatchdog(now);
+	}
+	UpdateBatteryWarnings(now);
+	snprintf(g_crash_context, sizeof(g_crash_context), "streaming=%d fg=%d upscale=%d game=%s",
+		phase == Phase::Streaming ? 1 : 0, phase == Phase::Streaming && FrameGenActive() ? settings.frame_gen : 0,
+		settings.upscale_mode, current_game.c_str());
+
 	if(settings_dirty && now - last_settings_save > 1000)
 	{
 		settings.Save(settings_path);
@@ -600,12 +695,21 @@ void App::Tick()
 	if(reconnect_at && now >= reconnect_at && phase == Phase::Idle)
 	{
 		reconnect_at = 0;
-		BeginConnect(active_host.mac);
+		if(!active_host.mac.empty())
+			BeginConnect(active_host.mac);
 	}
 
 	if(now - present_window_start >= 1000)
 	{
 		present_fps = present_count * 1000.0 / (double)(now - present_window_start);
+		if(phase == Phase::Streaming && session && renderer.HasVideo())
+		{
+			StreamStats st = session->Stats();
+			stat_fps_sum += st.decode_fps;
+			stat_rtt_sum += st.rtt_ms;
+			stat_samples++;
+			stat_lost = st.frames_lost;
+		}
 		// Frame generation should run at the display's refresh rate; if it can't, say why.
 		if(phase == Phase::Streaming && FrameGenActive() && !overlay_open)
 		{
@@ -636,6 +740,21 @@ void App::HandleSessionEvents()
 			case SessionEvent::Connected:
 				phase = Phase::Streaming;
 				reconnect_attempts = 0;
+				stream_start_ms = NowMs();
+				stat_fps_sum = stat_rtt_sum = 0.0;
+				stat_samples = 0;
+				stat_lost = 0;
+				frozen_warned = false;
+				last_keyframe_req = 0;
+				current_game.clear();
+				last_game_check = 0;
+				if(mini_mode)
+					ToggleMiniPlayer();
+				if(RegisteredHost *h = settings.FindHost(active_host.mac))
+				{
+					h->last_played = (uint64_t)time(nullptr);
+					MarkSettingsDirty();
+				}
 				overlay_open = false;
 				if(settings.kbm_enabled)
 					ShowToast("Keyboard & mouse ready - Esc or F1 for the menu");
@@ -663,16 +782,8 @@ void App::HandleSessionEvents()
 			case SessionEvent::Quit:
 			{
 				// Unexpected drop (Wi-Fi hiccup, console busy): try to get back in automatically.
-				bool was_streaming = phase == Phase::Streaming;
-				if(e.flag && was_streaming && settings.auto_reconnect && reconnect_attempts < 3)
-				{
-					reconnect_attempts++;
-					EndStream("", false);
-					reconnect_at = NowMs() + 2000;
-					toast = "Connection lost - reconnecting (" + std::to_string(reconnect_attempts) + "/3)...";
-					toast_until = reconnect_at + 4000;
+				if(e.flag && TryAutoReconnect("Connection lost"))
 					return;
-				}
 				EndStream(e.flag ? "Disconnected: " + e.text : "", e.flag);
 				return; // session is gone
 			}
@@ -896,8 +1007,170 @@ void App::StartStream()
 	sent_idle = false;
 }
 
+bool App::TryAutoReconnect(const std::string &why)
+{
+	if(phase != Phase::Streaming || !settings.auto_reconnect || reconnect_attempts >= 3)
+		return false;
+	reconnect_attempts++;
+	int attempt = reconnect_attempts;
+	EndStream("", false);
+	reconnect_attempts = attempt;
+	reconnect_at = NowMs() + 2000;
+	toast = why + " - reconnecting (" + std::to_string(attempt) + "/3)...";
+	toast_until = reconnect_at + 4000;
+	LOGW("%s, reconnecting (attempt %d)", why.c_str(), attempt);
+	return true;
+}
+
+std::string App::SanitizeKey(const std::string &in)
+{
+	std::string s;
+	for(char c : in)
+		s += (c == '=' || c == '[' || c == ']' || c == '\n' || c == '\r') ? ' ' : c;
+	while(!s.empty() && (s[0] == ';' || s[0] == '#' || s[0] == ' '))
+		s.erase(0, 1);
+	return s.empty() ? std::string("Unknown game") : s;
+}
+
+void App::FlushPlaytime()
+{
+	if(current_game.empty() || !game_since_ms)
+		return;
+	uint64_t now = NowMs();
+	settings.playtime[SanitizeKey(current_game)] += (now - game_since_ms) / 1000;
+	game_since_ms = now - (now - game_since_ms) % 1000;
+	MarkSettingsDirty();
+}
+
+void App::OnGameChanged(const std::string &game)
+{
+	FlushPlaytime();
+	current_game = game;
+	game_since_ms = NowMs();
+	LOGI("Now playing: %s", game.c_str());
+	if(RegisteredHost *h = settings.FindHost(active_host.mac))
+	{
+		h->last_app = game;
+		MarkSettingsDirty();
+	}
+	GameProfile *p = settings.game_profiles ? settings.FindProfile(game) : nullptr;
+	if(p)
+	{
+		settings.ApplyProfile(*p);
+		MarkSettingsDirty();
+		ShowToast("Loaded your settings for " + game);
+	}
+	else
+		ShowToast("Now playing " + game);
+	toast_until = NowMs() + 3500;
+}
+
+// The picture stopped arriving although the session is still up: ask for a fresh keyframe
+// (fixes a stuck decoder after packet loss); after 15 s treat it as a lost connection.
+void App::UpdateWatchdog(uint64_t now)
+{
+	if(!renderer.HasVideo() || !session->LastFrameTimeUs())
+		return;
+	uint64_t age = chiaki_time_now_monotonic_ms() - session->LastFrameTimeUs() / 1000;
+	if(age < 2500)
+	{
+		frozen_warned = false;
+		return;
+	}
+	if(now - last_keyframe_req > 2000)
+	{
+		session->RequestKeyframe();
+		last_keyframe_req = now;
+		LOGW("No picture for %llu ms, requesting a keyframe", (unsigned long long)age);
+	}
+	if(!frozen_warned)
+	{
+		ShowToast("Picture paused - asking the console for a fresh frame...");
+		frozen_warned = true;
+	}
+	if(age > 15000 && !TryAutoReconnect("The picture stopped"))
+		EndStream("The console stopped sending video. Check the network connection and try again.", true);
+}
+
+void App::UpdateBatteryWarnings(uint64_t now)
+{
+	if(now - last_battery_check < 5000)
+		return;
+	last_battery_check = now;
+	for(auto &p : gamepads.Info())
+	{
+		bool &warned = battery_warned[p.name];
+		if(p.battery < 0 || p.charging || p.battery > 25)
+		{
+			warned = false;
+			continue;
+		}
+		if(p.battery <= 15 && !warned && settings.low_battery_warning)
+		{
+			warned = true;
+			ShowToast(p.name + ": battery low (" + std::to_string(p.battery) + "%)");
+			toast_until = now + 5000;
+		}
+	}
+}
+
+// Small always-on-top window in the corner of the screen (watch while doing something else)
+void App::ToggleMiniPlayer()
+{
+	if(!mini_mode)
+	{
+		mini_was_fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+		if(mini_was_fullscreen)
+		{
+			SDL_SetWindowFullscreen(window, false);
+			SDL_SyncWindow(window);
+		}
+		SDL_GetWindowPosition(window, &mini_prev_x, &mini_prev_y);
+		SDL_GetWindowSize(window, &mini_prev_w, &mini_prev_h);
+		SDL_DisplayID disp = SDL_GetDisplayForWindow(window);
+		SDL_Rect r = { 0, 0, 1920, 1080 };
+		SDL_GetDisplayUsableBounds(disp, &r);
+		int w = std::max(480, r.w / 4), h = w * 9 / 16;
+		mini_mode = true;
+		ShowOverlay(false);
+		SDL_SetWindowBordered(window, false);
+		SDL_SetWindowAlwaysOnTop(window, true);
+		SDL_SetWindowSize(window, w, h);
+		SDL_SetWindowPosition(window, r.x + r.w - w - 24, r.y + r.h - h - 24);
+		ShowToast("Mini player - drag to move, Ctrl+M to go back");
+	}
+	else
+	{
+		mini_mode = false;
+		SDL_SetWindowAlwaysOnTop(window, false);
+		SDL_SetWindowBordered(window, true);
+		SDL_SetWindowSize(window, mini_prev_w, mini_prev_h);
+		SDL_SetWindowPosition(window, mini_prev_x, mini_prev_y);
+		if(mini_was_fullscreen)
+			SDL_SetWindowFullscreen(window, true);
+	}
+	sounds.Play(UiSound::Toggle);
+}
+
 void App::EndStream(const std::string &msg, bool is_error)
 {
+	FlushPlaytime();
+	bool user_ended = msg.empty() && phase == Phase::Streaming && stream_start_ms && NowMs() - stream_start_ms > 60000;
+	std::string summary;
+	if(user_ended && stat_samples > 0)
+	{
+		char b[256];
+		snprintf(b, sizeof(b), "Session ended  -  %s  -  %.1f fps  -  %.0f ms network  -  %llu frames lost",
+			FormatDuration((NowMs() - stream_start_ms) / 1000).c_str(), stat_fps_sum / stat_samples, stat_rtt_sum / stat_samples,
+			(unsigned long long)stat_lost);
+		summary = b;
+	}
+	current_game.clear();
+	game_since_ms = 0;
+	stream_start_ms = 0;
+	if(mini_mode)
+		ToggleMiniPlayer();
+	home_focus_pending = true;
 	if(recorder.Recording())
 		recorder.StopRecording();
 	if(session)
@@ -920,71 +1193,15 @@ void App::EndStream(const std::string &msg, bool is_error)
 	UpdateMouseCapture();
 	message = msg;
 	message_is_error = is_error;
+	if(!summary.empty())
+	{
+		ShowToast(summary);
+		toast_until = NowMs() + 7000;
+	}
 }
 
 // ---------------------------------------------------------------------------
 // UI
-
-static void SectionTitle(const char *text)
-{
-	ImGui::Dummy(ImVec2(0, ImGui::GetStyle().ItemSpacing.y));
-	if(g_heading)
-		ImGui::PushFont(g_heading);
-	ImGui::TextUnformatted(text);
-	if(g_heading)
-		ImGui::PopFont();
-	ImVec2 p = ImGui::GetCursorScreenPos();
-	float w = ImGui::GetContentRegionAvail().x;
-	ImDrawList *dl = ImGui::GetWindowDrawList();
-	dl->AddRectFilled(p, ImVec2(p.x + 42.0f * ImGui::GetFontSize() / 19.0f, p.y + 3), kAccentU, 2.0f);
-	dl->AddRectFilled(ImVec2(p.x, p.y + 1), ImVec2(p.x + w, p.y + 2), IM_COL32(255, 255, 255, 18));
-	ImGui::Dummy(ImVec2(0, 8));
-}
-
-static bool PrimaryButton(const char *label, const ImVec2 &size = ImVec2(0, 0))
-{
-	ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kAccentHi);
-	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.0f, 0.36f, 0.72f, 1.0f));
-	bool r = ImGui::Button(label, size);
-	ImGui::PopStyleColor(3);
-	return r;
-}
-
-static void HelpText(const char *text)
-{
-	ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
-	ImGui::PushTextWrapPos(0.0f);
-	ImGui::TextUnformatted(text);
-	ImGui::PopTextWrapPos();
-	ImGui::PopStyleColor();
-}
-
-// Small rounded status pill: colored dot + text
-static void StatusPill(const char *text, const ImVec4 &col)
-{
-	ImDrawList *dl = ImGui::GetWindowDrawList();
-	ImVec2 p = ImGui::GetCursorScreenPos();
-	ImVec2 ts = ImGui::CalcTextSize(text);
-	float h = ts.y + 8, r = 4.5f * ImGui::GetFontSize() / 19.0f;
-	float w = ts.x + r * 2 + 26;
-	dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(ImVec4(col.x, col.y, col.z, 0.14f)), h * 0.5f);
-	dl->AddCircleFilled(ImVec2(p.x + 11 + r, p.y + h * 0.5f), r, ImGui::GetColorU32(col));
-	dl->AddText(ImVec2(p.x + 17 + r * 2, p.y + 4), ImGui::GetColorU32(col), text);
-	ImGui::Dummy(ImVec2(w, h));
-}
-
-// The app background: deep navy gradient with a soft blue glow
-static void DrawBackground()
-{
-	ImDrawList *dl = ImGui::GetBackgroundDrawList();
-	ImGuiViewport *vp = ImGui::GetMainViewport();
-	ImVec2 a = vp->Pos, b(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y);
-	dl->AddRectFilledMultiColor(a, b, IM_COL32(9, 14, 30, 255), IM_COL32(6, 9, 20, 255), IM_COL32(3, 4, 9, 255), IM_COL32(5, 7, 16, 255));
-	ImVec2 c(a.x + vp->Size.x * 0.78f, a.y + vp->Size.y * 0.05f);
-	for(int i = 10; i >= 1; i--)
-		dl->AddCircleFilled(c, vp->Size.y * 0.07f * i, IM_COL32(0, 90, 220, 4), 64);
-}
 
 void App::BuildUi()
 {
@@ -1022,16 +1239,18 @@ void App::BuildUi()
 			label(right.c_str(), false, smooth(0.0f, 0.12f, 1.0f - compare_split));
 		}
 		DrawRecordingBadge();
-		if(settings.show_stats)
+		if(settings.show_stats && !mini_mode)
 			UiStats();
 		if(overlay_open)
+		{
+			UiControlCenterBar();
 			UiStreamOverlay();
+		}
 		UiStreamDialogs();
 		UiMessage();
 		return;
 	}
 
-	DrawBackground();
 	ImGuiViewport *vp = ImGui::GetMainViewport();
 	ImGui::SetNextWindowPos(vp->Pos);
 	ImGui::SetNextWindowSize(vp->Size);
@@ -1039,21 +1258,35 @@ void App::BuildUi()
 	ImGui::Begin("##main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings
 		| ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoBackground);
 	ImGui::PopStyleVar();
-
-	UiSidebar();
-	ImGui::SameLine(0, 0);
-	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(40 * ui_scale, 30 * ui_scale));
-	ImGui::BeginChild("##content", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_None);
-	ImGui::PopStyleVar();
-	ImGui::PopStyleColor();
-	switch(screen)
+	static Screen last_screen = Screen::Consoles;
+	if(screen != last_screen)
 	{
-		case Screen::Consoles: UiConsoles(); break;
-		case Screen::Settings: UiSettings(); break;
-		case Screen::Log: UiLog(); break;
+		home_focus_pending = screen == Screen::Consoles;
+		last_screen = screen;
 	}
-	ImGui::EndChild();
+	if(screen == Screen::Consoles)
+		UiHome();
+	else
+	{
+		DrawPs5Background(ImVec4(0.0f, 0.35f, 0.85f, 1.0f));
+		// Settings / Log: one readable centered column under the top bar
+		float top = 96 * ui_scale;
+		float w = std::min(vp->Size.x - 96 * ui_scale, 1180 * ui_scale);
+		ImGui::SetCursorScreenPos(ImVec2(vp->Pos.x + (vp->Size.x - w) * 0.5f, vp->Pos.y + top));
+		ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.03f, 0.04f, 0.08f, 0.72f));
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(36 * ui_scale, 26 * ui_scale));
+		ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 18 * ui_scale);
+		ImGui::BeginChild("##content", ImVec2(w, vp->Size.y - top - 28 * ui_scale), ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_Borders,
+			ImGuiWindowFlags_None);
+		ImGui::PopStyleVar(2);
+		ImGui::PopStyleColor();
+		if(screen == Screen::Settings)
+			UiSettings();
+		else
+			UiLog();
+		ImGui::EndChild();
+	}
+	UiTopBar();
 	ImGui::End();
 
 	if(phase == Phase::Waking || phase == Phase::Connecting || (phase == Phase::Streaming && !renderer.HasVideo()))
@@ -1061,270 +1294,7 @@ void App::BuildUi()
 	UiPairDialog();
 	UiStreamDialogs();
 	UiMessage();
-}
-
-bool App::NavItem(const char *icon, const char *label, bool active)
-{
-	ImVec2 size(ImGui::GetContentRegionAvail().x, 46.0f * ui_scale);
-	ImVec2 p = ImGui::GetCursorScreenPos();
-	ImGui::PushID(label);
-	bool clicked = ImGui::InvisibleButton("##nav", size);
-	ImGui::PopID();
-	bool hov = ImGui::IsItemHovered();
-	ImDrawList *dl = ImGui::GetWindowDrawList();
-	float r = 11.0f * ui_scale;
-	if(active)
-		dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), IM_COL32(0, 112, 219, 55), r);
-	else if(hov)
-		dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), IM_COL32(255, 255, 255, 14), r);
-	if(active)
-		dl->AddRectFilled(ImVec2(p.x, p.y + 12 * ui_scale), ImVec2(p.x + 4 * ui_scale, p.y + size.y - 12 * ui_scale), kAccentU, 2.0f);
-	ImU32 col = active ? IM_COL32(255, 255, 255, 255) : (hov ? IM_COL32(225, 230, 240, 255) : IM_COL32(160, 168, 185, 255));
-	float ty = p.y + (size.y - ImGui::GetFontSize()) * 0.5f;
-	dl->AddText(ImVec2(p.x + 18 * ui_scale, ty), col, Ico(icon));
-	dl->AddText(ImVec2(p.x + (g_icons ? 52 : 18) * ui_scale, ty), col, label);
-	return clicked;
-}
-
-void App::UiSidebar()
-{
-	float w = 260.0f * ui_scale;
-	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1, 1, 1, 0.03f));
-	ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16 * ui_scale, 22 * ui_scale));
-	ImGui::BeginChild("##sidebar", ImVec2(w, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
-	ImGui::PopStyleVar(2);
-	ImGui::PopStyleColor();
-
-	// Logo: a ringed planet
-	ImDrawList *dl = ImGui::GetWindowDrawList();
-	ImVec2 p = ImGui::GetCursorScreenPos();
-	float R = 15.0f * ui_scale;
-	ImVec2 c(p.x + R + 6 * ui_scale, p.y + R + 2 * ui_scale);
-	dl->AddCircleFilled(c, R * 0.62f, kAccentU, 32);
-	dl->AddEllipse(c, ImVec2(R * 1.25f, R * 0.42f), IM_COL32(150, 200, 255, 230), -0.35f, 48, 2.0f * ui_scale);
-	ImGui::SetCursorScreenPos(ImVec2(p.x + R * 2 + 18 * ui_scale, p.y - 1));
-	if(g_heading)
-		ImGui::PushFont(g_heading);
-	ImGui::TextUnformatted("Orbit Play");
-	if(g_heading)
-		ImGui::PopFont();
-	ImGui::SetCursorScreenPos(ImVec2(p.x + R * 2 + 18 * ui_scale, ImGui::GetCursorScreenPos().y - 6 * ui_scale));
-	ImGui::TextDisabled("PS5 Remote Play");
-	ImGui::Dummy(ImVec2(0, 22 * ui_scale));
-
-	if(NavItem(ICON_GAME, "Consoles", screen == Screen::Consoles))
-		screen = Screen::Consoles;
-	if(NavItem(ICON_SETTINGS, "Settings", screen == Screen::Settings))
-		screen = Screen::Settings;
-	if(NavItem(ICON_LOG, "Log", screen == Screen::Log))
-		screen = Screen::Log;
-
-	// System status at the bottom
-	float line = ImGui::GetTextLineHeightWithSpacing();
-	ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), ImGui::GetWindowHeight() - line * 6.2f - 22 * ui_scale));
-	ImGui::TextDisabled("THIS PC");
-	auto names = gamepads.Names();
-	ImGui::Text("%s  %s", Ico(ICON_GAME), names.empty() ? "No controller" : names[0].c_str());
-	if(names.size() > 1)
-		ImGui::TextDisabled("      + %zu more", names.size() - 1);
-	ImGui::Text("%s  %s", Ico(ICON_KEYBOARD), settings.kbm_enabled ? "Keyboard & mouse on" : "Keyboard & mouse off");
-	ImGui::Text("%s  %d Hz  %s", Ico(ICON_DISPLAY), renderer.DisplayHz(), renderer.DisplayHdr() ? "HDR" : "SDR");
-	ImGui::Text("%s  %s%s", Ico(ICON_SPEED), renderer.GpuVendorName().c_str(),
-		renderer.AiSuperResolutionAvailable() ? "  AI upscaling" : "");
-	ImGui::EndChild();
-}
-
-void App::UiConsoles()
-{
-	if(g_title)
-		ImGui::PushFont(g_title);
-	ImGui::TextUnformatted("Your consoles");
-	if(g_title)
-		ImGui::PopFont();
-	HelpText("Your PS5 must be on the same network with Remote Play enabled (Settings > System > Remote Play).");
-	ImGui::Dummy(ImVec2(0, 14 * ui_scale));
-
-	std::vector<DiscoveredHost> found = discovery.Hosts();
-	auto discovered = [&](const std::string &mac) -> const DiscoveredHost * {
-		for(auto &d : found)
-			if(d.mac == mac)
-				return &d;
-		return nullptr;
-	};
-
-	const float card_w = 400.0f * ui_scale, card_h = 236.0f * ui_scale;
-	float avail = ImGui::GetContentRegionAvail().x;
-	float gap = 20.0f * ui_scale;
-	int cols = std::max(1, (int)((avail + gap) / (card_w + gap)));
-	int col = 0, idx = 0;
-	std::string forget_mac;
-	auto next_cell = [&]() {
-		if(++col < cols)
-			ImGui::SameLine(0, gap);
-		else
-		{
-			col = 0;
-			ImGui::Dummy(ImVec2(0, gap * 0.5f));
-		}
-	};
-	// Card frame with a soft gradient and a big glyph
-	auto card_begin = [&](const char *id, bool highlight) {
-		ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(22 * ui_scale, 20 * ui_scale));
-		ImGui::BeginChild(id, ImVec2(card_w, card_h), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
-		ImGui::PopStyleVar();
-		ImGui::PopStyleColor();
-		ImDrawList *dl = ImGui::GetWindowDrawList();
-		ImVec2 p = ImGui::GetWindowPos(), q(p.x + card_w, p.y + card_h);
-		float r = 18.0f * ui_scale;
-		dl->AddRectFilled(p, q, IM_COL32(255, 255, 255, 9), r);
-		dl->AddRectFilledMultiColor(ImVec2(p.x, p.y + r), ImVec2(q.x, q.y - r),
-			IM_COL32(0, 90, 220, highlight ? 34 : 14), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(0, 90, 220, highlight ? 18 : 6));
-		dl->AddRect(p, q, highlight ? IM_COL32(60, 140, 255, 90) : IM_COL32(255, 255, 255, 22), r, 0, 1.2f);
-		// big console glyph in a glowing disc
-		float R = 34.0f * ui_scale;
-		ImVec2 c(q.x - R - 24 * ui_scale, p.y + R + 22 * ui_scale);
-		dl->AddCircleFilled(c, R, IM_COL32(0, 112, 219, highlight ? 70 : 40), 48);
-		if(g_icons && g_title)
-		{
-			ImVec2 ts = g_title->CalcTextSizeA(g_title->FontSize, FLT_MAX, 0, ICON_GAME);
-			dl->AddText(g_title, g_title->FontSize, ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f - 2 * ui_scale),
-				IM_COL32(220, 235, 255, 230), ICON_GAME);
-		}
-	};
-	auto heading = [&](const char *t) {
-		if(g_heading)
-			ImGui::PushFont(g_heading);
-		ImGui::PushTextWrapPos(card_w - 110 * ui_scale);
-		ImGui::TextUnformatted(t);
-		ImGui::PopTextWrapPos();
-		if(g_heading)
-			ImGui::PopFont();
-	};
-
-	for(auto &h : settings.hosts)
-	{
-		const DiscoveredHost *d = discovered(h.mac);
-		ImGui::PushID(idx++);
-		card_begin("##card", d && d->ready);
-		heading(h.nickname.empty() ? "PlayStation 5" : h.nickname.c_str());
-		if(d)
-			StatusPill(d->ready ? "Ready" : "Rest mode", d->ready ? kGood : kWarn);
-		else
-			StatusPill("Not found", kTextDim);
-		if(d && !d->running_app.empty())
-			ImGui::TextDisabled("Playing %s", d->running_app.c_str());
-		else
-			ImGui::TextDisabled("%s", d ? d->address.c_str() : (h.last_address.empty() ? "not seen yet" : h.last_address.c_str()));
-
-		bool busy = phase != Phase::Idle;
-		float bh = 46.0f * ui_scale;
-		ImGui::SetCursorPosY(card_h - bh - 20 * ui_scale);
-		ImGui::BeginDisabled(busy);
-		char play[64];
-		snprintf(play, sizeof(play), "%s  %s", Ico(ICON_PLAY), d && !d->ready ? "Wake & play" : "Play");
-		float small = bh;
-		if(PrimaryButton(play, ImVec2(card_w - 44 * ui_scale - (small + 10 * ui_scale) * 2, bh)))
-			BeginConnect(h.mac);
-		ImGui::SameLine(0, 10 * ui_scale);
-		if(ImGui::Button(g_icons ? ICON_POWER : "Wake", ImVec2(small, bh)))
-			Discovery::Wakeup(d ? d->address : h.last_address, h.regist_key, h.ps5);
-		if(ImGui::IsItemHovered())
-			ImGui::SetTooltip("Wake from rest mode");
-		ImGui::SameLine(0, 10 * ui_scale);
-		if(ImGui::Button(g_icons ? ICON_DELETE : "X", ImVec2(small, bh)))
-			forget_mac = h.mac;
-		if(ImGui::IsItemHovered())
-			ImGui::SetTooltip("Forget this console");
-		ImGui::EndDisabled();
-		ImGui::EndChild();
-		ImGui::PopID();
-		next_cell();
-	}
-	if(!forget_mac.empty())
-	{
-		settings.RemoveHost(forget_mac);
-		MarkSettingsDirty();
-	}
-
-	for(auto &d : found)
-	{
-		if(settings.FindHost(d.mac))
-			continue;
-		ImGui::PushID(idx++);
-		card_begin("##card", false);
-		heading(d.name.empty() ? "PlayStation" : d.name.c_str());
-		StatusPill(d.ready ? "Not paired" : "Rest mode - turn it on to pair", d.ready ? kAccentHi : kWarn);
-		ImGui::TextDisabled("%s  -  %s", d.address.c_str(), d.ps5 ? "PS5" : "PS4");
-		float bh = 46.0f * ui_scale;
-		ImGui::SetCursorPosY(card_h - bh - 20 * ui_scale);
-		ImGui::BeginDisabled(!d.ready || phase != Phase::Idle);
-		char pair[48];
-		snprintf(pair, sizeof(pair), "%s  Pair this console", Ico(ICON_LINK));
-		if(PrimaryButton(pair, ImVec2(-1, bh)))
-		{
-			pair_open = true;
-			pair_address = d.address;
-			pair_target = chiaki_target_is_unknown((ChiakiTarget)d.target) ? (d.ps5 ? CHIAKI_TARGET_PS5_1 : CHIAKI_TARGET_PS4_10) : d.target;
-			memset(pin_buf, 0, sizeof(pin_buf));
-		}
-		ImGui::EndDisabled();
-		ImGui::EndChild();
-		ImGui::PopID();
-		next_cell();
-	}
-
-	// "Add by IP" card
-	ImGui::PushID(idx++);
-	card_begin("##addcard", false);
-	heading("Add by IP address");
-	HelpText(settings.hosts.empty() && found.empty() ? "Searching your network... If your PS5 doesn't appear, enter its IP "
-		"(PS5: Settings > Network > Connection Status)." : "For a PS5 on another subnet or behind a VPN adapter.");
-	float bh = 46.0f * ui_scale;
-	ImGui::SetCursorPosY(card_h - bh - 20 * ui_scale);
-	ImGui::SetNextItemWidth(card_w - 44 * ui_scale - 110 * ui_scale);
-	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14 * ui_scale, (bh - ImGui::GetFontSize()) * 0.5f));
-	bool enter = ImGui::InputTextWithHint("##ip", "192.168.1.50", manual_ip_buf, sizeof(manual_ip_buf), ImGuiInputTextFlags_EnterReturnsTrue);
-	ImGui::PopStyleVar();
-	ImGui::SameLine(0, 10 * ui_scale);
-	char addl[32];
-	snprintf(addl, sizeof(addl), "%s  Add", Ico(ICON_ADD));
-	if((ImGui::Button(addl, ImVec2(100 * ui_scale, bh)) || enter) && manual_ip_buf[0])
-	{
-		std::string ip = manual_ip_buf;
-		bool exists = false;
-		for(auto &m : settings.manual_hosts)
-			exists |= m.address == ip;
-		if(!exists)
-			settings.manual_hosts.push_back({ ip });
-		discovery.ProbeAddress(ip);
-		memset(manual_ip_buf, 0, sizeof(manual_ip_buf));
-		MarkSettingsDirty();
-	}
-	ImGui::EndChild();
-	ImGui::PopID();
-
-	if(!settings.manual_hosts.empty())
-	{
-		ImGui::Dummy(ImVec2(0, 10 * ui_scale));
-		ImGui::TextDisabled("Probed by IP:");
-		for(size_t i = 0; i < settings.manual_hosts.size(); i++)
-		{
-			ImGui::PushID((int)(1000 + i));
-			ImGui::SameLine();
-			char lbl[96];
-			snprintf(lbl, sizeof(lbl), "%s  %s", settings.manual_hosts[i].address.c_str(), Ico(ICON_CANCEL));
-			if(ImGui::SmallButton(lbl))
-			{
-				settings.manual_hosts.erase(settings.manual_hosts.begin() + i);
-				MarkSettingsDirty();
-				ImGui::PopID();
-				break;
-			}
-			ImGui::PopID();
-		}
-	}
+	UiBootIntro();
 }
 
 void App::UiPairDialog()
@@ -1463,6 +1433,8 @@ void App::UiSettings()
 	UiControlsSection();
 	SectionTitle("Display & audio");
 	UiSystemSection();
+	SectionTitle("Interface & game profiles");
+	UiInterfaceSection();
 
 	SectionTitle("Account");
 	Row("PSN Account ID");
@@ -1845,7 +1817,7 @@ void App::UiSystemSection()
 		{ "F4", "Cycle frame generation" }, { "F5", "Ambient light on/off" }, { "F6", "Split-screen compare" },
 		{ "F7 / F8", "Detail level - / +   (Ctrl: fine sharpness)" }, { "F9", "Start / stop recording" },
 		{ "F10", "Save instant replay" }, { "Shift+F9", "Cycle picture mode" }, { "Ctrl+F10", "Microphone on/off" },
-		{ "F11", "Fullscreen" }, { "F12", "Screenshot" },
+		{ "F11", "Fullscreen" }, { "F12", "Screenshot" }, { "Ctrl+M", "Mini player (small always-on-top window)" },
 	};
 	for(auto &k : keys)
 	{
@@ -2166,6 +2138,7 @@ void App::UiStreamOverlay()
 			{ ICON_RECORD, recorder.Recording() ? "Stop rec" : "Record", recorder.Recording(), 3 },
 			{ ICON_VIDEO, "Save replay", false, 4 },
 			{ ICON_SPLIT, showcase_on ? "Showcase" : "Compare", compare_on || showcase_on, 5 },
+			{ ICON_DISPLAY, "Mini player", false, 6 },
 		};
 		float n = (float)qa.size();
 		float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * (n - 1)) / n;
@@ -2210,6 +2183,7 @@ void App::UiStreamOverlay()
 				case 2: TakeScreenshot(); break;
 				case 3: ToggleRecording(); break;
 				case 4: SaveReplay(); break;
+				case 6: ToggleMiniPlayer(); break;
 				case 5:
 					if(showcase_on)
 						showcase_on = false;
@@ -2270,6 +2244,7 @@ void App::UiStreamOverlay()
 			snprintf(tlabel[tk], sizeof(tlabel[tk]), "%s%s%s###%s", Ico(icon), g_icons ? "  " : "", name, name);
 			return (const char *)tlabel[tk];
 		};
+		tab(tl(ICON_GAME, "Game"), [&] { UiGameSection(); });
 		tab(tl(ICON_PHOTO, "Image"), [&] { UiUpscaleSection(); });
 		tab(tl(ICON_SPEED, "Motion"), [&] { UiFrameGenSection(); });
 		tab(tl(ICON_BRIGHTNESS, "Picture"), [&] { UiPictureSection(); });
@@ -2316,7 +2291,10 @@ void App::ShowOverlay(bool open)
 {
 	if(open == overlay_open)
 		return;
+	if(open && mini_mode)
+		ToggleMiniPlayer();
 	overlay_open = open;
+	sounds.Play(open ? UiSound::Toggle : UiSound::Back);
 	if(open)
 	{
 		overlay_just_opened = true;
@@ -2445,6 +2423,11 @@ bool App::HandleHotkey(SDL_Keycode key)
 		case SDLK_F12:
 			TakeScreenshot();
 			return true;
+		case SDLK_M:
+			if(!(SDL_GetModState() & SDL_KMOD_CTRL))
+				return false;
+			ToggleMiniPlayer();
+			return true;
 		default:
 			return false;
 	}
@@ -2461,7 +2444,7 @@ void App::SyncBindingsToSettings()
 
 bool App::WantMouseCapture() const
 {
-	return phase == Phase::Streaming && session && settings.kbm_enabled && window_focused
+	return phase == Phase::Streaming && session && settings.kbm_enabled && window_focused && !mini_mode
 		&& !overlay_open && !keyboard_open && !login_pin_open && renderer.HasVideo();
 }
 

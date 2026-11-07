@@ -52,6 +52,16 @@ public:
 	size_t Count() const { return pads.size(); }
 	std::vector<std::string> Names() const;
 
+	struct PadInfo
+	{
+		std::string name;
+		bool dualsense = false;
+		bool wired = false;
+		bool charging = false;
+		int battery = -1;   // percent, -1 = unknown (wired pads without a battery)
+	};
+	std::vector<PadInfo> Info() const;
+
 private:
 	struct Pad
 	{

@@ -1410,7 +1410,11 @@ void Renderer::Present(VideoView view, const PresentOptions &opt, uint64_t seria
 		flags |= DXGI_PRESENT_ALLOW_TEARING;
 	HRESULT hr = swapchain->Present(opt.sync_interval, flags);
 	if(hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
-		LOGE("GPU device lost (0x%08lx)", (unsigned long)device->GetDeviceRemovedReason());
+	{
+		if(!device_lost)
+			LOGE("GPU device lost (0x%08lx)", (unsigned long)device->GetDeviceRemovedReason());
+		device_lost = true;
+	}
 }
 
 // ---------------------------------------------------------------------------

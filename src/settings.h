@@ -6,6 +6,7 @@
 #include "kbm.h"
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -21,6 +22,18 @@ struct RegisteredHost
 	uint8_t rp_key[0x10] = {};  // a.k.a. "morning"
 	uint32_t rp_key_type = 0;
 	uint32_t console_pin = 0;
+	std::string last_app;       // last game seen running on it (shown on the home screen)
+	uint64_t last_played = 0;   // unix time of the last session
+};
+
+// Picture / enhancement / mouse settings remembered for one game.
+struct GameProfile
+{
+	std::string game;
+	int upscale_mode = 0, detail_preset = 2, frame_gen = 0, picture_preset = 0, mouse_preset = 1;
+	float sharpness = 0.7f, ai_sharpness = 0.7f, texture_boost = 0.25f, clarity = 0.15f, overshoot = 0.0f;
+	float brightness = 0.0f, contrast = 1.0f, saturation = 1.0f, vibrance = 0.0f, hdr_boost = 0.0f;
+	float mouse_sensitivity = 0.5f;
 };
 
 // A console the user added by IP (discovery broadcasts can't always reach it).
@@ -102,8 +115,22 @@ struct Settings
 	float volume = 1.0f;
 	bool microphone = true;
 
+	// Interface
+	bool ui_sounds = true;
+	float ui_sound_volume = 0.5f;
+	bool boot_animation = true;
+	bool game_profiles = true;        // apply a game's saved profile when it starts
+	bool low_battery_warning = true;
+
 	std::vector<RegisteredHost> hosts;
 	std::vector<ManualHost> manual_hosts;
+	std::vector<GameProfile> profiles;
+	std::map<std::string, uint64_t> playtime; // game -> seconds streamed
+
+	GameProfile *FindProfile(const std::string &game);
+	GameProfile CaptureProfile(const std::string &game) const;
+	void ApplyProfile(const GameProfile &p);
+	void RemoveProfile(const std::string &game);
 
 	RegisteredHost *FindHost(const std::string &mac);
 	void AddOrUpdateHost(const RegisteredHost &host);

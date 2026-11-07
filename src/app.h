@@ -11,18 +11,30 @@
 #include "renderer.h"
 #include "settings.h"
 #include "stream_session.h"
+#include "uisound.h"
 
 #include <SDL3/SDL.h>
+#include <imgui.h>
 
+#include <map>
 #include <memory>
 #include <string>
+
+// What the app was doing, written into crash reports (set by the app, read by the crash handler).
+extern char g_crash_context[256];
 
 class App
 {
 public:
-	bool Init();
+	bool Init(const std::string &resume_mac = "");
 	void Run();
 	void Shutdown();
+
+	// The GPU was reset: main() restarts the app, which then reconnects to this console.
+	bool RelaunchRequested() const { return relaunch; }
+	const std::string &RelaunchResumeMac() const { return relaunch_mac; }
+	// Mini player hit-testing (drag the borderless window)
+	bool MiniMode() const { return mini_mode; }
 
 private:
 	enum class Screen { Consoles, Settings, Log };
@@ -51,9 +63,16 @@ private:
 
 	// UI
 	void SetupStyle(float scale);
-	void UiSidebar();
-	bool NavItem(const char *icon, const char *label, bool active);
-	void UiConsoles();
+	void UiTopBar();
+	void UiHome();
+	void UiBootIntro();
+	void UiControlCenterBar();
+	void UiInterfaceSection();
+	void UiGameSection();
+	void DrawPs5Background(const ImVec4 &tint);
+	static ImVec4 HostColor(const std::string &id);
+	static std::string FormatDuration(uint64_t seconds);
+	static std::string SanitizeKey(const std::string &s);
 	void UiSettings();
 	void UiLog();
 	void UiPairDialog();
@@ -87,6 +106,15 @@ private:
 	void SaveReplay();
 	void UiCaptureSection();
 	void DrawRecordingBadge();
+
+	// v1.6
+	void ToggleMiniPlayer();
+	bool TryAutoReconnect(const std::string &why);
+	void OnGameChanged(const std::string &game);
+	void FlushPlaytime();
+	void CheckCrashMarker();
+	void UpdateWatchdog(uint64_t now);
+	void UpdateBatteryWarnings(uint64_t now);
 
 	std::string data_dir;
 	std::string settings_path;
@@ -176,4 +204,37 @@ private:
 
 	uint64_t last_display_refresh = 0;
 	uint64_t last_probe = 0;
+
+	// v1.6: PS5-style home, sounds, intro
+	UiSound sounds;
+	uint64_t boot_start_ms = 0;
+	int home_sel = 0;
+	bool home_focus_pending = true;
+	float home_scroll = 0.0f;
+	std::map<std::string, float> tile_anim;
+	ImVec4 bg_tint = ImVec4(0.0f, 0.35f, 0.85f, 1.0f);
+	std::string forget_mac;
+
+	// mini player
+	bool mini_mode = false;
+	bool mini_was_fullscreen = false;
+	int mini_prev_x = 0, mini_prev_y = 0, mini_prev_w = 1600, mini_prev_h = 900;
+
+	// current game, play time, session summary
+	std::string current_game;
+	uint64_t game_since_ms = 0;
+	uint64_t last_game_check = 0;
+	uint64_t stream_start_ms = 0;
+	double stat_fps_sum = 0.0, stat_rtt_sum = 0.0;
+	int stat_samples = 0;
+	uint64_t stat_lost = 0;
+
+	// stability
+	uint64_t last_keyframe_req = 0;
+	bool frozen_warned = false;
+	uint64_t last_battery_check = 0;
+	std::map<std::string, bool> battery_warned;
+	bool relaunch = false;
+	std::string relaunch_mac;
+	std::string resume_mac;
 };

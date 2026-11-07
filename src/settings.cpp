@@ -2,6 +2,8 @@
 #include "settings.h"
 #include "log.h"
 
+#include <windows.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -312,9 +314,16 @@ void Settings::Load(const std::string &path)
 	bol("view_is_touchpad", view_is_touchpad);
 	flt("volume", volume);
 	bol("microphone", microphone);
+	bol("ui_sounds", ui_sounds);
+	flt("ui_sound_volume", ui_sound_volume);
+	bol("boot_animation", boot_animation);
+	bol("game_profiles", game_profiles);
+	bol("low_battery_warning", low_battery_warning);
 
 	hosts.clear();
 	manual_hosts.clear();
+	profiles.clear();
+	playtime.clear();
 	for(const auto &name : order)
 	{
 		auto &s = sections[name];
@@ -328,6 +337,8 @@ void Settings::Load(const std::string &path)
 			h.target = s.count("target") ? atoi(s["target"].c_str()) : CHIAKI_TARGET_PS5_1;
 			h.rp_key_type = (uint32_t)strtoul(s["rp_key_type"].c_str(), nullptr, 10);
 			h.console_pin = (uint32_t)strtoul(s["console_pin"].c_str(), nullptr, 10);
+			h.last_app = s["last_app"];
+			h.last_played = strtoull(s["last_played"].c_str(), nullptr, 10);
 			bool ok = !h.mac.empty()
 				&& HexDecode(s["regist_key"], h.regist_key, sizeof(h.regist_key))
 				&& HexDecode(s["rp_key"], h.rp_key, sizeof(h.rp_key));
@@ -339,6 +350,25 @@ void Settings::Load(const std::string &path)
 		else if(name.rfind("manual.", 0) == 0 && !s["address"].empty())
 		{
 			manual_hosts.push_back({ s["address"] });
+		}
+		else if(name.rfind("profile.", 0) == 0 && !s["game"].empty())
+		{
+			GameProfile p;
+			p.game = s["game"];
+			auto i = [&](const char *k, int &v) { if(s.count(k)) v = atoi(s[k].c_str()); };
+			auto f = [&](const char *k, float &v) { if(s.count(k)) v = (float)atof(s[k].c_str()); };
+			i("upscale_mode", p.upscale_mode); i("detail_preset", p.detail_preset); i("frame_gen", p.frame_gen);
+			i("picture_preset", p.picture_preset); i("mouse_preset", p.mouse_preset);
+			f("sharpness", p.sharpness); f("ai_sharpness", p.ai_sharpness); f("texture_boost", p.texture_boost);
+			f("clarity", p.clarity); f("overshoot", p.overshoot); f("brightness", p.brightness); f("contrast", p.contrast);
+			f("saturation", p.saturation); f("vibrance", p.vibrance); f("hdr_boost", p.hdr_boost);
+			f("mouse_sensitivity", p.mouse_sensitivity);
+			profiles.push_back(p);
+		}
+		else if(name == "playtime")
+		{
+			for(auto &kv : s)
+				playtime[kv.first] = strtoull(kv.second.c_str(), nullptr, 10);
 		}
 	}
 	LOGI("Loaded settings (%zu paired console(s))", hosts.size());
@@ -402,6 +432,11 @@ void Settings::Save(const std::string &path) const
 	o << "view_is_touchpad=" << view_is_touchpad << "\n";
 	o << "volume=" << volume << "\n";
 	o << "microphone=" << microphone << "\n";
+	o << "ui_sounds=" << ui_sounds << "\n";
+	o << "ui_sound_volume=" << ui_sound_volume << "\n";
+	o << "boot_animation=" << boot_animation << "\n";
+	o << "game_profiles=" << game_profiles << "\n";
+	o << "low_battery_warning=" << low_battery_warning << "\n";
 
 	for(size_t i = 0; i < hosts.size(); i++)
 	{
@@ -416,6 +451,26 @@ void Settings::Save(const std::string &path) const
 		o << "rp_key=" << HexEncode(h.rp_key, sizeof(h.rp_key)) << "\n";
 		o << "rp_key_type=" << h.rp_key_type << "\n";
 		o << "console_pin=" << h.console_pin << "\n";
+		o << "last_app=" << h.last_app << "\n";
+		o << "last_played=" << h.last_played << "\n";
+	}
+	for(size_t i = 0; i < profiles.size(); i++)
+	{
+		const GameProfile &p = profiles[i];
+		o << "\n[profile." << i << "]\n";
+		o << "game=" << p.game << "\n";
+		o << "upscale_mode=" << p.upscale_mode << "\ndetail_preset=" << p.detail_preset << "\nframe_gen=" << p.frame_gen
+		  << "\npicture_preset=" << p.picture_preset << "\nmouse_preset=" << p.mouse_preset
+		  << "\nsharpness=" << p.sharpness << "\nai_sharpness=" << p.ai_sharpness << "\ntexture_boost=" << p.texture_boost
+		  << "\nclarity=" << p.clarity << "\novershoot=" << p.overshoot << "\nbrightness=" << p.brightness
+		  << "\ncontrast=" << p.contrast << "\nsaturation=" << p.saturation << "\nvibrance=" << p.vibrance
+		  << "\nhdr_boost=" << p.hdr_boost << "\nmouse_sensitivity=" << p.mouse_sensitivity << "\n";
+	}
+	if(!playtime.empty())
+	{
+		o << "\n[playtime]\n";
+		for(auto &kv : playtime)
+			o << kv.first << "=" << kv.second << "\n";
 	}
 	for(size_t i = 0; i < manual_hosts.size(); i++)
 		o << "\n[manual." << i << "]\naddress=" << manual_hosts[i].address << "\n";
@@ -430,6 +485,48 @@ void Settings::Save(const std::string &path) const
 		}
 		out << o.str();
 	}
-	std::remove(path.c_str());
-	std::rename(tmp.c_str(), path.c_str());
+	// Replace in one step (a crash or power cut can never leave a half-written or missing file),
+	// keeping the previous version as a backup.
+	CopyFileA(path.c_str(), (path + ".bak").c_str(), FALSE);
+	if(!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+		LOGE("Could not replace %s (error %lu)", path.c_str(), (unsigned long)GetLastError());
+}
+
+GameProfile *Settings::FindProfile(const std::string &game)
+{
+	for(auto &p : profiles)
+		if(p.game == game)
+			return &p;
+	return nullptr;
+}
+
+GameProfile Settings::CaptureProfile(const std::string &game) const
+{
+	GameProfile p;
+	p.game = game;
+	p.upscale_mode = upscale_mode; p.detail_preset = detail_preset; p.frame_gen = frame_gen;
+	p.picture_preset = picture_preset; p.mouse_preset = mouse_preset;
+	p.sharpness = sharpness; p.ai_sharpness = ai_sharpness; p.texture_boost = texture_boost;
+	p.clarity = clarity; p.overshoot = overshoot; p.brightness = brightness; p.contrast = contrast;
+	p.saturation = saturation; p.vibrance = vibrance; p.hdr_boost = hdr_boost;
+	p.mouse_sensitivity = kbm.sensitivity;
+	return p;
+}
+
+void Settings::ApplyProfile(const GameProfile &p)
+{
+	upscale_mode = p.upscale_mode; detail_preset = p.detail_preset; frame_gen = p.frame_gen;
+	picture_preset = p.picture_preset; mouse_preset = p.mouse_preset;
+	sharpness = p.sharpness; ai_sharpness = p.ai_sharpness; texture_boost = p.texture_boost;
+	clarity = p.clarity; overshoot = p.overshoot; brightness = p.brightness; contrast = p.contrast;
+	saturation = p.saturation; vibrance = p.vibrance; hdr_boost = p.hdr_boost;
+	if(mouse_preset >= 0 && mouse_preset < 4)
+		ApplyMousePreset(mouse_preset);
+	kbm.sensitivity = p.mouse_sensitivity;
+}
+
+void Settings::RemoveProfile(const std::string &game)
+{
+	profiles.erase(std::remove_if(profiles.begin(), profiles.end(), [&](const GameProfile &p) { return p.game == game; }),
+		profiles.end());
 }
