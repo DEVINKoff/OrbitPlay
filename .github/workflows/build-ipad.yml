@@ -40,6 +40,16 @@ jobs:
       - name: Build app
         run: ios/build.sh
 
+      - name: Inspect app bundle
+        run: |
+          APP=build-ios/Payload/OrbitPlay.app
+          echo "--- files"; find "$APP" -maxdepth 2 | head -60
+          echo "--- Info.plist"; plutil -lint "$APP/Info.plist"; plutil -p "$APP/Info.plist"
+          echo "--- binary"; file "$APP/OrbitPlay"; lipo -info "$APP/OrbitPlay"
+          otool -l "$APP/OrbitPlay" | grep -A6 -E "LC_BUILD_VERSION|LC_VERSION_MIN" | head -20
+          otool -L "$APP/OrbitPlay"
+          echo "--- ipa"; unzip -l build-ios/OrbitPlay.ipa | head -20
+
       - name: Upload unsigned .ipa
         uses: actions/upload-artifact@v4
         with:
