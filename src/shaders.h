@@ -712,11 +712,34 @@ float3 LoadExact(Texture2D<float4> tex, float2 uv)
 	return tex.Load(int3(clamp(int2(uv * size), int2(0, 0), int2(size) - 1), 0)).rgb;
 }
 
+// Brightness, compressed so HDR highlights don't dominate the matching error
+float MatchLuma(float3 c) { float l = Luma(c); return l / (1.0 + l); }
+
+// How well a motion vector explains this pixel: the previous frame followed back along it and the
+// current frame followed forward along it should show the same thing. Three points around the
+// pixel make it robust to single-pixel noise. Also valid for prediction (t > 1): there both
+// samples lie behind the pixel on the same straight motion path.
+float MatchError(float2 uv, float2 full, float2 px)
+{
+	float e = 0.0;
+	[unroll] for(int k = 0; k < 3; k++)
+	{
+		float2 o = (k == 0 ? float2(0.0, 0.0) : (k == 1 ? float2(1.5, 0.5) : float2(-0.5, -1.5))) * px;
+		e += abs(MatchLuma(prevF.SampleLevel(samp, uv + o - full * t, 0).rgb)
+		       - MatchLuma(curF.SampleLevel(samp, uv + o + full * (1.0 - t), 0).rgb));
+	}
+	return e * (1.0 / 3.0);
+}
+
 float4 main(VSOut i) : SV_Target
 {
 	float2 uv = i.uv;
-	// Vectors live at the midpoint time; follow the motion back to where this pixel's
-	// content was at the midpoint (two fixed-point steps) before sampling the field.
+	float2 osize; curF.GetDimensions(osize.x, osize.y);
+	float2 px = 1.0 / osize;
+	float2 fsize; mv.GetDimensions(fsize.x, fsize.y);
+
+	// Smooth vector: vectors live at the midpoint time; follow the motion back to where this
+	// pixel's content was at the midpoint (two fixed-point steps) before sampling the field.
 	float4 m = mv.SampleLevel(samp, uv * grid_scale, 0);
 	float2 full = 2.0 * m.xy / src_size;
 	float2 mid_uv = uv + full * (0.5 - t);
@@ -726,32 +749,48 @@ float4 main(VSOut i) : SV_Target
 	m = mv.SampleLevel(samp, mid_uv * grid_scale, 0);
 	full = 2.0 * m.xy / src_size;
 
-	float failed = saturate((m.z - 0.07) / 0.08);
-	// How far this pixel moves, in output pixels. Still areas (HUD, text, static scenery)
-	// are shown exactly as decoded, so they stay as sharp as the upscaled frame.
-	float2 osize; curF.GetDimensions(osize.x, osize.y);
-	float move_px = length(full * osize) * max(t, 1.0 - t);
-	float still = 1.0 - saturate((move_px - 0.15) / 0.35);
+	// Per-pixel vector choice. A block's vector is wrong for pixels on the other side of an
+	// object edge, and a blended vector is wrong on both sides (the "halo" around moving things),
+	// and nothing in the field knows about the HUD drawn over a moving picture. So the smooth
+	// vector competes with the four nearest block vectors and "not moving" for each pixel, and
+	// the one that lines both frames up best wins.
+	float best_err = MatchError(uv, full, px);
+	float2 best = full;
+	float2 fc = mid_uv * grid_scale * fsize - 0.5;
+	int2 base = int2(floor(fc));
+	int2 fmax = int2(fsize) - 1;
+	[unroll] for(int k = 0; k < 4; k++)
+	{
+		int2 q = clamp(base + int2(k & 1, k >> 1), int2(0, 0), fmax);
+		float2 cand = 2.0 * mv.Load(int3(q, 0)).xy / src_size;
+		float e = MatchError(uv, cand, px) + 0.004; // small bias toward the smooth vector
+		if(e < best_err) { best_err = e; best = cand; }
+	}
+	float zero_err = MatchError(uv, float2(0.0, 0.0), px) + 0.002;
+	bool zero_wins = zero_err < best_err;
+	if(zero_wins) { best_err = zero_err; best = float2(0.0, 0.0); }
+	full = best;
+
+	// How far this pixel moves, in output pixels. Still pixels (HUD, text, static scenery) are
+	// shown exactly as decoded, so they stay as sharp as the upscaled frame.
+	float move_px = length(full * osize) * max(abs(t), abs(1.0 - t));
+	float still = zero_wins ? 1.0 : 1.0 - saturate((move_px - 0.15) / 0.35);
+
 	if(t > 1.0)
 	{
 		// Predictive: the newest frame moved forward along its motion
 		float3 now = LoadExact(curF, uv);
 		float3 moved = SampleSharp(curF, uv + full * (1.0 - t));
-		return float4(lerp(moved, now, max(failed, still)), 1.0);
+		return float4(lerp(moved, now, still), 1.0);
 	}
 	float3 a = SampleSharp(prevF, uv - full * t);
 	float3 b = SampleSharp(curF, uv + full * (1.0 - t));
-	float3 blended = lerp(a, b, t);
-
-	// Where the two motion-compensated frames disagree (something appears / disappears),
-	// use the one nearer in time: it is still moved along the motion, so it doesn't judder.
-	float disagree = saturate((abs(Luma(a) - Luma(b)) - 0.04) / 0.10);
-	float3 c = lerp(blended, t < 0.5 ? a : b, disagree);
-	// Only where block matching failed completely (particles, flashes) show the unmoved real frame.
+	// Where even the best vector doesn't line the frames up (something appears or disappears),
+	// blending would ghost: use the frame nearer in time, still moved along the motion.
+	float disagree = saturate((best_err - 0.03) / 0.08);
+	float3 c = lerp(lerp(a, b, t), t < 0.5 ? a : b, disagree);
 	float3 nearest = t < 0.5 ? LoadExact(prevF, uv) : LoadExact(curF, uv);
-	// Nothing moves here: the nearer real frame, untouched
-	float pixel_still = still * (1.0 - disagree);
-	return float4(lerp(c, nearest, max(failed, pixel_still)), 1.0);
+	return float4(lerp(c, nearest, still * (1.0 - disagree)), 1.0);
 }
 )HLSL";
 

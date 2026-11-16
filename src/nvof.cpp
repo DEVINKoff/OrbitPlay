@@ -221,7 +221,7 @@ bool HwOpticalFlow::Init(ID3D11Device *device, int w, int h)
 	ip.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
 	ip.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
 	ip.mode = NV_OF_MODE_OPTICALFLOW;
-	ip.perfLevel = NV_OF_PERF_LEVEL_MEDIUM;
+	ip.perfLevel = NV_OF_PERF_LEVEL_SLOW; // best quality; at half resolution it is still a fraction of a millisecond
 	ip.enableExternalHints = NV_OF_FALSE;
 	ip.enableOutputCost = NV_OF_FALSE;
 	ip.hPrivData = nullptr;
