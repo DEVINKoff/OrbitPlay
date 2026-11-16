@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(OrbitPlay VERSION 1.7.1 LANGUAGES C CXX)
+project(OrbitPlay VERSION 1.8.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -129,6 +129,7 @@ else()
 		src/main.cpp
 		src/renderer.cpp
 		src/vpscaler.cpp
+		src/nvof.cpp
 		src/window_chrome.cpp
 		src/platform/platform_win.cpp
 		res/orbitplay.rc)

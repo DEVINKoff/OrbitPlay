@@ -119,6 +119,11 @@ for kv in "DTPlatformName string iphoneos" "DTPlatformVersion string $SDKV" "DTP
 done
 plutil -convert binary1 "$A/Info.plist"
 plutil -lint "$A/Info.plist"
+# chiaki-ng pins the deployment target to 13.0; make the binary's minimum OS match the plist (16.0)
+vtool -set-build-version ios $MIN_IOS "$SDKV" -replace -output "$A/OrbitPlay.tmp" "$A/OrbitPlay" && mv "$A/OrbitPlay.tmp" "$A/OrbitPlay"
+# Ad-hoc signature: some installers refuse a completely unsigned binary; every sideloading tool re-signs anyway
+codesign --force --sign - --timestamp=none "$A"
+codesign -dv "$A" 2>&1 | head -5
 ( cd "$B" && zip -qry OrbitPlay.ipa Payload )
 echo
 echo "Built $B/OrbitPlay.ipa ($(du -h "$B/OrbitPlay.ipa" | cut -f1))"

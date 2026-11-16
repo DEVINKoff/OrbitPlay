@@ -11,6 +11,8 @@
 
 #include <imgui.h>
 
+#include "nvof.h"
+
 struct AVFrame;
 class VpScaler;
 
@@ -83,6 +85,9 @@ public:
 	int OutputVideoWidth() const;   // size of what's shown (after upscaling)
 	int OutputVideoHeight() const;
 	const std::string &UpscalerStatus() const { return upscaler_status; }
+	// How frame generation finds motion (NVIDIA optical flow hardware or the shader search)
+	const std::string &MotionStatus() const { return motion_status; }
+	bool HwOpticalFlowActive() const { return hwof && hwof->Ready(); }
 	bool AiSuperResolutionAvailable() const;
 	bool AiHdrAvailable() const;
 	std::string GpuVendorName() const;
@@ -181,7 +186,7 @@ private:
 	// Shaders and states
 	Com<ID3D11VertexShader> vs;
 	Com<ID3D11PixelShader> ps_nv12, ps_planar, ps_denoise, ps_edge, ps_sharpen, ps_deband, ps_out, ps_overlay, ps_interp;
-	Com<ID3D11ComputeShader> cs_luma_half, cs_down2, cs_search, cs_median, cs_box8, cs_amb_blend, cs_frame_diff;
+	Com<ID3D11ComputeShader> cs_luma_half, cs_down2, cs_search, cs_median, cs_box8, cs_amb_blend, cs_frame_diff, cs_luma_r8, cs_flow_field;
 	Com<ID3D11Buffer> cb_yuv, cb_denoise, cb_up, cb_sharp, cb_deband, cb_out, cb_ui, cb_me, cb_interp, cb_amb, cb_amb_down;
 	Com<ID3D11SamplerState> samp_linear;
 	Com<ID3D11BlendState> blend_premul;
@@ -241,4 +246,12 @@ private:
 	Com<ID3D11UnorderedAccessView> diff_uav;
 	Target interp;
 	bool interp_ready = false;
+	// NVIDIA optical flow hardware
+	bool EnsureHwFlow();
+	void ReleaseHwFlow();
+	std::unique_ptr<HwOpticalFlow> hwof;
+	Target luma8[kSlots], hw_flow_tex;
+	bool hw_flow_wanted = true, hw_flow_tried = false;
+	int hw_flow_failures = 0;
+	std::string motion_status = "Starts with frame generation";
 };

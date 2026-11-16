@@ -22,6 +22,7 @@ struct ProcessOptions
 	float paper_white = 203.0f;     // used to put SDR and HDR on one scale for ambient light
 	bool ai_hdr = false;            // NVIDIA RTX Video HDR for SDR streams on an HDR display
 	bool frame_gen = false;
+	bool hw_flow = true;        // frame generation: NVIDIA optical flow hardware when available
 	bool ambient = false;
 	AspectMode aspect = AspectMode::Fit;
 };

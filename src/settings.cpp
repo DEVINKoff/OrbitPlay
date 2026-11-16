@@ -278,6 +278,8 @@ void Settings::Load(const std::string &path)
 	frame_gen = frame_gen ? 1 : 0; // older versions: any "on" value becomes predictive
 	if(g.count("frame_gen_v2"))
 		frame_gen = std::clamp(atoi(g["frame_gen_v2"].c_str()), 0, 2);
+	num("motion_engine", motion_engine);
+	motion_engine = std::clamp(motion_engine, 0, 1);
 	flt("paper_white_nits", paper_white_nits);
 	bol("ai_hdr", ai_hdr);
 	flt("hdr_boost", hdr_boost);
@@ -407,6 +409,7 @@ void Settings::Save(const std::string &path) const
 	o << "deband=" << deband << "\n";
 	o << "frame_gen_mode=" << (frame_gen ? 1 : 0) << "\n";
 	o << "frame_gen_v2=" << frame_gen << "\n";
+	o << "motion_engine=" << motion_engine << "\n";
 	o << "paper_white_nits=" << paper_white_nits << "\n";
 	o << "ai_hdr=" << ai_hdr << "\n";
 	o << "hdr_boost=" << hdr_boost << "\n";

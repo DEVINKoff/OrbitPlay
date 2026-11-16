@@ -160,6 +160,7 @@ bool Renderer::Init(HWND window)
 
 void Renderer::Shutdown()
 {
+	hwof.reset();
 	if(context)
 	{
 		context->ClearState();
@@ -218,7 +219,9 @@ bool Renderer::CompileShaders()
 		&& cs(shaders::kCsMedian, cs_median)
 		&& cs(shaders::kCsBox8, cs_box8)
 		&& cs(shaders::kCsAmbientBlend, cs_amb_blend)
-		&& cs(shaders::kCsFrameDiff, cs_frame_diff);
+		&& cs(shaders::kCsFrameDiff, cs_frame_diff)
+		&& cs(shaders::kCsLumaToR8, cs_luma_r8)
+		&& cs(shaders::kCsFlowToField, cs_flow_field);
 	if(!ok)
 		LOGE("Failed to build shaders");
 	return ok;
@@ -595,6 +598,7 @@ bool Renderer::EnsureVideoTargets(int w, int h)
 			return false;
 	// Everything sized from the stream is rebuilt lazily
 	mv_coarse[0].Reset();
+	ReleaseHwFlow();
 	interp.Reset();
 	LOGI("Video size %dx%d", w, h);
 	return true;
@@ -840,6 +844,13 @@ SubmitResult Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o)
 	luma_valid[work] = false;
 	slot_serial[work] = 0;
 	frame_gen_enabled = o.frame_gen;
+	if(hw_flow_wanted != o.hw_flow)
+	{
+		hw_flow_wanted = o.hw_flow;
+		ReleaseHwFlow();
+		for(auto &f : mvc)
+			f.a = f.b = 0;
+	}
 	if(frame_gen_enabled && EnsureMotionTargets())
 	{
 		ComputeLumaPyramid(work);
@@ -1216,6 +1227,35 @@ int Renderer::EnsureMotionField(int sa, int sb)
 	int other = 1 - dst;
 	bool temporal = mvc[other].a != 0;
 
+	// NVIDIA optical flow hardware when available: dedicated silicon, so it costs the GPU's shader
+	// cores nothing and finds large and complex motion that block matching misses.
+	if(EnsureHwFlow())
+	{
+		for(int s : { sa, sb })
+		{
+			ID3D11ShaderResourceView *l = luma_half[s].srv.Get();
+			Dispatch(cs_luma_r8.Get(), &l, 1, luma8[s].uav.Get(), nullptr, luma8[s].w, luma8[s].h);
+		}
+		if(hwof->Run(luma8[sa].tex.Get(), luma8[sb].tex.Get(), hw_flow_tex.tex.Get()))
+		{
+			hw_flow_failures = 0;
+			ID3D11ShaderResourceView *fs[3] = { luma_half[sa].srv.Get(), luma_half[sb].srv.Get(), hw_flow_tex.srv.Get() };
+			Dispatch(cs_flow_field.Get(), fs, 3, mv_fine.uav.Get(), nullptr, fine_w, fine_h);
+			ID3D11ShaderResourceView *mf = mv_fine.srv.Get();
+			Dispatch(cs_median.Get(), &mf, 1, mvc[dst].field.uav.Get(), nullptr, fine_w, fine_h);
+			mvc[dst].a = a;
+			mvc[dst].b = b;
+			mvc[dst].used = ++mv_use_counter;
+			return dst;
+		}
+		if(++hw_flow_failures >= 30 || !hwof->Ready())
+		{
+			LOGW("NVIDIA optical flow keeps failing; using shader motion search");
+			motion_status = "Shader block matching (NVIDIA optical flow stopped working)";
+			hwof.reset();
+		}
+	}
+
 	// 1) Coarse search at quarter resolution: 4x4 blocks (= 16x16 px), +-8 (= +-32 px half-step,
 	//    i.e. up to 64 px of motion per frame), plus the previous pair's vectors for faster motion.
 	MeCB me = {};
@@ -1259,6 +1299,49 @@ int Renderer::EnsureMotionField(int sa, int sb)
 	mvc[dst].b = b;
 	mvc[dst].used = ++mv_use_counter;
 	return dst;
+}
+
+bool Renderer::EnsureHwFlow()
+{
+	if(!hw_flow_wanted)
+	{
+		motion_status = "Shader block matching";
+		return false;
+	}
+	if(hwof && hwof->Ready())
+		return true;
+	if(hw_flow_tried)
+		return false;
+	hw_flow_tried = true;
+	int w = luma_half[0].w, h = luma_half[0].h;
+	bool ok = true;
+	for(int i = 0; i < kSlots && ok; i++)
+		ok = MakeTarget(luma8[i], w, h, DXGI_FORMAT_R8_UNORM, false, true);
+	hwof = std::make_unique<HwOpticalFlow>();
+	ok = ok && MakeTarget(hw_flow_tex, (w + 3) / 4, (h + 3) / 4, DXGI_FORMAT_R16G16_SINT, false, false);
+	ok = ok && hwof->Init(device.Get(), w, h);
+	if(!ok)
+	{
+		motion_status = "Shader block matching (NVIDIA optical flow: " + hwof->Status() + ")";
+		hwof.reset();
+		for(auto &t : luma8)
+			t.Reset();
+		hw_flow_tex.Reset();
+		return false;
+	}
+	hw_flow_failures = 0;
+	motion_status = hwof->Status();
+	return true;
+}
+
+void Renderer::ReleaseHwFlow()
+{
+	hwof.reset();
+	for(auto &t : luma8)
+		t.Reset();
+	hw_flow_tex.Reset();
+	hw_flow_tried = false;
+	motion_status = hw_flow_wanted ? "Starts with frame generation" : "Shader block matching";
 }
 
 bool Renderer::BuildInterpolated(uint64_t serial_a, uint64_t serial_b, float t)

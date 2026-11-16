@@ -854,4 +854,80 @@ void main(uint3 id : SV_DispatchThreadID)
 }
 )HLSL";
 
+// Half-res luma -> 8-bit, the input format of NVIDIA's optical flow hardware
+static const char *kCsLumaToR8 = R"HLSL(
+Texture2D<float> src : register(t0);
+RWTexture2D<unorm float> dst : register(u0);
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+	uint w, h; dst.GetDimensions(w, h);
+	if(id.x >= w || id.y >= h) return;
+	dst[id.xy] = saturate(src.Load(int3(id.xy, 0)));
+}
+)HLSL";
+
+// NVIDIA hardware optical flow (one S10.5 vector per 4x4 half-res pixels) -> the motion field the
+// interpolation shader uses: per 8x8 px block, the half displacement at the midpoint between the
+// two frames (prev at p - v, cur at p + v), plus the block's matching error and still error.
+// The midpoint vector is found by fixed-point iteration on the flow field. Both sign conventions
+// are tried and the one that actually matches the pixels wins, with sub-pixel precision kept.
+static const char *kCsFlowToField = R"HLSL(
+Texture2D<float> prevL : register(t0);
+Texture2D<float> curL : register(t1);
+Texture2D<int2> flow : register(t2);
+RWTexture2D<float4> mvOut : register(u0);
+
+float Sad4(int2 origin, int2 v, int2 maxc)
+{
+	float s = 0.0;
+	[unroll] for(int y = 0; y < 4; y++)
+		[unroll] for(int x = 0; x < 4; x++)
+		{
+			int2 p = origin + int2(x, y);
+			s += abs(prevL.Load(int3(clamp(p - v, 0, maxc), 0)) - curL.Load(int3(clamp(p + v, 0, maxc), 0)));
+		}
+	return s;
+}
+
+float2 FlowAt(float2 pos, int2 fmax)
+{
+	int2 b = clamp(int2(floor(pos / 4.0)), 0, fmax);
+	return float2(flow.Load(int3(b, 0))) / 32.0;
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+	uint gw, gh; mvOut.GetDimensions(gw, gh);
+	if(id.x >= gw || id.y >= gh) return;
+	uint w, h; curL.GetDimensions(w, h);
+	uint fw, fh; flow.GetDimensions(fw, fh);
+	int2 maxc = int2(w - 1, h - 1), fmax = int2(fw - 1, fh - 1);
+	int2 origin = int2(id.xy) * 4;
+	float2 pc = float2(origin) + 2.0;
+
+	// a) flow = where each block of the current frame was in the previous one: 2v = -flow(p + v)
+	float2 va = -FlowAt(pc, fmax) * 0.5;
+	[unroll] for(int i = 0; i < 3; i++)
+		va = -FlowAt(pc + va, fmax) * 0.5;
+	// b) flow = where each block of the previous frame went: 2v = flow(p - v)
+	float2 vb = FlowAt(pc, fmax) * 0.5;
+	[unroll] for(int j = 0; j < 3; j++)
+		vb = FlowAt(pc - vb, fmax) * 0.5;
+
+	float sa = Sad4(origin, int2(round(va)), maxc);
+	float sb = Sad4(origin, int2(round(vb)), maxc);
+	float zero = Sad4(origin, int2(0, 0), maxc);
+	float2 v = sa <= sb ? va : vb;
+	float s = min(sa, sb);
+	if(zero <= s)
+	{
+		v = 0;
+		s = zero;
+	}
+	mvOut[id.xy] = float4(v * 2.0, s / 16.0, zero / 16.0);
+}
+)HLSL";
+
 } // namespace shaders

@@ -351,6 +351,7 @@ ProcessOptions App::MakeProcessOptions() const
 	o.paper_white = settings.paper_white_nits;
 	o.ai_hdr = settings.ai_hdr;
 	o.frame_gen = FrameGenActive();
+	o.hw_flow = settings.motion_engine == 0;
 	o.ambient = settings.ambient && settings.aspect_mode == 0;
 	o.aspect = (AspectMode)std::clamp(settings.aspect_mode, 0, 2);
 	return o;
@@ -1704,7 +1705,15 @@ void App::UiFrameGenSection()
 			renderer.DisplayHz(), dup_rate > 5.0 ? ", repeated frames skipped (30 fps game)" : "");
 		RowHelp(st);
 	}
-	RowHelp(buf);
+#ifdef _WIN32
+	Row("Motion estimation");
+	const char *engines[] = { "Auto (NVIDIA optical flow hardware)", "Shader (any GPU)" };
+	changed |= ImGui::Combo("##me", &settings.motion_engine, engines, 2);
+	RowHelp("RTX 20 series and newer GPUs have a dedicated optical flow unit, the same hardware DLSS Frame "
+		"Generation uses. It tracks fast, large and complex motion better than the shader search and leaves the "
+		"GPU's shader cores free. Other GPUs use the shader search automatically.");
+	RowHelp(("Now: " + renderer.MotionStatus()).c_str());
+#endif
 	if(changed)
 		MarkSettingsDirty();
 }
@@ -2106,6 +2115,10 @@ void App::UiStats()
 		ImGui::Text("FrameGen %s  game %.0f fps -> %.0f fps   buffer %.0f ms   repeats skipped %.0f/s",
 			settings.frame_gen == 1 ? "predictive" : "interpolated", timeline.SourceFps(), present_fps,
 			timeline.BufferMs(settings.frame_gen == 1), dup_rate);
+#ifdef _WIN32
+	if(FrameGenActive())
+		ImGui::Text("Motion   %s", renderer.MotionStatus().c_str());
+#endif
 	{
 		// Rough end-to-end picture of where the delay comes from (the PS5's own capture/encode
 		// time isn't visible to the PC and comes on top).
