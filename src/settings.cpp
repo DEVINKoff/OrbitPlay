@@ -250,6 +250,7 @@ void Settings::Load(const std::string &path)
 	auto bol = [&](const char *k, bool &v) { if(g.count(k)) v = g[k] == "1" || g[k] == "true"; };
 
 	str("psn_account_id", psn_account_id);
+	str("capture_audio", capture_audio);
 	num("resolution", resolution);
 	num("fps", fps);
 	num("bitrate_kbps", bitrate_kbps);
@@ -391,6 +392,7 @@ void Settings::Save(const std::string &path) const
 	std::ostringstream o;
 	o << "[general]\n";
 	o << "psn_account_id=" << psn_account_id << "\n";
+	o << "capture_audio=" << capture_audio << "\n";
 	o << "resolution=" << resolution << "\n";
 	o << "fps=" << fps << "\n";
 	o << "bitrate_kbps=" << bitrate_kbps << "\n";

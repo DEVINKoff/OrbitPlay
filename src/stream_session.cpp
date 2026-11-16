@@ -83,6 +83,11 @@ bool StreamSession::Start(const StreamConfig &cfg, void *hw_device, void *hw_con
 	total_lost = 0;
 	window_start_ms = chiaki_time_now_monotonic_ms();
 	bytes_window = frames_window = 0;
+	capture_mode = false;
+#ifdef _WIN32
+	if(!cfg.capture.link.empty())
+		return StartCapture(error);
+#endif
 
 	ChiakiLog *log = Log::Get().Chiaki();
 
@@ -196,8 +201,53 @@ bool StreamSession::Start(const StreamConfig &cfg, void *hw_device, void *hw_con
 	return true;
 }
 
+#ifdef _WIN32
+// Capture card: frames come from Media Foundation instead of chiaki. `connected` stays false
+// so every console command (PS button, rest mode, mic, keyboard) is a no-op.
+bool StreamSession::StartCapture(std::string *error)
+{
+	capture_mode = true;
+	capture = std::make_unique<CaptureSource>();
+	bool ok = capture->Start(config.capture, config.capture_audio, audio, frame_event,
+		[this](bool first) {
+			decoded_frames++;
+			last_frame_us = chiaki_time_now_monotonic_us();
+			if(first)
+			{
+				SessionEvent e;
+				e.type = SessionEvent::Connected;
+				PushEvent(e);
+			}
+		},
+		[this](const std::string &why) {
+			SessionEvent e;
+			e.type = SessionEvent::Quit;
+			e.flag = true;
+			e.text = why;
+			PushEvent(e);
+		},
+		error);
+	if(!ok)
+	{
+		capture.reset();
+		capture_mode = false;
+		return false;
+	}
+	running = true;
+	LOGI("Capture card: %s", config.capture.name.c_str());
+	return true;
+}
+#endif
+
 void StreamSession::Stop()
 {
+#ifdef _WIN32
+	if(capture)
+	{
+		capture->Stop();
+		capture.reset();
+	}
+#endif
 	if(session_inited)
 	{
 		if(running)
@@ -231,6 +281,18 @@ void StreamSession::Stop()
 
 AVFrame *StreamSession::PullFrame()
 {
+#ifdef _WIN32
+	if(capture)
+	{
+		AVFrame *f = capture->PullFrame();
+		if(f)
+		{
+			std::lock_guard<std::mutex> lock(stats_mutex);
+			frames_window++;
+		}
+		return f;
+	}
+#endif
 	if(!decoder_inited)
 		return nullptr;
 	int32_t lost = 0;
@@ -361,6 +423,15 @@ StreamStats StreamSession::Stats()
 		s.decode_fps = decode_fps;
 		s.frames_lost = total_lost;
 	}
+#ifdef _WIN32
+	if(capture)
+	{
+		CaptureFormat f = capture->Format();
+		s.width = f.width;
+		s.height = f.height;
+		s.codec = "Capture " + f.subtype;
+	}
+#endif
 	if(session_inited)
 	{
 		s.rtt_ms = session.rtt_us / 1000.0;

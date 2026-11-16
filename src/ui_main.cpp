@@ -545,7 +545,8 @@ void App::UiHome()
 	}
 
 	// ---- the list of things you can select
-	struct Entry { int kind; std::string title; RegisteredHost *host = nullptr; DiscoveredHost d; bool has_d = false; };
+	// kind: 0 paired console, 1 console found on the network, 2 "add a console", 3 capture card
+	struct Entry { int kind; std::string title; RegisteredHost *host = nullptr; DiscoveredHost d; bool has_d = false; int capture = -1; };
 	std::vector<DiscoveredHost> found = discovery.Hosts();
 	std::vector<Entry> entries;
 	for(auto &h : settings.hosts)
@@ -572,12 +573,25 @@ void App::UiHome()
 			e.has_d = true;
 			entries.push_back(e);
 		}
+#ifdef _WIN32
+	for(int i = 0; i < (int)capture_devices.size(); i++)
+	{
+		Entry e;
+		e.kind = 3;
+		e.title = capture_devices[i].name;
+		e.capture = i;
+		entries.push_back(e);
+	}
+#endif
 	{
 		Entry e;
 		e.kind = 2;
 		e.title = "Add a console";
 		entries.push_back(e);
 	}
+	int capture_count = 0;
+	for(auto &en : entries)
+		capture_count += en.kind == 3;
 	home_sel = std::clamp(home_sel, 0, (int)entries.size() - 1);
 	int dir = ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) ? 1 : ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) ? -1 : 0;
 	if(dir && entries.size() > 1)
@@ -593,7 +607,7 @@ void App::UiHome()
 	float hy = vp->Pos.y + std::max(150.0f * s, H * 0.25f);
 	float x0 = vp->Pos.x + mx;
 	{
-		std::string kicker = e.kind == 0 ? "PLAYSTATION 5" : e.kind == 1 ? "FOUND ON YOUR NETWORK" : "NEW CONSOLE";
+		std::string kicker = e.kind == 0 ? "PLAYSTATION 5" : e.kind == 1 ? "FOUND ON YOUR NETWORK" : e.kind == 3 ? "CAPTURE CARD" : "NEW CONSOLE";
 		if(e.kind == 0 && !e.host->ps5)
 			kicker = "PLAYSTATION 4";
 		dl->AddText(ImVec2(x0 + 2 * s, hy), IM_COL32(150, 156, 168, 255), kicker.c_str());
@@ -677,6 +691,59 @@ void App::UiHome()
 			ImGui::EndPopup();
 		}
 	}
+#ifdef _WIN32
+	else if(e.kind == 3 && e.capture >= 0 && e.capture < (int)capture_devices.size())
+	{
+		const CaptureDevice &dev = capture_devices[e.capture];
+		StatusPill("HDMI input", ImVec4(0.55f, 0.70f, 1.0f, 1.0f));
+		ImGui::SameLine(0, 16 * s);
+		ImGui::TextDisabled("Play on the console with its own controller; Orbit shows the picture");
+		ImGui::Dummy(ImVec2(0, 10 * s));
+		// The card's sound is a separate recording device; find it by name, or let the user pick.
+		std::string guess = capture_audio_guess.count(dev.name) ? capture_audio_guess[dev.name] : std::string();
+		std::string shown = settings.capture_audio == "none" ? "No sound"
+			: !settings.capture_audio.empty() ? settings.capture_audio
+			: guess.empty() ? "Automatic (not found - pick one)" : "Automatic (" + guess + ")";
+		ImGui::AlignTextToFramePadding();
+		ImGui::TextUnformatted("Sound from");
+		ImGui::SameLine(0, 12 * s);
+		ImGui::SetNextItemWidth(std::min(460.0f * s, W - mx * 2 - 120 * s));
+		if(ImGui::BeginCombo("##capaudio", shown.c_str()))
+		{
+			if(ImGui::Selectable("Automatic", settings.capture_audio.empty()))
+			{
+				settings.capture_audio.clear();
+				MarkSettingsDirty();
+			}
+			if(ImGui::Selectable("No sound", settings.capture_audio == "none"))
+			{
+				settings.capture_audio = "none";
+				MarkSettingsDirty();
+			}
+			ImGui::Separator();
+			for(const std::string &a : capture_audio_devices)
+				if(ImGui::Selectable(a.c_str(), settings.capture_audio == a))
+				{
+					settings.capture_audio = a;
+					MarkSettingsDirty();
+				}
+			ImGui::EndCombo();
+		}
+		ImGui::Dummy(ImVec2(0, 14 * s));
+		ImGui::BeginDisabled(busy);
+		if(home_focus_pending)
+		{
+			ImGui::SetKeyboardFocusHere();
+			home_focus_pending = false;
+		}
+		if(big_button("Watch", 260 * s, true))
+		{
+			sounds.Play(UiSound::Select);
+			StartCapture(dev);
+		}
+		ImGui::EndDisabled();
+	}
+#endif
 	else if(e.kind == 1)
 	{
 		StatusPill(e.d.ready ? "Not paired yet" : "Rest mode - turn it on to pair", e.d.ready ? kTextDim : kWarn);
@@ -761,7 +828,7 @@ void App::UiHome()
 	float sw_y = std::max(ImGui::GetItemRectMax().y + 40 * s, strip_y - 110 * s);
 	{
 		ImGui::SetCursorScreenPos(ImVec2(x0, sw_y));
-		dl->AddText(ImVec2(x0 + 2 * s, sw_y), IM_COL32(150, 156, 168, 255), entries.size() > 1 ? "CONSOLES   (L1 / R1)" : "CONSOLES");
+		dl->AddText(ImVec2(x0 + 2 * s, sw_y), IM_COL32(150, 156, 168, 255), entries.size() > 1 ? (capture_count ? "CONSOLES & CAPTURE   (L1 / R1)" : "CONSOLES   (L1 / R1)") : "CONSOLES");
 		float x = x0;
 		float y = sw_y + ImGui::GetFontSize() + 12 * s;
 		for(int i = 0; i < (int)entries.size(); i++)
@@ -787,7 +854,9 @@ void App::UiHome()
 			else if(hov || foc)
 				dl->AddRectFilled(p, q, IM_COL32(255, 255, 255, 10), r);
 			// status dot
-			if(en.kind != 2)
+			if(en.kind == 3)
+				dl->AddCircleFilled(ImVec2(p.x + 15 * s, p.y + (q.y - p.y) * 0.5f), 3.0f * s, IM_COL32(140, 178, 255, 255), 12);
+			else if(en.kind != 2)
 			{
 				ImU32 dc = !en.has_d ? IM_COL32(120, 124, 134, 255) : en.d.ready ? IM_COL32(110, 214, 143, 255) : IM_COL32(245, 184, 92, 255);
 				dl->AddCircleFilled(ImVec2(p.x + 15 * s, p.y + (q.y - p.y) * 0.5f), 3.0f * s, dc, 12);

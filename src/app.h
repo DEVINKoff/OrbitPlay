@@ -20,6 +20,7 @@
 #include <SDL3/SDL.h>
 #include <imgui.h>
 
+#include <future>
 #include <map>
 #include <memory>
 #include <string>
@@ -69,6 +70,17 @@ private:
 	// actions
 	void BeginConnect(const std::string &mac);
 	void StartStream();
+#ifdef _WIN32
+	void StartCapture(const CaptureDevice &dev);
+	void ScanCaptureDevices(uint64_t now);
+	std::vector<CaptureDevice> capture_devices;
+	std::future<std::vector<CaptureDevice>> capture_scan;
+	uint64_t capture_scan_ms = 0;
+	std::vector<std::string> capture_audio_devices;
+	std::map<std::string, std::string> capture_audio_guess;   // video device name -> its sound device
+	CaptureDevice active_capture;
+#endif
+	bool capture_active = false;     // the current / last session is a capture card, not a console
 	void EndStream(const std::string &message, bool is_error);
 	void SetFullscreen(bool fullscreen);
 	void MarkSettingsDirty() { settings_dirty = true; }

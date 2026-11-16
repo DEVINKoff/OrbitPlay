@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(OrbitPlay VERSION 1.8.1 LANGUAGES C CXX)
+project(OrbitPlay VERSION 1.9.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -130,6 +130,7 @@ else()
 		src/renderer.cpp
 		src/vpscaler.cpp
 		src/nvof.cpp
+		src/capture_source.cpp
 		src/window_chrome.cpp
 		src/platform/platform_win.cpp
 		res/orbitplay.rc)
@@ -139,7 +140,7 @@ else()
 		imgui
 		SDL3::SDL3
 		PkgConfig::FFMPEG
-		d3d11 dxgi d3dcompiler winmm winhttp shell32 iphlpapi ws2_32 windowscodecs ole32 uuid dbghelp comctl32 dwmapi)
+		d3d11 dxgi d3dcompiler winmm winhttp shell32 iphlpapi ws2_32 windowscodecs ole32 uuid dbghelp comctl32 dwmapi mfplat mf mfreadwrite mfuuid)
 	if(MINGW)
 		target_link_options(OrbitPlay PRIVATE -static-libgcc -static-libstdc++)
 	endif()

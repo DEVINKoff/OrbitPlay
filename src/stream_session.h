@@ -12,7 +12,12 @@
 #include <windows.h>
 #endif
 
+#ifdef _WIN32
+#include "capture_source.h"
+#endif
+
 #include <atomic>
+#include <memory>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -35,6 +40,11 @@ struct StreamConfig
 	bool hdr = false;
 	bool dualsense = true;
 	float haptics_gain = 1.0f;
+#ifdef _WIN32
+	// Capture card mode (instead of a console): the device and its audio input ("" = none)
+	CaptureDevice capture;
+	std::string capture_audio;
+#endif
 };
 
 // Events delivered from chiaki's threads to the UI thread.
@@ -74,6 +84,12 @@ public:
 	void Stop();
 
 	bool Running() const { return running; }
+	// Showing an HDMI capture card instead of streaming from a console
+	bool IsCapture() const { return capture_mode; }
+#ifdef _WIN32
+	CaptureFormat CaptureMode() { return capture ? capture->Format() : CaptureFormat(); }
+	std::string CaptureAudio() const { return capture ? capture->AudioName() : std::string(); }
+#endif
 	bool Connected() const { return connected; }
 
 	// Newest decoded frame since the last call, or nullptr. Free with av_frame_free.
@@ -118,6 +134,11 @@ private:
 	void PushEvent(const SessionEvent &e);
 
 	StreamConfig config;
+	bool capture_mode = false;
+#ifdef _WIN32
+	std::unique_ptr<CaptureSource> capture;
+	bool StartCapture(std::string *error);
+#endif
 	std::string host_str;
 	Audio *audio = nullptr;
 	std::atomic<Recorder *> recorder{ nullptr };

@@ -49,6 +49,7 @@ struct Settings
 {
 	// Account
 	std::string psn_account_id; // base64, 8 bytes
+	std::string capture_audio;  // capture card sound: "" = find it automatically, "none", or a recording device name
 
 	// Stream
 	int resolution = 1080;      // 360 / 540 / 720 / 1080

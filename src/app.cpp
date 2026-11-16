@@ -631,6 +631,9 @@ void App::PumpEvents()
 void App::Tick()
 {
 	uint64_t now = NowMs();
+#ifdef _WIN32
+	ScanCaptureDevices(now);
+#endif
 
 	if(now - last_display_refresh > 2000)
 	{
@@ -666,7 +669,7 @@ void App::Tick()
 	if(phase == Phase::Streaming && session)
 	{
 		// What's running on the console (for play time, profiles, the menu)
-		if(now - last_game_check > 3000)
+		if(!session->IsCapture() && now - last_game_check > 3000)
 		{
 			last_game_check = now;
 			discovery.ProbeAddress(active_address);
@@ -736,10 +739,11 @@ void App::Tick()
 
 	// Connecting -> Streaming once the first frame arrives (handled in HandleSessionEvents)
 	if(phase == Phase::Connecting && now > phase_deadline)
-		EndStream("Connection timed out. Make sure Remote Play is enabled on the console.", true);
+		EndStream(capture_active ? "No picture from the capture card. Check that the console is on and the HDMI cable is in the card's input."
+			: "Connection timed out. Make sure Remote Play is enabled on the console.", true);
 
 	// Hot-plugged DualSense: (re)try opening the haptics audio device
-	if(phase == Phase::Streaming && session && settings.dualsense_features && !audio.HapticsActive()
+	if(phase == Phase::Streaming && session && !session->IsCapture() && settings.dualsense_features && !audio.HapticsActive()
 		&& now - last_haptics_try > 3000 && gamepads.AnyWiredDualSense())
 	{
 		audio.OpenHaptics();
@@ -794,6 +798,11 @@ void App::Tick()
 	if(reconnect_at && now >= reconnect_at && phase == Phase::Idle)
 	{
 		reconnect_at = 0;
+#ifdef _WIN32
+		if(capture_active && !active_capture.link.empty())
+			StartCapture(active_capture);
+		else
+#endif
 		if(!active_host.mac.empty())
 			BeginConnect(active_host.mac);
 	}
@@ -876,7 +885,18 @@ void App::HandleSessionEvents()
 				}
 				input_guard = true;
 				gamepads.SetMicLed(false);
-				if(settings.dualsense_features && gamepads.AnyWiredDualSense())
+				if(session->IsCapture())
+				{
+#ifdef _WIN32
+					CaptureFormat f = session->CaptureMode();
+					std::string a = session->CaptureAudio();
+					char b[256];
+					snprintf(b, sizeof(b), "%s  -  %dx%d at %.0f fps%s", active_capture.name.c_str(), f.width, f.height, f.fps,
+						a.empty() ? "  -  no sound (pick the card's audio on the home screen)" : "");
+					ShowToast(b);
+#endif
+				}
+				else if(settings.dualsense_features && gamepads.AnyWiredDualSense())
 					audio.OpenHaptics();
 				break;
 			case SessionEvent::Quit:
@@ -1043,6 +1063,7 @@ void App::BeginConnect(const std::string &mac)
 	RegisteredHost *h = settings.FindHost(mac);
 	if(!h)
 		return;
+	capture_active = false;
 	active_host = *h;
 	active_address = h->last_address;
 	message.clear();
@@ -1107,6 +1128,55 @@ void App::StartStream()
 	chiaki_controller_state_set_idle(&last_sent);
 	sent_idle = false;
 }
+
+#ifdef _WIN32
+// Capture card list, refreshed in the background every few seconds on the home screen, so a
+// card plugged in while the app runs shows up by itself.
+void App::ScanCaptureDevices(uint64_t now)
+{
+	if(capture_scan.valid() && capture_scan.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+	{
+		capture_devices = capture_scan.get();
+		capture_audio_devices = CaptureSource::EnumerateAudio();
+		capture_audio_guess.clear();
+		for(const CaptureDevice &d : capture_devices)
+			capture_audio_guess[d.name] = CaptureSource::GuessAudio(d.name);
+	}
+	if(!capture_scan.valid() && phase == Phase::Idle && screen == Screen::Consoles && now - capture_scan_ms > 4000)
+	{
+		capture_scan_ms = now;
+		capture_scan = std::async(std::launch::async, [] { return CaptureSource::EnumerateVideo(); });
+	}
+}
+
+void App::StartCapture(const CaptureDevice &dev)
+{
+	capture_active = true;
+	active_capture = dev;
+	message.clear();
+	StreamConfig cfg;
+	cfg.capture = dev;
+	cfg.capture_audio = settings.capture_audio == "none" ? std::string()
+		: !settings.capture_audio.empty() ? settings.capture_audio : CaptureSource::GuessAudio(dev.name);
+	cfg.fps = 60;
+	session = std::make_unique<StreamSession>();
+	renderer.ResetVideo();
+	std::string error;
+	if(!session->Start(cfg, nullptr, nullptr, &audio, &error))
+	{
+		session.reset();
+		phase = Phase::Idle;
+		message = error;
+		message_is_error = true;
+		return;
+	}
+	phase = Phase::Connecting;
+	phase_deadline = NowMs() + 12000;
+	last_wakeup = 0;
+	chiaki_controller_state_set_idle(&last_sent);
+	sent_idle = false;
+}
+#endif
 
 bool App::TryAutoReconnect(const std::string &why)
 {
@@ -1176,6 +1246,17 @@ void App::UpdateWatchdog(uint64_t now)
 	if(age < 2500)
 	{
 		frozen_warned = false;
+		return;
+	}
+	if(session->IsCapture())
+	{
+		if(!frozen_warned)
+		{
+			ShowToast("No signal from the capture card...");
+			frozen_warned = true;
+		}
+		if(age > 15000 && !TryAutoReconnect("The capture card stopped"))
+			EndStream("The capture card stopped sending a picture. Check that the console is on and the HDMI cable is in.", true);
 		return;
 	}
 	if(now - last_keyframe_req > 2000)
@@ -1487,6 +1568,8 @@ void App::UiPairDialog()
 bool App::StreamSettingsChanged() const
 {
 	if(!session)
+		return false;
+	if(session->IsCapture())
 		return false;
 	const StreamConfig &c = session->Config();
 	bool want_hdr = settings.hdr && (renderer.DisplayHdr() || settings.hdr_force);
@@ -1899,6 +1982,11 @@ void App::ToggleRecording()
 {
 	if(phase != Phase::Streaming || !session)
 		return;
+	if(session->IsCapture())
+	{
+		ShowToast("Recording works with console streams only (it saves the console's own video stream)");
+		return;
+	}
 	if(recorder.Recording())
 	{
 		recorder.StopRecording();
@@ -1916,6 +2004,11 @@ void App::SaveReplay()
 {
 	if(phase != Phase::Streaming || !session)
 		return;
+	if(session->IsCapture())
+	{
+		ShowToast("Instant replay works with console streams only");
+		return;
+	}
 	if(!recorder.ReplayEnabled())
 	{
 		ShowToast("Instant replay is off - turn it on in the menu (Capture tab)");
@@ -2039,7 +2132,11 @@ void App::UiConnecting()
 	ImFont *df = g_display ? g_display : (g_title ? g_title : ImGui::GetFont());
 	ImFont *hf = g_heading ? g_heading : ImGui::GetFont();
 	std::string name = active_host.nickname.empty() ? "PlayStation 5" : active_host.nickname;
-	dl->AddText(ImVec2(x + 2 * s, y), IM_COL32(150, 156, 168, 255), "CONNECTING");
+#ifdef _WIN32
+	if(capture_active)
+		name = active_capture.name;
+#endif
+	dl->AddText(ImVec2(x + 2 * s, y), IM_COL32(150, 156, 168, 255), capture_active ? "CAPTURE CARD" : "CONNECTING");
 	y += ImGui::GetFontSize() + 8 * s;
 	dl->AddText(df, df->FontSize, ImVec2(x - 3 * s, y), IM_COL32(244, 245, 248, 255), name.c_str());
 	y += df->FontSize + 34 * s;
@@ -2048,6 +2145,12 @@ void App::UiConnecting()
 	int cur = phase == Phase::Waking ? 0 : phase == Phase::Connecting ? 1 : 2;
 	const char *steps[] = { "Waking the console", "Connecting and signing in", "Starting the picture" };
 	const char *hints[] = { "From rest mode this can take up to a minute.", "", "" };
+	if(capture_active)
+	{
+		steps[0] = "Finding the card";
+		steps[1] = "Waiting for the picture";
+		hints[1] = "Turn the console on if it's off.";
+	}
 	float t = (float)ImGui::GetTime();
 	for(int i = 0; i < 3; i++)
 	{
@@ -2334,25 +2437,35 @@ void App::UiStreamOverlay()
 	}
 
 	ImGui::Separator();
-	float fw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2) / 3.0f;
-	char hb[48], rb[64], db[48];
-	snprintf(hb, sizeof(hb), "%s%sPS Home screen", Ico(ICON_HOME), g_icons ? "  " : "");
-	snprintf(rb, sizeof(rb), "%s%sPut console in rest mode", Ico(ICON_POWER), g_icons ? "  " : "");
-	snprintf(db, sizeof(db), "%s%sDisconnect", Ico(ICON_CANCEL), g_icons ? "  " : "");
-	if(ImGui::Button(hb, ImVec2(fw, 0)) && session)
+	if(session->IsCapture())
 	{
-		session->GoHome();
-		ShowOverlay(false);
+		char sb[48];
+		snprintf(sb, sizeof(sb), "%s%sStop watching", Ico(ICON_CANCEL), g_icons ? "  " : "");
+		if(ImGui::Button(sb, ImVec2(-1, 0)))
+			EndStream("", false);
 	}
-	ImGui::SameLine();
-	if(ImGui::Button(rb, ImVec2(fw, 0)) && session)
+	else
 	{
-		session->GotoBed();
-		EndStream("", false);
+		float fw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2) / 3.0f;
+		char hb[48], rb[64], db[48];
+		snprintf(hb, sizeof(hb), "%s%sPS Home screen", Ico(ICON_HOME), g_icons ? "  " : "");
+		snprintf(rb, sizeof(rb), "%s%sPut console in rest mode", Ico(ICON_POWER), g_icons ? "  " : "");
+		snprintf(db, sizeof(db), "%s%sDisconnect", Ico(ICON_CANCEL), g_icons ? "  " : "");
+		if(ImGui::Button(hb, ImVec2(fw, 0)) && session)
+		{
+			session->GoHome();
+			ShowOverlay(false);
+		}
+		ImGui::SameLine();
+		if(ImGui::Button(rb, ImVec2(fw, 0)) && session)
+		{
+			session->GotoBed();
+			EndStream("", false);
+		}
+		ImGui::SameLine();
+		if(ImGui::Button(db, ImVec2(fw, 0)))
+			EndStream("", false);
 	}
-	ImGui::SameLine();
-	if(ImGui::Button(db, ImVec2(fw, 0)))
-		EndStream("", false);
 	ImGui::End();
 
 	// Drag the compare divider with the mouse (outside the menu)
