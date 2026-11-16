@@ -196,6 +196,12 @@ private:
 	Com<ID3D11Texture2D> hw_copy;
 	DXGI_FORMAT hw_copy_format = DXGI_FORMAT_UNKNOWN;
 	UINT hw_copy_w = 0, hw_copy_h = 0;
+	// CPU NV12 frames (capture cards) uploaded into a GPU NV12 texture, so they take the same
+	// path as decoded frames, AI super resolution included.
+	bool UploadNv12(const AVFrame *frame);
+	Com<ID3D11Texture2D> up_staging[2], up_tex;
+	int up_w = 0, up_h = 0, up_index = 0;
+	bool up_failed = false;
 	Com<ID3D11ShaderResourceView> hw_srv_y, hw_srv_uv;
 	Com<ID3D11Texture2D> sw_planes[3];
 	Com<ID3D11ShaderResourceView> sw_srvs[3];

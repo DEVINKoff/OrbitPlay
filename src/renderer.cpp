@@ -718,11 +718,84 @@ void Renderer::DiscardFrame(uint64_t serial)
 		latest = hist[0];
 }
 
+bool Renderer::UploadNv12(const AVFrame *frame)
+{
+	if(up_failed)
+		return false;
+	int w = frame->width & ~1, h = frame->height & ~1;
+	if(!up_tex || up_w != w || up_h != h)
+	{
+		vp->Reset(); // its input views may point at the texture being replaced
+		up_tex.Reset();
+		up_staging[0].Reset();
+		up_staging[1].Reset();
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = (UINT)w;
+		td.Height = (UINT)h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_NV12;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_DECODER;
+		if(FAILED(device->CreateTexture2D(&td, nullptr, up_tex.Put())))
+		{
+			td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			if(FAILED(device->CreateTexture2D(&td, nullptr, up_tex.Put())))
+			{
+				LOGW("NV12 textures not supported; capture frames use the software path");
+				up_failed = true;
+				return false;
+			}
+		}
+		td.Usage = D3D11_USAGE_STAGING;
+		td.BindFlags = 0;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		for(auto &st : up_staging)
+			if(FAILED(device->CreateTexture2D(&td, nullptr, st.Put())))
+			{
+				up_tex.Reset();
+				up_failed = true;
+				return false;
+			}
+		up_w = w;
+		up_h = h;
+	}
+	// Two staging textures in turn, so writing one never waits for the copy out of the other
+	ID3D11Texture2D *st = up_staging[up_index].Get();
+	up_index ^= 1;
+	D3D11_MAPPED_SUBRESOURCE m;
+	if(FAILED(context->Map(st, 0, D3D11_MAP_WRITE, 0, &m)))
+		return false;
+	auto *dst = static_cast<uint8_t *>(m.pData);
+	for(int y = 0; y < h; y++)
+		memcpy(dst + (size_t)y * m.RowPitch, frame->data[0] + (size_t)y * frame->linesize[0], (size_t)w);
+	uint8_t *uv = dst + (size_t)m.RowPitch * h;   // NV12: the UV plane follows the Y plane
+	for(int y = 0; y < h / 2; y++)
+		memcpy(uv + (size_t)y * m.RowPitch, frame->data[1] + (size_t)y * frame->linesize[1], (size_t)w);
+	context->Unmap(st, 0);
+	context->CopyResource(up_tex.Get(), st);
+	return true;
+}
+
 SubmitResult Renderer::SubmitFrame(AVFrame *frame, const ProcessOptions &o)
 {
 	SubmitResult result;
 	if(!frame || frame->width <= 0 || frame->height <= 0)
 		return result;
+	// A CPU NV12 frame (capture card) becomes a GPU frame here: same path as decoded video,
+	// including the driver's AI super resolution.
+	AVFrame gpu_frame;
+	if(frame->format == AV_PIX_FMT_NV12 && UploadNv12(frame))
+	{
+		gpu_frame = *frame;
+		gpu_frame.format = AV_PIX_FMT_D3D11;
+		gpu_frame.data[0] = reinterpret_cast<uint8_t *>(up_tex.Get());
+		gpu_frame.data[1] = nullptr;
+		gpu_frame.width = up_w;
+		gpu_frame.height = up_h;
+		frame = &gpu_frame;
+	}
 	if(!EnsureVideoTargets(frame->width, frame->height))
 		return result;
 	work = PickWorkSlot();
