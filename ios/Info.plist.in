@@ -49,9 +49,17 @@
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>UILaunchScreen</key>
+	<dict/>
+	<key>CFBundleIcons~ipad</key>
 	<dict>
-		<key>UIColorName</key>
-		<string></string>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>AppIcon76x76</string>
+				<string>AppIcon83.5x83.5</string>
+			</array>
+		</dict>
 	</dict>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>

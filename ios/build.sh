@@ -99,6 +99,26 @@ APP="$(find "$B" -maxdepth 2 -name 'OrbitPlay.app' -type d | head -1)"
 rm -rf "$B/Payload" "$B/OrbitPlay.ipa"
 mkdir -p "$B/Payload"
 cp -R "$APP" "$B/Payload/"
+A="$B/Payload/OrbitPlay.app"
+# What Xcode adds to every app: icon files, PkgInfo, and the SDK/platform keys that installers
+# and sideloading tools look for. The plist ends up in binary form, as Xcode writes it.
+cp "$ROOT"/ios/icons/AppIcon76x76~ipad.png "$ROOT"/ios/icons/AppIcon76x76@2x~ipad.png "$ROOT"/ios/icons/AppIcon83.5x83.5@2x~ipad.png "$A/"
+printf 'APPL????' > "$A/PkgInfo"
+PB=/usr/libexec/PlistBuddy
+SDKV="$(xcrun --sdk iphoneos --show-sdk-version)"
+SDKB="$(xcrun --sdk iphoneos --show-sdk-build-version)"
+XCV="$(xcodebuild -version | awk '/^Xcode/ {print $2}' | tr -d .)"
+XCB="$(xcodebuild -version | awk '/Build version/ {print $3}')"
+while [ ${#XCV} -lt 4 ]; do XCV="${XCV}0"; done
+for kv in "DTPlatformName string iphoneos" "DTPlatformVersion string $SDKV" "DTPlatformBuild string $SDKB" \
+	"DTSDKName string iphoneos$SDKV" "DTSDKBuild string $SDKB" "DTXcode string $XCV" "DTXcodeBuild string $XCB" \
+	"DTCompiler string com.apple.compilers.llvm.clang.1_0" "BuildMachineOSBuild string $(sw_vers -buildVersion)"; do
+	set -- $kv
+	$PB -c "Delete :$1" "$A/Info.plist" 2>/dev/null || true
+	$PB -c "Add :$1 $2 $3" "$A/Info.plist"
+done
+plutil -convert binary1 "$A/Info.plist"
+plutil -lint "$A/Info.plist"
 ( cd "$B" && zip -qry OrbitPlay.ipa Payload )
 echo
 echo "Built $B/OrbitPlay.ipa ($(du -h "$B/OrbitPlay.ipa" | cut -f1))"
