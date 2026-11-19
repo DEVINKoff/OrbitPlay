@@ -79,6 +79,10 @@ private:
 	std::vector<std::string> capture_audio_devices;
 	std::map<std::string, std::string> capture_audio_guess;   // video device name -> its sound device
 	CaptureDevice active_capture;
+	// The card's modes, read once per device (opening it takes a moment)
+	std::map<std::wstring, std::vector<CaptureMode>> capture_modes;
+	std::future<std::vector<CaptureMode>> modes_scan;
+	std::wstring modes_scan_link;
 #endif
 	bool capture_active = false;     // the current / last session is a capture card, not a console
 	void EndStream(const std::string &message, bool is_error);

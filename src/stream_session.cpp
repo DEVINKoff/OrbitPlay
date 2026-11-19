@@ -7,6 +7,7 @@
 #include <chiaki/time.h>
 
 extern "C" {
+#include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
 #ifdef _WIN32
@@ -86,7 +87,7 @@ bool StreamSession::Start(const StreamConfig &cfg, void *hw_device, void *hw_con
 	capture_mode = false;
 #ifdef _WIN32
 	if(!cfg.capture.link.empty())
-		return StartCapture(error);
+		return StartCapture(hw_device, hw_context, error);
 #endif
 
 	ChiakiLog *log = Log::Get().Chiaki();
@@ -204,11 +205,18 @@ bool StreamSession::Start(const StreamConfig &cfg, void *hw_device, void *hw_con
 #ifdef _WIN32
 // Capture card: frames come from Media Foundation instead of chiaki. `connected` stays false
 // so every console command (PS button, rest mode, mic, keyboard) is a no-op.
-bool StreamSession::StartCapture(std::string *error)
+bool StreamSession::StartCapture(void *hw_device, void *hw_context, std::string *error)
 {
 	capture_mode = true;
+	capture_upload_failed = false;
+	if(hw_device && hw_context)
+		hw_device_ctx = CreateD3D11VAContext((ID3D11Device *)hw_device, (ID3D11DeviceContext *)hw_context);
+	if(!hw_device_ctx)
+		LOGW("Capture: no D3D11VA context; frames use the software path");
 	capture = std::make_unique<CaptureSource>();
-	bool ok = capture->Start(config.capture, config.capture_audio, audio, frame_event,
+	if(recorder)
+		capture->SetRecorder(recorder);
+	bool ok = capture->Start(config.capture, config.capture_options, audio, frame_event,
 		[this](bool first) {
 			decoded_frames++;
 			last_frame_us = chiaki_time_now_monotonic_us();
@@ -231,11 +239,116 @@ bool StreamSession::StartCapture(std::string *error)
 	{
 		capture.reset();
 		capture_mode = false;
+		if(hw_device_ctx)
+			av_buffer_unref(&hw_device_ctx);
 		return false;
 	}
 	running = true;
 	LOGI("Capture card: %s", config.capture.name.c_str());
 	return true;
+}
+
+void StreamSession::ReleaseCaptureStaging()
+{
+	for(auto &st : capture_staging)
+		if(st)
+		{
+			st->Release();
+			st = nullptr;
+		}
+	capture_staging_next = 0;
+}
+
+AVFrame *StreamSession::UploadCaptureFrame(AVFrame *sw)
+{
+	if(!sw || !hw_device_ctx || capture_upload_failed)
+		return sw;
+	auto fail = [&](const char *what, int err) {
+		char eb[128] = {};
+		av_strerror(err, eb, sizeof(eb));
+		LOGW("Capture: GPU upload failed (%s: %s); using the software path", what, eb);
+		capture_upload_failed = true;
+		return sw;
+	};
+	if(!capture_frames_ctx || capture_fw != sw->width || capture_fh != sw->height)
+	{
+		ReleaseCaptureStaging();
+		av_buffer_unref(&capture_frames_ctx);
+		capture_frames_ctx = av_hwframe_ctx_alloc(hw_device_ctx);
+		if(!capture_frames_ctx)
+			return fail("frames context", AVERROR(ENOMEM));
+		auto *fc = reinterpret_cast<AVHWFramesContext *>(capture_frames_ctx->data);
+		fc->format = AV_PIX_FMT_D3D11;
+		fc->sw_format = AV_PIX_FMT_NV12;
+		fc->width = sw->width;
+		fc->height = sw->height;
+		fc->initial_pool_size = 8;
+		// Same kind of texture the hardware decoder writes into
+		reinterpret_cast<AVD3D11VAFramesContext *>(fc->hwctx)->BindFlags = D3D11_BIND_DECODER;
+		int err = av_hwframe_ctx_init(capture_frames_ctx);
+		if(err < 0)
+		{
+			av_buffer_unref(&capture_frames_ctx);
+			return fail("frames init", err);
+		}
+		capture_fw = sw->width;
+		capture_fh = sw->height;
+	}
+	auto *dev = reinterpret_cast<AVD3D11VADeviceContext *>(reinterpret_cast<AVHWDeviceContext *>(hw_device_ctx->data)->hwctx);
+	if(!capture_staging[0])
+	{
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = (UINT)sw->width;
+		td.Height = (UINT)sw->height;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_NV12;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_STAGING;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		for(auto &st : capture_staging)
+			if(FAILED(dev->device->CreateTexture2D(&td, nullptr, &st)))
+			{
+				ReleaseCaptureStaging();
+				return fail("staging texture", AVERROR(EINVAL));
+			}
+	}
+	AVFrame *hw = av_frame_alloc();
+	int err = hw ? av_hwframe_get_buffer(capture_frames_ctx, hw, 0) : AVERROR(ENOMEM);
+	if(err < 0)
+	{
+		av_frame_free(&hw);
+		return fail("pool frame", err);
+	}
+	// CPU -> staging (one of three, so it is never still in use) -> the pool's texture slice
+	ID3D11Texture2D *st = capture_staging[capture_staging_next];
+	capture_staging_next = (capture_staging_next + 1) % 3;
+	dev->lock(dev->lock_ctx);
+	D3D11_MAPPED_SUBRESOURCE m;
+	bool mapped = SUCCEEDED(dev->device_context->Map(st, 0, D3D11_MAP_WRITE, 0, &m));
+	if(mapped)
+	{
+		auto *dst = static_cast<uint8_t *>(m.pData);
+		for(int y = 0; y < sw->height; y++)
+			memcpy(dst + (size_t)y * m.RowPitch, sw->data[0] + (size_t)y * sw->linesize[0], (size_t)sw->width);
+		uint8_t *uv = dst + (size_t)m.RowPitch * (size_t)sw->height;  // NV12: UV plane follows Y
+		for(int y = 0; y < sw->height / 2; y++)
+			memcpy(uv + (size_t)y * m.RowPitch, sw->data[1] + (size_t)y * sw->linesize[1], (size_t)sw->width);
+		dev->device_context->Unmap(st, 0);
+		auto *tex = reinterpret_cast<ID3D11Texture2D *>(hw->data[0]);
+		UINT index = (UINT)(intptr_t)hw->data[1];
+		D3D11_BOX box = { 0, 0, 0, (UINT)sw->width, (UINT)sw->height, 1 };
+		dev->device_context->CopySubresourceRegion(tex, index, 0, 0, 0, st, 0, &box);
+	}
+	dev->unlock(dev->lock_ctx);
+	if(!mapped)
+	{
+		av_frame_free(&hw);
+		return fail("map", AVERROR(EIO));
+	}
+	av_frame_copy_props(hw, sw);
+	av_frame_free(&sw);
+	return hw;
 }
 #endif
 
@@ -247,6 +360,10 @@ void StreamSession::Stop()
 		capture->Stop();
 		capture.reset();
 	}
+	ReleaseCaptureStaging();
+	if(capture_frames_ctx)
+		av_buffer_unref(&capture_frames_ctx);
+	capture_fw = capture_fh = 0;
 #endif
 	if(session_inited)
 	{
@@ -290,7 +407,7 @@ AVFrame *StreamSession::PullFrame()
 			std::lock_guard<std::mutex> lock(stats_mutex);
 			frames_window++;
 		}
-		return f;
+		return UploadCaptureFrame(f);
 	}
 #endif
 	if(!decoder_inited)
@@ -380,6 +497,10 @@ void StreamSession::GoHome()
 
 void StreamSession::RequestKeyframe()
 {
+#ifdef _WIN32
+	if(capture)
+		capture->RequestKeyframe();
+#endif
 	if(connected)
 		chiaki_session_request_idr(&session);
 }

@@ -888,7 +888,7 @@ void App::HandleSessionEvents()
 				if(session->IsCapture())
 				{
 #ifdef _WIN32
-					CaptureFormat f = session->CaptureMode();
+					CaptureFormat f = session->CaptureInfo();
 					std::string a = session->CaptureAudio();
 					char b[256];
 					snprintf(b, sizeof(b), "%s  -  %dx%d at %.0f fps%s", active_capture.name.c_str(), f.width, f.height, f.fps,
@@ -1142,6 +1142,8 @@ void App::ScanCaptureDevices(uint64_t now)
 		for(const CaptureDevice &d : capture_devices)
 			capture_audio_guess[d.name] = CaptureSource::GuessAudio(d.name);
 	}
+	if(modes_scan.valid() && modes_scan.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+		capture_modes[modes_scan_link] = modes_scan.get();
 	if(!capture_scan.valid() && phase == Phase::Idle && screen == Screen::Consoles && now - capture_scan_ms > 4000)
 	{
 		capture_scan_ms = now;
@@ -1156,13 +1158,18 @@ void App::StartCapture(const CaptureDevice &dev)
 	message.clear();
 	StreamConfig cfg;
 	cfg.capture = dev;
-	cfg.capture_audio = settings.capture_audio == "none" ? std::string()
+	cfg.capture_options.audio_device = settings.capture_audio == "none" ? std::string()
 		: !settings.capture_audio.empty() ? settings.capture_audio : CaptureSource::GuessAudio(dev.name);
+	cfg.capture_options.mode_key = settings.capture_mode;
+	cfg.capture_options.full_range = settings.capture_full_range;
 	cfg.fps = 60;
+	cfg.codec = VideoCodec::H264;   // what the recorder gets from the GPU encoder
+	cfg.hdr = false;
 	session = std::make_unique<StreamSession>();
 	renderer.ResetVideo();
 	std::string error;
-	if(!session->Start(cfg, nullptr, nullptr, &audio, &error))
+	// The renderer's device, like a stream: frames become the same GPU frames the decoder makes
+	if(!session->Start(cfg, renderer.DecoderDevice(), renderer.DecoderContext(), &audio, &error))
 	{
 		session.reset();
 		phase = Phase::Idle;
@@ -1982,11 +1989,6 @@ void App::ToggleRecording()
 {
 	if(phase != Phase::Streaming || !session)
 		return;
-	if(session->IsCapture())
-	{
-		ShowToast("Recording works with console streams only (it saves the console's own video stream)");
-		return;
-	}
 	if(recorder.Recording())
 	{
 		recorder.StopRecording();
@@ -1996,7 +1998,8 @@ void App::ToggleRecording()
 	if(recorder.StartRecording(CapturePath("OrbitPlay")))
 	{
 		session->RequestKeyframe(); // recording starts on the next keyframe
-		ShowToast("Recording (F9 to stop) - lossless, straight from the PS5 stream");
+		ShowToast(session->IsCapture() ? "Recording (F9 to stop) - capture card, encoded on the GPU"
+			: "Recording (F9 to stop) - lossless, straight from the PS5 stream");
 	}
 }
 
@@ -2004,11 +2007,6 @@ void App::SaveReplay()
 {
 	if(phase != Phase::Streaming || !session)
 		return;
-	if(session->IsCapture())
-	{
-		ShowToast("Instant replay works with console streams only");
-		return;
-	}
 	if(!recorder.ReplayEnabled())
 	{
 		ShowToast("Instant replay is off - turn it on in the menu (Capture tab)");

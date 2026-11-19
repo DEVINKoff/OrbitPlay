@@ -43,7 +43,7 @@ struct StreamConfig
 #ifdef _WIN32
 	// Capture card mode (instead of a console): the device and its audio input ("" = none)
 	CaptureDevice capture;
-	std::string capture_audio;
+	CaptureSource::Options capture_options;
 #endif
 };
 
@@ -80,14 +80,22 @@ public:
 	// hw_device / hw_context: the renderer's D3D11 device and context on Windows (D3D11VA decoding);
 	// unused on Apple, where VideoToolbox decodes into CVPixelBuffers.
 	bool Start(const StreamConfig &config, void *hw_device, void *hw_context, Audio *audio, std::string *error);
-	void SetRecorder(Recorder *r) { recorder = r; }
+	void SetRecorder(Recorder *r)
+	{
+		recorder = r;
+#ifdef _WIN32
+		if(capture)
+			capture->SetRecorder(r);
+#endif
+	}
 	void Stop();
 
 	bool Running() const { return running; }
 	// Showing an HDMI capture card instead of streaming from a console
 	bool IsCapture() const { return capture_mode; }
 #ifdef _WIN32
-	CaptureFormat CaptureMode() { return capture ? capture->Format() : CaptureFormat(); }
+	CaptureFormat CaptureInfo() { return capture ? capture->Format() : CaptureFormat(); }
+	std::string CaptureEncoder() const { return capture ? capture->EncoderName() : std::string(); }
 	std::string CaptureAudio() const { return capture ? capture->AudioName() : std::string(); }
 #endif
 	bool Connected() const { return connected; }
@@ -137,7 +145,16 @@ private:
 	bool capture_mode = false;
 #ifdef _WIN32
 	std::unique_ptr<CaptureSource> capture;
-	bool StartCapture(std::string *error);
+	bool StartCapture(void *hw_device, void *hw_context, std::string *error);
+	// Capture frames are uploaded into the same kind of GPU frame the hardware decoder makes
+	AVFrame *UploadCaptureFrame(AVFrame *sw);
+	AVBufferRef *capture_frames_ctx = nullptr;
+	int capture_fw = 0, capture_fh = 0;
+	// Upload staging textures, used in turn so writing one never waits for the GPU
+	struct ID3D11Texture2D *capture_staging[3] = {};
+	int capture_staging_next = 0;
+	void ReleaseCaptureStaging();
+	bool capture_upload_failed = false;
 #endif
 	std::string host_str;
 	Audio *audio = nullptr;

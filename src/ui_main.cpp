@@ -729,6 +729,68 @@ void App::UiHome()
 				}
 			ImGui::EndCombo();
 		}
+		// The card's modes (read once, in the background)
+		auto mit = capture_modes.find(dev.link);
+		if(mit == capture_modes.end() && !modes_scan.valid())
+		{
+			modes_scan_link = dev.link;
+			CaptureDevice copy = dev;
+			modes_scan = std::async(std::launch::async, [copy] { return CaptureSource::EnumerateModes(copy); });
+		}
+		std::string mode_shown = "Automatic";
+		if(mit != capture_modes.end())
+		{
+			const CaptureMode *pick = nullptr;
+			for(const CaptureMode &m : mit->second)
+				if(m.Key() == settings.capture_mode)
+					pick = &m;
+			if(pick)
+				mode_shown = pick->Label();
+			else if(!mit->second.empty())
+				mode_shown = "Automatic (" + mit->second.front().Label() + ")";
+		}
+		ImGui::AlignTextToFramePadding();
+		ImGui::TextUnformatted("Picture  ");
+		ImGui::SameLine(0, 12 * s);
+		ImGui::SetNextItemWidth(std::min(460.0f * s, W - mx * 2 - 120 * s));
+		if(ImGui::BeginCombo("##capmode", mode_shown.c_str()))
+		{
+			if(ImGui::Selectable("Automatic (best uncompressed mode)", settings.capture_mode.empty()))
+			{
+				settings.capture_mode.clear();
+				MarkSettingsDirty();
+			}
+			if(mit != capture_modes.end())
+			{
+				ImGui::Separator();
+				for(const CaptureMode &m : mit->second)
+					if(ImGui::Selectable(m.Label().c_str(), settings.capture_mode == m.Key()))
+					{
+						settings.capture_mode = m.Key();
+						MarkSettingsDirty();
+					}
+			}
+			else
+				ImGui::TextDisabled("Reading the card's modes...");
+			ImGui::EndCombo();
+		}
+		ImGui::AlignTextToFramePadding();
+		ImGui::TextUnformatted("Colour range");
+		ImGui::SameLine(0, 12 * s);
+		int range = settings.capture_full_range ? 1 : 0;
+		if(ImGui::RadioButton("Limited (normal)", &range, 0))
+		{
+			settings.capture_full_range = false;
+			MarkSettingsDirty();
+		}
+		ImGui::SameLine();
+		if(ImGui::RadioButton("Full", &range, 1))
+		{
+			settings.capture_full_range = true;
+			MarkSettingsDirty();
+		}
+		ImGui::SameLine(0, 14 * s);
+		ImGui::TextDisabled("Blacks look grey: Full. Dark detail is crushed: Limited.");
 		ImGui::Dummy(ImVec2(0, 14 * s));
 		ImGui::BeginDisabled(busy);
 		if(home_focus_pending)

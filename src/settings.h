@@ -50,6 +50,8 @@ struct Settings
 	// Account
 	std::string psn_account_id; // base64, 8 bytes
 	std::string capture_audio;  // capture card sound: "" = find it automatically, "none", or a recording device name
+	std::string capture_mode;   // capture card mode (CaptureMode::Key), "" = automatic
+	bool capture_full_range = false; // the card sends full-range video (0-255)
 
 	// Stream
 	int resolution = 1080;      // 360 / 540 / 720 / 1080

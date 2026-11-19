@@ -251,6 +251,8 @@ void Settings::Load(const std::string &path)
 
 	str("psn_account_id", psn_account_id);
 	str("capture_audio", capture_audio);
+	str("capture_mode", capture_mode);
+	bol("capture_full_range", capture_full_range);
 	num("resolution", resolution);
 	num("fps", fps);
 	num("bitrate_kbps", bitrate_kbps);
@@ -393,6 +395,8 @@ void Settings::Save(const std::string &path) const
 	o << "[general]\n";
 	o << "psn_account_id=" << psn_account_id << "\n";
 	o << "capture_audio=" << capture_audio << "\n";
+	o << "capture_mode=" << capture_mode << "\n";
+	o << "capture_full_range=" << (capture_full_range ? 1 : 0) << "\n";
 	o << "resolution=" << resolution << "\n";
 	o << "fps=" << fps << "\n";
 	o << "bitrate_kbps=" << bitrate_kbps << "\n";
